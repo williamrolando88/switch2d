@@ -1,8 +1,13 @@
+pub mod advert;
 pub mod calibration;
 pub mod command;
 pub mod constants;
 pub mod report;
 
+pub use advert::{
+    accepts, host_field_from_adapter, mac_to_int, AcceptPolicy, AdvertInfo, HostBinding,
+    PAIRING_TTL, WAKE_TTL,
+};
 pub use calibration::{
     apply_trigger_deadzone, get_stick_xy, normalize_gc_trigger, StickCalibration,
     GC_TRIGGER_CLICK_THRESHOLD, GC_TRIGGER_DEADZONE, GC_TRIGGER_DEFAULT_NEUTRAL,
