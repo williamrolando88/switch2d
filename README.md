@@ -243,7 +243,8 @@ likely thing to find here, because that path has been rewritten most.
 
 The current round's plan, with the exact measurements to capture and the questions
 it must answer, is [`docs/TEST_PLAN_ROUND2.md`](docs/TEST_PLAN_ROUND2.md). Start
-there: it supersedes Test A's checklist for this build (`1e50b79`).
+there: it supersedes Test A's checklist for this build (`2aaa36a`). Step 1 purges
+both Joy-Cons from BlueZ and switch2d, and pairing is re-verified from scratch.
 
 ### Recording findings
 
