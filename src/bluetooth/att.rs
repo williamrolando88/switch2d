@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
-use tracing::debug;
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 use super::l2cap::L2capSocket;
 
@@ -23,11 +23,17 @@ pub const ATT_READ_BY_GROUP_RSP: u8 = 0x11;
 pub const ATT_WRITE_REQ: u8 = 0x12;
 pub const ATT_WRITE_RSP: u8 = 0x13;
 pub const ATT_HANDLE_VALUE_NTF: u8 = 0x1B;
+pub const ATT_HANDLE_VALUE_IND: u8 = 0x1D;
+pub const ATT_HANDLE_VALUE_CFM: u8 = 0x1E;
 pub const ATT_WRITE_CMD: u8 = 0x52;
 
 pub const UUID_PRIMARY_SERVICE: u16 = 0x2800;
 pub const UUID_CHARACTERISTIC: u16 = 0x2803;
 pub const UUID_CCCD: u16 = 0x2902;
+
+/// Upper bound on FIND_INFO pages per characteristic (MTU-sized replies can
+/// need several round-trips for descriptor-heavy characteristics).
+const MAX_FIND_INFO_PAGES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct Characteristic {
@@ -46,7 +52,7 @@ pub struct Service {
     pub characteristics: Vec<Characteristic>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResolvedHandles {
     pub input_report: u16,
     pub input_report_cccd: u16,
@@ -54,6 +60,106 @@ pub struct ResolvedHandles {
     pub command_response: u16,
     pub command_response_cccd: u16,
     pub vibration: u16,
+}
+
+/// Which of the [`ResolvedHandles`] values came from real GATT discovery
+/// rather than the hard-coded NSO GameCube safety-net defaults.
+///
+/// `true` = discovered; `false` = fallback was substituted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HandleProvenance {
+    pub input_report: bool,
+    pub input_report_cccd: bool,
+    pub command_write: bool,
+    pub command_response: bool,
+    pub command_response_cccd: bool,
+    pub vibration: bool,
+}
+
+/// Parse an `ATT_FIND_INFO_RSP` body into `(handle, raw uuid bytes)` entries.
+///
+/// Accepts format `0x01` (16-bit UUIDs, 4-byte items) and `0x02` (128-bit
+/// UUIDs, 18-byte items). Returns `None` for a wrong opcode, an unknown format,
+/// or a body that is not a whole number of items.
+pub fn parse_find_info_rsp(pdu: &[u8]) -> Option<Vec<(u16, Vec<u8>)>> {
+    if pdu.len() < 2 || pdu[0] != ATT_FIND_INFO_RSP {
+        return None;
+    }
+    let uuid_len = match pdu[1] {
+        0x01 => 2,
+        0x02 => 16,
+        _ => return None,
+    };
+    let body = &pdu[2..];
+    if body.is_empty() || body.len() % (2 + uuid_len) != 0 {
+        return None;
+    }
+
+    Some(
+        body.chunks_exact(2 + uuid_len)
+            .map(|item| (u16::from_le_bytes([item[0], item[1]]), item[2..].to_vec()))
+            .collect(),
+    )
+}
+
+/// Descriptor handle range belonging to a characteristic.
+///
+/// Starts at `value_handle + 1` and ends at `next_decl_handle - 1` when a
+/// following characteristic exists in the same service, otherwise at
+/// `service_end`. Returns `None` when the range would be inverted or overflow.
+pub fn descriptor_range(
+    value_handle: u16,
+    next_decl_handle: Option<u16>,
+    service_end: u16,
+) -> Option<(u16, u16)> {
+    let start = value_handle.checked_add(1)?;
+    let end = match next_decl_handle {
+        Some(next_decl) => next_decl.checked_sub(1)?,
+        None => service_end,
+    };
+    if start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Pick the CCCD handle from `(handle, 16-bit uuid)` entries.
+///
+/// Only `0x2902` entries inside the inclusive `start..=end` range qualify; the
+/// highest handle wins (legacy assigns every match and never breaks).
+pub fn select_cccd(entries: &[(u16, u16)], start: u16, end: u16) -> Option<u16> {
+    entries
+        .iter()
+        .filter(|(handle, uuid)| *uuid == UUID_CCCD && (start..=end).contains(handle))
+        .map(|(handle, _)| *handle)
+        .max()
+}
+
+/// Response opcode expected for a request opcode (notifications/indications and
+/// write commands have none).
+fn expected_response(request_opcode: u8) -> Option<u8> {
+    match request_opcode {
+        ATT_EXCHANGE_MTU_REQ => Some(ATT_EXCHANGE_MTU_RSP),
+        ATT_FIND_INFO_REQ => Some(ATT_FIND_INFO_RSP),
+        ATT_READ_BY_TYPE_REQ => Some(ATT_READ_BY_TYPE_RSP),
+        ATT_READ_REQ => Some(ATT_READ_RSP),
+        ATT_READ_BY_GROUP_REQ => Some(ATT_READ_BY_GROUP_RSP),
+        ATT_WRITE_REQ => Some(ATT_WRITE_RSP),
+        _ => None,
+    }
+}
+
+/// Whether `pdu` may complete a request expecting `expected`.
+///
+/// Errors always correlate (they carry the failed request opcode); otherwise
+/// the opcode must match. Unmapped request opcodes keep the historical
+/// lenient behaviour of accepting any non-error reply.
+fn is_expected_response(expected: Option<u8>, pdu: &[u8]) -> bool {
+    match pdu.first() {
+        Some(&ATT_ERROR_RSP) => true,
+        Some(&opcode) => expected.map_or(true, |want| opcode == want),
+        None => false,
+    }
 }
 
 pub fn uuid_to_str(raw: &[u8]) -> String {
@@ -114,19 +220,33 @@ impl AttClient {
                     match sock.recv(&mut buf) {
                         Ok(n) if n > 0 => {
                             let pdu = &buf[..n];
-                            let opcode = pdu[0];
-                            if opcode == ATT_HANDLE_VALUE_NTF && n >= 3 {
-                                let handle = u16::from_le_bytes([pdu[1], pdu[2]]);
-                                let data = &pdu[3..];
-                                if let Some(cb) = notification_cb.lock().unwrap().as_ref() {
-                                    cb(handle, data);
+                            match pdu[0] {
+                                ATT_HANDLE_VALUE_NTF if n >= 3 => {
+                                    let handle = u16::from_le_bytes([pdu[1], pdu[2]]);
+                                    let data = &pdu[3..];
+                                    if let Some(cb) = notification_cb.lock().unwrap().as_ref() {
+                                        cb(handle, data);
+                                    }
                                 }
-                            } else {
-                                // Request response
-                                let (lock, cvar) = &*resp_state;
-                                let mut resp = lock.lock().unwrap();
-                                *resp = Some(pdu.to_vec());
-                                cvar.notify_one();
+                                ATT_HANDLE_VALUE_IND if n >= 3 => {
+                                    // Confirmations are sent from the reader thread so the
+                                    // peer can release its pending indication immediately.
+                                    if let Err(err) = sock.send(&[ATT_HANDLE_VALUE_CFM]) {
+                                        debug!("Failed to confirm ATT indication: {}", err);
+                                    }
+                                    let handle = u16::from_le_bytes([pdu[1], pdu[2]]);
+                                    let data = &pdu[3..];
+                                    if let Some(cb) = notification_cb.lock().unwrap().as_ref() {
+                                        cb(handle, data);
+                                    }
+                                }
+                                _ => {
+                                    // Request response
+                                    let (lock, cvar) = &*resp_state;
+                                    let mut resp = lock.lock().unwrap();
+                                    *resp = Some(pdu.to_vec());
+                                    cvar.notify_one();
+                                }
                             }
                         }
                         _ => {
@@ -170,6 +290,10 @@ impl AttClient {
     }
 
     /// Perform a synchronous request/response ATT exchange.
+    ///
+    /// A reply is accepted only when it is an ATT error or matches the response
+    /// opcode for the request. Anything else received while waiting is dropped
+    /// and the wait continues on the original deadline.
     pub fn request(&self, req_pdu: &[u8], timeout: Duration) -> std::io::Result<Vec<u8>> {
         let _guard = self.req_lock.lock().unwrap();
         let (lock, cvar) = &*self.resp_state;
@@ -183,20 +307,37 @@ impl AttClient {
         // Send request
         self.socket.send(req_pdu)?;
 
-        // Wait for response with timeout
+        let expected = req_pdu
+            .first()
+            .and_then(|opcode| expected_response(*opcode));
+        let deadline = Instant::now() + timeout;
+        let timeout_err =
+            || std::io::Error::new(std::io::ErrorKind::TimedOut, "ATT request timed out");
+
         let mut resp_guard = lock.lock().unwrap();
-        while resp_guard.is_none() {
-            let (new_guard, wait_res) = cvar.wait_timeout(resp_guard, timeout).unwrap();
-            resp_guard = new_guard;
-            if wait_res.timed_out() && resp_guard.is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "ATT request timed out",
-                ));
+        loop {
+            match resp_guard.as_ref() {
+                Some(pdu) if is_expected_response(expected, pdu) => break,
+                Some(_) => {
+                    // Unrelated PDU: drop it without resetting the deadline.
+                    *resp_guard = None;
+                }
+                None => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(timeout_err());
+                    }
+                    let (new_guard, wait_res) =
+                        cvar.wait_timeout(resp_guard, deadline - now).unwrap();
+                    resp_guard = new_guard;
+                    if wait_res.timed_out() && resp_guard.is_none() {
+                        return Err(timeout_err());
+                    }
+                }
             }
         }
 
-        let resp = resp_guard.take().unwrap();
+        let resp = resp_guard.take().unwrap_or_default();
         if !resp.is_empty() && resp[0] == ATT_ERROR_RSP {
             let code = if resp.len() >= 5 { resp[4] } else { 0 };
             return Err(std::io::Error::new(
@@ -234,7 +375,12 @@ impl AttClient {
     }
 
     /// Write request with response confirmation.
-    pub fn write_request(&self, handle: u16, value: &[u8], timeout: Duration) -> std::io::Result<()> {
+    pub fn write_request(
+        &self,
+        handle: u16,
+        value: &[u8],
+        timeout: Duration,
+    ) -> std::io::Result<()> {
         let mut buf = Vec::with_capacity(3 + value.len());
         buf.push(ATT_WRITE_REQ);
         buf.extend_from_slice(&handle.to_le_bytes());
@@ -358,20 +504,90 @@ impl AttClient {
                 c_start = last_handle.saturating_add(1);
             }
 
-            // Fill CCCD handles (typically value_handle + 1)
-            for ch in &mut svc.characteristics {
-                if (ch.properties & 0x10) != 0 || (ch.properties & 0x20) != 0 {
-                    // Characteristic supports notifications or indications
-                    ch.cccd_handle = Some(ch.value_handle + 1);
-                }
+            // 3. Discover each characteristic's CCCD via ATT_FIND_INFO over its
+            // descriptor range. No derivation: an absent CCCD stays None and is
+            // only replaced by the legacy safety-net defaults in resolve_handles.
+            let plan: Vec<(usize, u16, u16)> = (0..svc.characteristics.len())
+                .filter_map(|idx| {
+                    let ch = &svc.characteristics[idx];
+                    let next_decl = svc.characteristics.get(idx + 1).map(|n| n.decl_handle);
+                    descriptor_range(ch.value_handle, next_decl, svc.end_handle)
+                        .map(|(start, end)| (idx, start, end))
+                })
+                .collect();
+
+            for (idx, start, end) in plan {
+                let entries = self.find_info_scan(start, end);
+                svc.characteristics[idx].cccd_handle = select_cccd(&entries, start, end);
             }
         }
 
         Ok(services)
     }
 
-    /// Resolve standard Switch 2 handles from discovery.
-    pub fn resolve_handles(services: &[Service], pid: u16) -> ResolvedHandles {
+    /// Page through `ATT_FIND_INFO_RSP` replies over `start..=end` and return
+    /// `(handle, 16-bit uuid)` entries.
+    ///
+    /// Stops on ATT errors, non-FIND_INFO replies, malformed/truncated bodies,
+    /// or after [`MAX_FIND_INFO_PAGES`] round-trips. 128-bit UUID entries only
+    /// advance the page cursor (they can never be a CCCD).
+    fn find_info_scan(&self, start: u16, end: u16) -> Vec<(u16, u16)> {
+        let mut found = Vec::new();
+        let mut handle = start;
+
+        for _ in 0..MAX_FIND_INFO_PAGES {
+            if handle > end {
+                break;
+            }
+
+            let mut req = [0u8; 5];
+            req[0] = ATT_FIND_INFO_REQ;
+            req[1..3].copy_from_slice(&handle.to_le_bytes());
+            req[3..5].copy_from_slice(&end.to_le_bytes());
+
+            let resp = match self.request(&req, Duration::from_secs(2)) {
+                Ok(resp) => resp,
+                Err(err) => {
+                    debug!(
+                        "FIND_INFO 0x{:04X}..=0x{:04X} stopped: {}",
+                        handle, end, err
+                    );
+                    break;
+                }
+            };
+
+            let entries = match parse_find_info_rsp(&resp) {
+                Some(entries) => entries,
+                None => {
+                    debug!("Unexpected FIND_INFO payload: {:02X?}", resp);
+                    break;
+                }
+            };
+
+            let mut last = 0u16;
+            for (entry_handle, raw_uuid) in entries {
+                if raw_uuid.len() == 2 {
+                    found.push((entry_handle, u16::from_le_bytes([raw_uuid[0], raw_uuid[1]])));
+                }
+                last = last.max(entry_handle);
+            }
+
+            if last == 0 || last >= end {
+                break;
+            }
+            handle = last + 1;
+        }
+
+        found
+    }
+
+    /// Resolve standard Switch 2 handles from discovery, reporting which values
+    /// were discovered and which fell back to the hard-coded NSO GameCube
+    /// defaults (legacy `_resolve_handles`).
+    pub fn resolve_handles_ex(
+        services: &[Service],
+        pid: u16,
+    ) -> (ResolvedHandles, HandleProvenance) {
         use crate::protocol::constants::*;
 
         let mut map: HashMap<String, (u16, Option<u16>)> = HashMap::new();
@@ -383,13 +599,404 @@ impl AttClient {
 
         let vib_uuid = vibration_uuid_for(pid);
 
-        ResolvedHandles {
-            input_report: map.get(INPUT_REPORT_UUID).map(|x| x.0).unwrap_or(0x000A),
-            input_report_cccd: map.get(INPUT_REPORT_UUID).and_then(|x| x.1).unwrap_or(0x000B),
-            command_write: map.get(COMMAND_WRITE_UUID).map(|x| x.0).unwrap_or(0x0014),
-            command_response: map.get(COMMAND_RESPONSE_UUID).map(|x| x.0).unwrap_or(0x001A),
-            command_response_cccd: map.get(COMMAND_RESPONSE_UUID).and_then(|x| x.1).unwrap_or(0x001B),
-            vibration: map.get(vib_uuid).map(|x| x.0).unwrap_or(0x0012),
+        let value_handle = |uuid: &str, fallback: u16| -> (u16, bool) {
+            match map.get(uuid) {
+                Some((value, _)) => (*value, true),
+                None => (fallback, false),
+            }
+        };
+        let cccd_handle = |uuid: &str, fallback: u16| -> (u16, bool) {
+            match map.get(uuid).and_then(|(_, cccd)| *cccd) {
+                Some(handle) => (handle, true),
+                None => (fallback, false),
+            }
+        };
+
+        let mut handles = ResolvedHandles::default();
+        let mut provenance = HandleProvenance::default();
+
+        (handles.input_report, provenance.input_report) = value_handle(INPUT_REPORT_UUID, 0x000A);
+        (handles.input_report_cccd, provenance.input_report_cccd) =
+            cccd_handle(INPUT_REPORT_UUID, 0x000B);
+        (handles.command_write, provenance.command_write) =
+            value_handle(COMMAND_WRITE_UUID, 0x0014);
+        (handles.command_response, provenance.command_response) =
+            value_handle(COMMAND_RESPONSE_UUID, 0x001A);
+        (
+            handles.command_response_cccd,
+            provenance.command_response_cccd,
+        ) = cccd_handle(COMMAND_RESPONSE_UUID, 0x001B);
+        (handles.vibration, provenance.vibration) = value_handle(vib_uuid, 0x0012);
+
+        let mut fallbacks: Vec<String> = Vec::new();
+        if !provenance.input_report {
+            fallbacks.push(format!("input_report=0x{:04X}", handles.input_report));
         }
+        if !provenance.input_report_cccd {
+            fallbacks.push(format!(
+                "input_report_cccd=0x{:04X}",
+                handles.input_report_cccd
+            ));
+        }
+        if !provenance.command_write {
+            fallbacks.push(format!("command_write=0x{:04X}", handles.command_write));
+        }
+        if !provenance.command_response {
+            fallbacks.push(format!(
+                "command_response=0x{:04X}",
+                handles.command_response
+            ));
+        }
+        if !provenance.command_response_cccd {
+            fallbacks.push(format!(
+                "command_response_cccd=0x{:04X}",
+                handles.command_response_cccd
+            ));
+        }
+        if !provenance.vibration {
+            fallbacks.push(format!("vibration=0x{:04X}", handles.vibration));
+        }
+
+        if fallbacks.is_empty() {
+            debug!(
+                "GATT handles discovered: input=0x{:04X} input_cccd=0x{:04X} \
+                 cmd_write=0x{:04X} cmd_rsp=0x{:04X} cmd_rsp_cccd=0x{:04X} vibration=0x{:04X}",
+                handles.input_report,
+                handles.input_report_cccd,
+                handles.command_write,
+                handles.command_response,
+                handles.command_response_cccd,
+                handles.vibration
+            );
+        } else {
+            warn!(
+                "GATT discovery incomplete; using NSO GameCube fallback handles: {}",
+                fallbacks.join(", ")
+            );
+        }
+
+        (handles, provenance)
+    }
+
+    /// Resolve standard Switch 2 handles from discovery.
+    ///
+    /// Applies the legacy NSO GameCube defaults for anything discovery did not
+    /// find; use [`AttClient::resolve_handles_ex`] to learn which values are
+    /// fallbacks.
+    pub fn resolve_handles(services: &[Service], pid: u16) -> ResolvedHandles {
+        Self::resolve_handles_ex(services, pid).0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::constants::{
+        COMMAND_RESPONSE_UUID, COMMAND_WRITE_UUID, INPUT_REPORT_UUID, PRO_CONTROLLER2_PID,
+    };
+
+    // --- FIND_INFO decoding -------------------------------------------------
+
+    #[test]
+    fn find_info_rsp_16bit_uuids() {
+        let mut pdu = vec![ATT_FIND_INFO_RSP, 0x01];
+        for (handle, uuid) in [(0x0010u16, UUID_CCCD), (0x0020, UUID_CHARACTERISTIC)] {
+            pdu.extend_from_slice(&handle.to_le_bytes());
+            pdu.extend_from_slice(&uuid.to_le_bytes());
+        }
+
+        let entries = parse_find_info_rsp(&pdu).expect("valid format 1 response");
+        assert_eq!(
+            entries,
+            vec![
+                (0x0010, UUID_CCCD.to_le_bytes().to_vec()),
+                (0x0020, UUID_CHARACTERISTIC.to_le_bytes().to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn find_info_rsp_128bit_uuids() {
+        let uuid_a = [
+            0xd2, 0x7f, 0xdf, 0x09, 0x8f, 0x11, 0x8f, 0x82, 0xad, 0x49, 0xfe, 0x89, 0xbe, 0xe9,
+            0x7d, 0xab,
+        ];
+        let uuid_b = [0x11u8; 16];
+
+        let mut pdu = vec![ATT_FIND_INFO_RSP, 0x02];
+        pdu.extend_from_slice(&0x0030u16.to_le_bytes());
+        pdu.extend_from_slice(&uuid_a);
+        pdu.extend_from_slice(&0x0032u16.to_le_bytes());
+        pdu.extend_from_slice(&uuid_b);
+
+        let entries = parse_find_info_rsp(&pdu).expect("valid format 2 response");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (0x0030, uuid_a.to_vec()));
+        assert_eq!(entries[1], (0x0032, uuid_b.to_vec()));
+    }
+
+    #[test]
+    fn find_info_rsp_rejects_bad_format_and_truncation() {
+        assert_eq!(parse_find_info_rsp(&[]), None);
+        assert_eq!(parse_find_info_rsp(&[ATT_FIND_INFO_RSP]), None);
+        // Wrong opcode (request instead of response).
+        assert_eq!(
+            parse_find_info_rsp(&[ATT_FIND_INFO_REQ, 0x01, 0x10, 0x00, 0x02, 0x29]),
+            None
+        );
+        // Unknown format.
+        assert_eq!(
+            parse_find_info_rsp(&[ATT_FIND_INFO_RSP, 0x03, 0x10, 0x00, 0x02, 0x29]),
+            None
+        );
+        // Empty body.
+        assert_eq!(parse_find_info_rsp(&[ATT_FIND_INFO_RSP, 0x01]), None);
+        // 16-bit format, body not a multiple of 4.
+        assert_eq!(
+            parse_find_info_rsp(&[ATT_FIND_INFO_RSP, 0x01, 0x10, 0x00, 0x02]),
+            None
+        );
+        // 128-bit format, body not a multiple of 18.
+        let mut truncated = vec![ATT_FIND_INFO_RSP, 0x02];
+        truncated.extend_from_slice(&[0xAA; 17]);
+        assert_eq!(parse_find_info_rsp(&truncated), None);
+    }
+
+    #[test]
+    fn select_cccd_last_wins() {
+        let entries = [
+            (0x0010, UUID_CHARACTERISTIC),
+            (0x0011, UUID_CCCD),
+            (0x0012, 0x2901),
+            (0x0015, UUID_CCCD),
+            (0x0019, UUID_CCCD),
+        ];
+        assert_eq!(select_cccd(&entries, 0x0010, 0x0020), Some(0x0019));
+        // Narrowing the range to a single match still picks that one.
+        assert_eq!(select_cccd(&entries, 0x0010, 0x0015), Some(0x0015));
+    }
+
+    #[test]
+    fn select_cccd_out_of_range_returns_none() {
+        let entries = [(0x000F, UUID_CCCD), (0x0021, UUID_CCCD)];
+        assert_eq!(select_cccd(&entries, 0x0010, 0x0020), None);
+        // Inverted range contains nothing.
+        assert_eq!(select_cccd(&[(0x0015, UUID_CCCD)], 0x0020, 0x0010), None);
+        assert_eq!(select_cccd(&[], 0x0010, 0x0020), None);
+    }
+
+    #[test]
+    fn select_cccd_ignores_non_cccd() {
+        let entries = [
+            (0x0011, 0x2901), // user description
+            (0x0012, 0x2904), // presentation format
+            (0x0013, UUID_CHARACTERISTIC),
+        ];
+        assert_eq!(select_cccd(&entries, 0x0010, 0x0020), None);
+    }
+
+    #[test]
+    fn descriptor_range_uses_next_decl() {
+        // value_handle 0x0010, next characteristic declared at 0x0020.
+        assert_eq!(
+            descriptor_range(0x0010, Some(0x0020), 0x00FF),
+            Some((0x0011, 0x001F))
+        );
+    }
+
+    #[test]
+    fn descriptor_range_last_char_uses_service_end() {
+        assert_eq!(
+            descriptor_range(0x0010, None, 0x0020),
+            Some((0x0011, 0x0020))
+        );
+        // A last characteristic whose value_handle is the service end has no
+        // descriptor space at all.
+        assert_eq!(descriptor_range(0x0020, None, 0x0020), None);
+    }
+
+    #[test]
+    fn descriptor_range_inverted_is_none() {
+        // No descriptor gap: next characteristic is immediately after value.
+        assert_eq!(descriptor_range(0x0010, Some(0x0011), 0x0020), None);
+        // value_handle == service_end.
+        assert_eq!(descriptor_range(0x0020, None, 0x0020), None);
+    }
+
+    #[test]
+    fn descriptor_range_overflow_safe() {
+        // value_handle + 1 overflows u16.
+        assert_eq!(descriptor_range(u16::MAX, None, u16::MAX), None);
+        assert_eq!(descriptor_range(u16::MAX, Some(0x0002), u16::MAX), None);
+        // next_decl_handle - 1 underflows u16.
+        assert_eq!(descriptor_range(0x0010, Some(0x0000), 0x00FF), None);
+    }
+
+    // --- handle resolution --------------------------------------------------
+
+    fn service(chars: &[(&str, u16, Option<u16>)]) -> Service {
+        Service {
+            start_handle: 0x0001,
+            end_handle: 0xFFFF,
+            uuid: "service".to_string(),
+            characteristics: chars
+                .iter()
+                .map(|(uuid, value_handle, cccd_handle)| Characteristic {
+                    decl_handle: value_handle.saturating_sub(1),
+                    properties: 0x10,
+                    value_handle: *value_handle,
+                    uuid: (*uuid).to_string(),
+                    cccd_handle: *cccd_handle,
+                })
+                .collect(),
+        }
+    }
+
+    const GC_DEFAULTS: ResolvedHandles = ResolvedHandles {
+        input_report: 0x000A,
+        input_report_cccd: 0x000B,
+        command_write: 0x0014,
+        command_response: 0x001A,
+        command_response_cccd: 0x001B,
+        vibration: 0x0012,
+    };
+
+    #[test]
+    fn resolve_handles_defaults_when_empty() {
+        let (handles, provenance) = AttClient::resolve_handles_ex(&[], PRO_CONTROLLER2_PID);
+        assert_eq!(handles, GC_DEFAULTS);
+        assert_eq!(provenance, HandleProvenance::default());
+        assert!(!provenance.input_report);
+        assert!(!provenance.input_report_cccd);
+        assert!(!provenance.command_write);
+        assert!(!provenance.command_response);
+        assert!(!provenance.command_response_cccd);
+        assert!(!provenance.vibration);
+        // The legacy wrapper keeps the same defaults.
+        assert_eq!(
+            AttClient::resolve_handles(&[], PRO_CONTROLLER2_PID),
+            GC_DEFAULTS
+        );
+    }
+
+    #[test]
+    fn resolve_handles_uses_discovered_handles() {
+        let vibration_uuid = crate::protocol::constants::vibration_uuid_for(PRO_CONTROLLER2_PID);
+        let services = [service(&[
+            (INPUT_REPORT_UUID, 0x0030, Some(0x0031)),
+            (COMMAND_WRITE_UUID, 0x0050, None),
+            (COMMAND_RESPONSE_UUID, 0x0052, Some(0x0053)),
+            (vibration_uuid, 0x0070, None),
+        ])];
+
+        let (handles, provenance) = AttClient::resolve_handles_ex(&services, PRO_CONTROLLER2_PID);
+        assert_eq!(
+            handles,
+            ResolvedHandles {
+                input_report: 0x0030,
+                input_report_cccd: 0x0031,
+                command_write: 0x0050,
+                command_response: 0x0052,
+                command_response_cccd: 0x0053,
+                vibration: 0x0070,
+            }
+        );
+        assert_eq!(
+            provenance,
+            HandleProvenance {
+                input_report: true,
+                input_report_cccd: true,
+                command_write: true,
+                command_response: true,
+                command_response_cccd: true,
+                vibration: true,
+            }
+        );
+        assert_eq!(
+            AttClient::resolve_handles(&services, PRO_CONTROLLER2_PID),
+            handles
+        );
+    }
+
+    #[test]
+    fn resolve_handles_mixed_keeps_defaults() {
+        let vibration_uuid = crate::protocol::constants::vibration_uuid_for(PRO_CONTROLLER2_PID);
+        // Input report value is discovered but its CCCD is not; vibration is
+        // discovered; the command characteristics are entirely missing.
+        let services = [service(&[
+            (INPUT_REPORT_UUID, 0x0030, None),
+            (vibration_uuid, 0x0070, None),
+        ])];
+
+        let (handles, provenance) = AttClient::resolve_handles_ex(&services, PRO_CONTROLLER2_PID);
+        assert_eq!(
+            handles,
+            ResolvedHandles {
+                input_report: 0x0030,
+                input_report_cccd: 0x000B,
+                command_write: 0x0014,
+                command_response: 0x001A,
+                command_response_cccd: 0x001B,
+                vibration: 0x0070,
+            }
+        );
+        assert_eq!(
+            provenance,
+            HandleProvenance {
+                input_report: true,
+                input_report_cccd: false,
+                command_write: false,
+                command_response: false,
+                command_response_cccd: false,
+                vibration: true,
+            }
+        );
+    }
+
+    // --- request correlation ------------------------------------------------
+
+    #[test]
+    fn response_opcode_correlation() {
+        assert_eq!(
+            expected_response(ATT_EXCHANGE_MTU_REQ),
+            Some(ATT_EXCHANGE_MTU_RSP)
+        );
+        assert_eq!(
+            expected_response(ATT_FIND_INFO_REQ),
+            Some(ATT_FIND_INFO_RSP)
+        );
+        assert_eq!(
+            expected_response(ATT_READ_BY_TYPE_REQ),
+            Some(ATT_READ_BY_TYPE_RSP)
+        );
+        assert_eq!(expected_response(ATT_READ_REQ), Some(ATT_READ_RSP));
+        assert_eq!(
+            expected_response(ATT_READ_BY_GROUP_REQ),
+            Some(ATT_READ_BY_GROUP_RSP)
+        );
+        assert_eq!(expected_response(ATT_WRITE_REQ), Some(ATT_WRITE_RSP));
+        assert_eq!(expected_response(ATT_WRITE_CMD), None);
+        assert_eq!(expected_response(ATT_HANDLE_VALUE_NTF), None);
+
+        // Matching opcode and errors correlate; everything else is stale.
+        assert!(is_expected_response(
+            Some(ATT_FIND_INFO_RSP),
+            &[ATT_FIND_INFO_RSP, 0x01]
+        ));
+        assert!(is_expected_response(
+            Some(ATT_FIND_INFO_RSP),
+            &[ATT_ERROR_RSP, 0x04, 0x10, 0x00, 0x0A]
+        ));
+        assert!(!is_expected_response(
+            Some(ATT_FIND_INFO_RSP),
+            &[ATT_READ_RSP, 0x00]
+        ));
+        assert!(!is_expected_response(
+            Some(ATT_FIND_INFO_RSP),
+            &[ATT_HANDLE_VALUE_NTF, 0x00, 0x00, 0x00]
+        ));
+        assert!(!is_expected_response(Some(ATT_FIND_INFO_RSP), &[]));
+        // Unmapped request: any non-error reply is accepted (legacy leniency).
+        assert!(is_expected_response(None, &[ATT_READ_RSP, 0x00]));
     }
 }
