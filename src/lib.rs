@@ -8,6 +8,7 @@ pub mod monitor;
 pub mod players;
 pub mod profiles;
 pub mod protocol;
+pub mod rumble;
 pub mod status;
 pub mod uinput;
 pub mod worker;

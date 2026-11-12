@@ -6,7 +6,9 @@
 //! payload; only the vibration characteristic UUID and the documented defect
 //! differ.
 
-use super::{led_pattern_for, CalibrationAddresses, ControllerProfile, Sticks, Support};
+use super::{
+    led_pattern_for, CalibrationAddresses, ControllerProfile, RumbleKind, Sticks, Support,
+};
 use crate::protocol::constants::{
     JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID, VIBRATION_JOYCON_L_UUID, VIBRATION_JOYCON_R_UUID,
 };
@@ -22,6 +24,7 @@ pub static LEFT: ControllerProfile = ControllerProfile {
     sticks: Sticks::Left,
     vibration_uuid: VIBRATION_JOYCON_L_UUID,
     rumble_layout: Layout::SingleBlock,
+    rumble: RumbleKind::Hd,
     analog_triggers: false,
     calibration: CALIBRATION,
     led_pattern: led_pattern_for,
@@ -37,6 +40,7 @@ pub static RIGHT: ControllerProfile = ControllerProfile {
     sticks: Sticks::Right,
     vibration_uuid: VIBRATION_JOYCON_R_UUID,
     rumble_layout: Layout::SingleBlock,
+    rumble: RumbleKind::Hd,
     analog_triggers: false,
     calibration: CALIBRATION,
     led_pattern: led_pattern_for,

@@ -62,6 +62,15 @@ pub enum Sticks {
     Both,
 }
 
+/// How this model turns a force-feedback target into rumble packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RumbleKind {
+    /// Sustained HD waveform: one 0x0A/0x10 packet per ~16 ms while active.
+    Hd,
+    /// Finite built-in clip (0x0A/0x02), retriggered on a wall-clock gate.
+    PresetOnly,
+}
+
 /// Everything `controller.rs` needs to know about one controller model.
 #[derive(Debug, Clone, Copy)]
 pub struct ControllerProfile {
@@ -74,6 +83,8 @@ pub struct ControllerProfile {
     pub vibration_uuid: &'static str,
     /// Single block (Joy-Con / GameCube) or dual block (Pro Controller 2).
     pub rumble_layout: crate::protocol::vibration::Layout,
+    /// HD sustainer or finite preset clips (analysis §8.5).
+    pub rumble: RumbleKind,
     /// True only for the NSO GameCube pad (`L`/`R` are real analog triggers).
     pub analog_triggers: bool,
     pub calibration: CalibrationAddresses,
