@@ -96,10 +96,44 @@ impl BluezAdvertSource {
     }
 }
 
+impl BluezAdvertSource {
+    /// Snapshot including the raw fields used by `switch2d advert`.
+    pub fn snapshot(&mut self) -> io::Result<Vec<AdvertSnapshot>> {
+        let json = self.managed_objects_json()?;
+        parse_advert_snapshots(&json)
+    }
+}
+
 impl AdvertSource for BluezAdvertSource {
     fn devices(&mut self) -> io::Result<Vec<DeviceAdvert>> {
         let json = self.managed_objects_json()?;
         parse_managed_objects(&json)
+    }
+}
+
+/// One BlueZ `Device1` entry with the raw fields the `switch2d advert`
+/// diagnostic needs (name, address type, manufacturer block).
+///
+/// Deliberately separate from [`DeviceAdvert`]: that type is the daemon's
+/// transport-agnostic view and must not grow fields the hub does not use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvertSnapshot {
+    pub address: String,
+    /// BlueZ `AddressType` (`"public"` / `"random"`), when exposed.
+    pub address_type: Option<String>,
+    /// `Alias` when present, else `Name`.
+    pub name: Option<String>,
+    pub connected: bool,
+    pub rssi: Option<i16>,
+    /// Raw Nintendo manufacturer block, exactly as BlueZ returned it.
+    pub manufacturer_data: Option<Vec<u8>>,
+    pub advert: Option<AdvertInfo>,
+}
+
+impl AdvertSnapshot {
+    /// Live advertisement rather than a cached BlueZ property set.
+    pub fn is_live(&self) -> bool {
+        matches!(self.rssi, Some(rssi) if rssi > -127)
     }
 }
 
@@ -137,6 +171,20 @@ pub fn parse_managed_objects(json: &str) -> io::Result<Vec<DeviceAdvert>> {
     Ok(devices)
 }
 
+/// Parse a `GetManagedObjects` reply into [`AdvertSnapshot`]s (raw view).
+pub fn parse_advert_snapshots(json: &str) -> io::Result<Vec<AdvertSnapshot>> {
+    let objects = parse_object_map(json)?;
+    let mut devices = Vec::new();
+    for object in objects.values() {
+        if let Some(device) = object.get(ORG_BLUEZ_DEVICE1) {
+            if let Some(snapshot) = parse_snapshot_device(device) {
+                devices.push(snapshot);
+            }
+        }
+    }
+    Ok(devices)
+}
+
 /// Extract `org.bluez.Adapter1.Address` for `/org/bluez/hci{hci_index}`.
 pub fn parse_adapter_mac(json: &str, hci_index: u8) -> Option<String> {
     let objects = parse_object_map(json).ok()?;
@@ -171,18 +219,33 @@ fn parse_object_map(json: &str) -> io::Result<serde_json::Map<String, Value>> {
 }
 
 fn parse_device(device: &Value) -> Option<DeviceAdvert> {
+    let snapshot = parse_snapshot_device(device)?;
+    Some(DeviceAdvert {
+        address: snapshot.address,
+        connected: snapshot.connected,
+        rssi: snapshot.rssi,
+        advert: snapshot.advert,
+    })
+}
+
+fn parse_snapshot_device(device: &Value) -> Option<AdvertSnapshot> {
     let address = property_string(device, "Address")?;
+    let address_type = property_string(device, "AddressType").map(|kind| kind.to_lowercase());
+    let name = property_string(device, "Alias").or_else(|| property_string(device, "Name"));
     let connected = property_bool(device, "Connected").unwrap_or(false);
     let rssi = property_i16(device, "RSSI");
-    let advert = manufacturer_data(device).and_then(|bytes| {
-        // `parse` itself rejects short blocks and foreign VIDs.
-        AdvertInfo::parse(&address, Some(&bytes))
-    });
+    let manufacturer_data = manufacturer_data(device);
+    let advert = manufacturer_data
+        .as_ref()
+        .and_then(|bytes| AdvertInfo::parse(&address, Some(bytes)));
 
-    Some(DeviceAdvert {
+    Some(AdvertSnapshot {
         address,
+        address_type,
+        name,
         connected,
         rssi,
+        manufacturer_data,
         advert,
     })
 }
@@ -405,6 +468,37 @@ mod tests {
         // Unknown index maps to an object path that does not exist.
         assert_eq!(parse_adapter_mac(MANAGED_OBJECTS, 1), None);
         assert_eq!(parse_adapter_mac("not json", 0), None);
+    }
+
+    #[test]
+    fn snapshot_exposes_name_address_type_and_raw_block() {
+        let bytes = [0, 0, 0, 126, 5, 105, 32, 0, 0, 0, 1, 2, 3, 4, 5, 6];
+        let json = managed_objects_with(&[(
+            "/org/bluez/hci0/dev_AA",
+            device_object(&format!(
+                r#""Address": {{"type":"s","data":"AA:BB:CC:DD:EE:FF"}},
+                   "AddressType": {{"type":"s","data":"public"}},
+                   "Alias": {{"type":"s","data":"Joy-Con 2 (Left)"}},
+                   "RSSI": {{"type":"n","data":-52}},
+                   "ManufacturerData": {{"type":"a{{qv}}","data":[{{"1363":{{"type":"ay","data":{bytes:?}}}}}]}}"#
+            )),
+        )]);
+
+        let snapshots = parse_advert_snapshots(&json).expect("snapshot parses");
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.address, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(snapshot.address_type.as_deref(), Some("public"));
+        assert_eq!(snapshot.name.as_deref(), Some("Joy-Con 2 (Left)"));
+        assert_eq!(snapshot.rssi, Some(-52));
+        assert_eq!(snapshot.manufacturer_data.as_deref(), Some(&bytes[..]));
+        assert!(snapshot.advert.is_some());
+        assert!(snapshot.is_live());
+
+        // The hub's transport-agnostic view shares the same parser.
+        let devices = parse_managed_objects(&json).expect("devices parse");
+        assert_eq!(devices[0].address, "AA:BB:CC:DD:EE:FF");
+        assert!(devices[0].is_live());
     }
 
     #[test]

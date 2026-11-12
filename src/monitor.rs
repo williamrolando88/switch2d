@@ -12,6 +12,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::bluetooth::bluez::AdvertSnapshot;
 use crate::controller::{
     BondPolicy, CalibratedInput, ConnectOptions, ControllerInputCallback, DialBudget,
     SwitchController,
@@ -19,6 +20,83 @@ use crate::controller::{
 use crate::protocol::constants::button_mask;
 use crate::protocol::report::InputReport;
 use crate::status::battery_pct_from_mv;
+
+/// Header for `switch2d pair --hold`.
+///
+/// Kept pure so the LED-verification note and the player number are pinned by a
+/// test rather than by a manual run (the hold loop itself needs hardware).
+pub fn pair_hold_header(mac: &str, player: u8, seconds: u64) -> String {
+    format!(
+        "===========================================================\n\
+         Holding the link to {mac} (Player {player}) for up to {seconds} s.\n\
+         Note: the Player {player} LED is set for this session and goes out when\n\
+         the link drops — this hold is the LED verification window.\n\
+         Live decoded input follows, exactly like `switch2d monitor`.\n\
+         Ctrl-C ends the hold early; the link then closes cleanly.\n\
+         ==========================================================="
+    )
+}
+
+/// One line for `switch2d advert`, built only from a BlueZ snapshot.
+///
+/// Nintendo advertisement (full form):
+/// `<MAC> <public|random> pid=0x21xx <name> rssi=<n> host=<HH:..|pairing|unknown> vid=0x057E md=<hex>`
+///
+/// Everything else (used with `--all`): address, optional address type, name,
+/// RSSI only.
+pub fn advert_line_for(item: &AdvertSnapshot) -> String {
+    let rssi = item
+        .rssi
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let name = item.name.as_deref().unwrap_or("<unknown>");
+
+    let mut line = item.address.clone();
+    if let Some(kind) = &item.address_type {
+        line.push(' ');
+        line.push_str(kind);
+    }
+
+    match &item.advert {
+        Some(advert) => line.push_str(&format!(
+            " pid=0x{:04X} {} rssi={} host={} vid=0x{:04X} md={}",
+            advert.pid,
+            name,
+            rssi,
+            host_field(&advert.host),
+            advert.vid,
+            manufacturer_hex(item.manufacturer_data.as_deref()),
+        )),
+        None => line.push_str(&format!(" {} rssi={}", name, rssi)),
+    }
+    line
+}
+
+/// Bonded-host field in display order, or a state word.
+fn host_field(host: &crate::protocol::advert::HostBinding) -> String {
+    use crate::protocol::advert::HostBinding;
+    match host {
+        HostBinding::Pairing => "pairing".to_string(),
+        HostBinding::Unknown => "unknown".to_string(),
+        HostBinding::Host(wire) => wire
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    }
+}
+
+/// Lower-case, separator-free hex of the manufacturer block (`-` when absent).
+fn manufacturer_hex(data: Option<&[u8]>) -> String {
+    match data {
+        Some(bytes) if !bytes.is_empty() => bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        _ => "-".to_string(),
+    }
+}
 
 /// Stable, ordered button table for the one-line report. Masks come from
 /// `protocol::constants::button_mask`; the order is defined once here and is
@@ -389,5 +467,95 @@ mod tests {
         assert_eq!(stats.count, 3);
         assert_eq!(stats.dropped, 3);
         assert_eq!(stats.max_gap, Duration::from_millis(50));
+    }
+
+    fn snapshot(host: crate::protocol::advert::HostBinding, name: Option<&str>) -> AdvertSnapshot {
+        // Full Nintendo block: prefix, vid 0x057E, pid 0x2067, flags, host field.
+        let mut md = vec![0x00, 0x00, 0x00, 0x7E, 0x05, 0x67, 0x20, 0x00, 0x00, 0x00];
+        md.extend_from_slice(&[0x1E, 0xD6, 0x41, 0x59, 0x17, 0x8C]);
+        AdvertSnapshot {
+            address: "BC:89:A6:45:83:CC".to_string(),
+            address_type: Some("public".to_string()),
+            name: name.map(|n| n.to_string()),
+            connected: false,
+            rssi: Some(-53),
+            manufacturer_data: Some(md),
+            advert: Some(crate::protocol::advert::AdvertInfo {
+                address: "BC:89:A6:45:83:CC".to_string(),
+                vid: 0x057E,
+                pid: 0x2067,
+                host,
+            }),
+        }
+    }
+
+    #[test]
+    fn advert_line_for_nintendo_shows_host_in_display_order() {
+        // Wire bytes `1E:D6:41:59:17:8C` reverse to `8C:17:59:41:D6:1E`.
+        let line = advert_line_for(&snapshot(
+            crate::protocol::advert::HostBinding::Host([0x1E, 0xD6, 0x41, 0x59, 0x17, 0x8C]),
+            Some("Joy-Con 2 (Left)"),
+        ));
+
+        assert_eq!(
+            line,
+            "BC:89:A6:45:83:CC public pid=0x2067 Joy-Con 2 (Left) rssi=-53 \
+             host=8C:17:59:41:D6:1E vid=0x057E \
+             md=0000007e0567200000001ed64159178c"
+        );
+    }
+
+    #[test]
+    fn advert_line_for_reports_pairing_and_unknown_bindings() {
+        let pairing = advert_line_for(&snapshot(
+            crate::protocol::advert::HostBinding::Pairing,
+            None,
+        ));
+        assert!(pairing.contains("host=pairing"), "{pairing}");
+        assert!(pairing.contains("<unknown>"), "missing name is explicit");
+
+        let unknown = advert_line_for(&snapshot(
+            crate::protocol::advert::HostBinding::Unknown,
+            Some("Pro Controller 2"),
+        ));
+        assert!(unknown.contains("host=unknown"), "{unknown}");
+        assert!(unknown.contains("pid=0x2067"));
+        assert!(unknown.contains("vid=0x057E"));
+    }
+
+    #[test]
+    fn advert_line_for_non_nintendo_is_address_name_rssi_only() {
+        let item = AdvertSnapshot {
+            address: "11:22:33:44:55:66".to_string(),
+            address_type: Some("random".to_string()),
+            name: Some("some-headset".to_string()),
+            connected: false,
+            rssi: Some(-71),
+            manufacturer_data: None,
+            advert: None,
+        };
+
+        assert_eq!(
+            advert_line_for(&item),
+            "11:22:33:44:55:66 random some-headset rssi=-71"
+        );
+        // No Nintendo-only fields leak into a non-Nintendo line.
+        assert!(!advert_line_for(&item).contains("md="));
+        assert!(!advert_line_for(&item).contains("pid="));
+    }
+
+    #[test]
+    fn pair_hold_header_keeps_the_led_note_and_ctrl_c_hint() {
+        let header = pair_hold_header("BC:89:A6:45:83:CC", 2, 30);
+
+        assert!(header.contains("BC:89:A6:45:83:CC"));
+        assert!(header.contains("Player 2"));
+        assert!(header.contains("30 s"));
+        assert!(header.contains("LED"), "6 s verification note survives");
+        assert!(header.contains("Ctrl-C"));
+        assert!(
+            header.contains("switch2d monitor"),
+            "points at the same view"
+        );
     }
 }

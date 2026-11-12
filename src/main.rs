@@ -3,19 +3,25 @@
 
 use clap::{Parser, Subcommand};
 use evdev::{AbsoluteAxisType, Key};
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use switch2d::bluetooth::bluez::BluezAdvertSource;
 use switch2d::bluetooth::scan::{ScanControl, ShellScanControl};
 use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
 use switch2d::controller::{BondPolicy, ConnectOptions, DialBudget, SwitchController};
 use switch2d::daemon::Daemon;
-use switch2d::monitor::{run_monitor, MonitorConfig};
+use switch2d::monitor::{
+    advert_line_for, format_report, pair_hold_header, run_monitor, MonitorConfig,
+};
 use switch2d::protocol::constants::*;
+use switch2d::protocol::report::InputReport;
 use switch2d::protocol::vibration::{amplitude, payload, stop_payload, Layout, Sample};
 use switch2d::uinput::gamepad::{
     find_node, VirtualGamepad, KEYS, STICK_MAX, STICK_MIN, TRIGGER_MAX, TRIGGER_MIN,
@@ -81,6 +87,11 @@ enum Commands {
         /// Player assignment (1-8, defaults to next available slot)
         #[arg(short, long)]
         player: Option<u8>,
+
+        /// After bonding, keep the link open for this many seconds and stream
+        /// live decoded input (like `monitor`). 0 = the default 6 s LED hold.
+        #[arg(long, default_value_t = 0)]
+        hold: u64,
     },
 
     /// Register / add a Switch 2 controller MAC address directly
@@ -101,6 +112,17 @@ enum Commands {
     Remove {
         /// MAC address to remove
         mac: String,
+    },
+
+    /// Print live BLE advertisements (Nintendo ones in full by default)
+    Advert {
+        /// How long to watch for advertisements; 0 = until Ctrl-C
+        #[arg(long, default_value_t = 15)]
+        seconds: u64,
+
+        /// Include non-Nintendo devices (address, name, RSSI only)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Hardware smoke test: create a virtual pad, print what the kernel sees,
@@ -259,7 +281,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Pair { mac, name, player } => {
+        Commands::Pair {
+            mac,
+            name,
+            player,
+            hold,
+        } => {
             let target_mac = match mac {
                 Some(m) => m.trim().to_uppercase(),
                 None => {
@@ -303,7 +330,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let adapter_mac = config.adapter_mac.clone();
             let mac_for_task = target_mac.clone();
 
+            // Reports are forwarded to this channel from the ATT reader thread
+            // (try_send only, never printing) and consumed on the main thread
+            // by the optional --hold loop, exactly like `monitor`.
+            let (report_tx, report_rx) = mpsc::sync_channel::<InputReport>(64);
+
             let res = tokio::task::spawn_blocking(move || {
+                let callback = Box::new(move |report: &InputReport| {
+                    let _ = report_tx.try_send(report.clone());
+                });
                 // Same dial envelope as the daemon: BlueZ object removal plus
                 // short rounds. Pairing a fresh pad rarely needs the retries,
                 // but re-pairing a bonded one hits exactly the case they fix.
@@ -315,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // An explicit pair always re-bonds.
                         bond: BondPolicy::Force,
                     },
-                    Box::new(|_| {}),
+                    callback,
                     DialBudget::default(),
                 )
             }).await?;
@@ -364,6 +399,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     config.save()?;
 
+                    let ctrl_for_hold = ctrl;
+
                     println!("===========================================================");
                     if bonded {
                         println!("  ✅ Controller Successfully Paired & Bonded!");
@@ -374,9 +411,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  Address: {}", target_mac);
                     println!("  Player:  {}", next_player);
                     println!("===========================================================");
-                    println!("The LED on your controller is now set to Player {}.", next_player);
-                    println!("Holding connection for 6 seconds so you can verify the Player {} LED...", next_player);
-                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    println!(
+                        "The LED on your controller is now set to Player {}.",
+                        next_player
+                    );
+                    if hold == 0 {
+                        println!(
+                            "Holding connection for 6 seconds so you can verify the Player {} LED...",
+                            next_player
+                        );
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                    } else {
+                        println!("{}", pair_hold_header(&target_mac, next_player, hold));
+                        run_pair_hold(ctrl_for_hold, report_rx, hold).await?;
+                    }
                     println!("Saved to config. (Joy-Con LEDs will turn off now until switch2d runs or monitors).");
                 }
                 Err(e) => {
@@ -415,6 +463,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.save()?;
             println!("Registered controller {} ({}) as Player {}.", final_name, clean_mac, player);
         }
+        Commands::Advert { seconds, all } => {
+            run_advert(seconds, all).await?;
+        }
         Commands::Selftest { seconds, drive } => {
             run_selftest(seconds, drive).await?;
         }
@@ -431,6 +482,163 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `pair --hold` and `switch2d advert`
+// ---------------------------------------------------------------------------
+
+/// Keep the freshly bonded link open and print decoded reports until the
+/// deadline, Ctrl-C, or the link drops.
+///
+/// Runs on a blocking thread because `recv_timeout` and `calibrated_input` are
+/// synchronous; the caller polls `ctrl_c` and sets the cancel flag.
+async fn run_pair_hold(
+    controller: SwitchController,
+    reports: std::sync::mpsc::Receiver<InputReport>,
+    seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut seq = 0u64;
+        while Instant::now() < deadline
+            && !worker_cancel.load(Ordering::Relaxed)
+            && controller.is_connected()
+        {
+            match reports.recv_timeout(Duration::from_millis(250)) {
+                Ok(report) => {
+                    seq += 1;
+                    let calibrated = controller.calibrated_input(&report);
+                    println!("{}", format_report(seq, &report, &calibrated));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        println!("[hold] link released after {seq} report(s).");
+    });
+
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            _ = interrupt.as_mut() => {
+                cancel.store(true, Ordering::Relaxed);
+                println!("[hold] Ctrl-C received, closing the link...");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if worker.is_finished() {
+                    break;
+                }
+            }
+        }
+    }
+    worker.await?;
+    Ok(())
+}
+
+/// `switch2d advert`: watch live advertisements for `seconds` (0 = until
+/// Ctrl-C) and print one deduplicated line per device.
+async fn run_advert(seconds: u64, all: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let control = ShellScanControl::from_env();
+    let mut source = BluezAdvertSource::new();
+
+    // Printed once so the host field can be compared by eye.
+    let adapter = match source.adapter_mac(control.hci_index()) {
+        Ok(mac) => mac,
+        Err(err) => {
+            warn!("Could not read adapter address: {err}");
+            "<unknown>".to_string()
+        }
+    };
+    println!("===========================================================");
+    println!(
+        "   Advertisements  (adapter {} on hci{})",
+        adapter,
+        control.hci_index()
+    );
+    println!("   host= is the bonded-host field the pad advertises.");
+    println!("===========================================================");
+
+    if let Err(err) = control.start_le_scan() {
+        warn!("Could not start LE discovery: {err} (showing cached BlueZ objects only)");
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut printed: HashMap<String, String> = HashMap::new();
+        let mut printed_total = 0usize;
+        let deadline = if seconds == 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs(seconds))
+        };
+
+        loop {
+            if worker_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+
+            match source.snapshot() {
+                Ok(items) => {
+                    for item in items.iter().filter(|item| item.is_live()) {
+                        if !all && item.advert.is_none() {
+                            continue;
+                        }
+                        let line = advert_line_for(item);
+                        // Print only when this MAC's line changed since the
+                        // last poll (BlueZ caches properties, so an unchanged
+                        // snapshot must stay quiet).
+                        if printed.get(&item.address) != Some(&line) {
+                            println!("{line}");
+                            printed.insert(item.address.clone(), line);
+                            printed_total += 1;
+                        }
+                    }
+                }
+                Err(err) => warn!("BlueZ advert snapshot failed: {err}"),
+            }
+
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        printed_total
+    });
+
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            _ = interrupt.as_mut() => {
+                cancel.store(true, Ordering::Relaxed);
+                println!("[advert] Ctrl-C received, stopping discovery...");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if worker.is_finished() {
+                    break;
+                }
+            }
+        }
+    }
+    let printed_total = worker.await?;
+    if printed_total == 0 {
+        println!("[advert] no live advertisements seen.");
+    }
+
+    if let Err(err) = control.stop_le_scan(true) {
+        warn!("Could not stop Bluetooth discovery: {err}");
+    } else {
+        println!("[advert] discovery stopped.");
+    }
     Ok(())
 }
 
