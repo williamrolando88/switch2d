@@ -257,6 +257,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     let serial = ctrl.info.as_ref().map(|i| i.serial_number.clone()).unwrap_or_default();
+                    let bonded = ctrl.did_bond;
+
+                    if !bonded {
+                        println!("===========================================================");
+                        println!("  ⚠️  Bonding was not confirmed by the controller.");
+                        println!("  It may need to be paired again: switch2d pair {}", target_mac);
+                        println!("===========================================================");
+                    }
 
                     config.add_or_update_controller(BondedController {
                         mac: target_mac.clone(),
@@ -264,12 +272,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         product_id: pid,
                         serial,
                         player: next_player,
-                        bonded: true,
+                        bonded,
                     });
                     config.save()?;
 
                     println!("===========================================================");
-                    println!("  ✅ Controller Successfully Paired & Bonded!");
+                    if bonded {
+                        println!("  ✅ Controller Successfully Paired & Bonded!");
+                    } else {
+                        println!("  ⚠️  Controller Paired — Bonding NOT confirmed!");
+                    }
                     println!("  Device:  {}", final_name);
                     println!("  Address: {}", target_mac);
                     println!("  Player:  {}", next_player);
