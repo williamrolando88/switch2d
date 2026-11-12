@@ -336,6 +336,18 @@ impl SwitchController {
         Ok(controller)
     }
 
+    /// Write an HD-rumble payload (see [`crate::protocol::vibration`]).
+    ///
+    /// This is an **ATT Write Command (0x52)**: unacknowledged at the ATT
+    /// layer, needs no CCCD subscription, and is deliberately *not* routed
+    /// through [`Self::write_command`] (no command ACK is expected). A
+    /// `DualBlock` payload is 33 bytes and therefore needs `ATT_MTU >= 36`;
+    /// [`Self::connect_with`] already refuses any MTU below 66 for the 63-byte
+    /// input reports, so the write always fits here.
+    pub fn write_vibration(&self, payload: &[u8]) -> io::Result<()> {
+        self.att.write_command(self.handles.vibration, payload)
+    }
+
     /// Send a framed command and await the ACK notification.
     pub fn write_command(
         &self,

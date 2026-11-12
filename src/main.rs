@@ -4,9 +4,10 @@
 use clap::{Parser, Subcommand};
 use std::process::Command;
 use std::time::Duration;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use switch2d::bluetooth::scan::{ScanControl, ShellScanControl};
 use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
 use switch2d::controller::{BondPolicy, ConnectOptions, SwitchController};
 use switch2d::daemon::Daemon;
@@ -213,6 +214,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let next_player = player.unwrap_or_else(|| {
                 (config.controllers.len() as u8 + 1).min(8)
             });
+
+            // HANDOVER Bug 3: `scan_for_joycon()` kills the `bluetoothctl scan
+            // on` helper, but that does not stop HCI discovery. An LE scan
+            // still running makes the connect time out (EBUSY), so stop all
+            // discovery first — best effort, never abort the pair attempt.
+            let scan_control = ShellScanControl::from_env();
+            if let Err(err) = scan_control.prepare_global() {
+                warn!(
+                    "Could not stop Bluetooth discovery before connecting: {}",
+                    err
+                );
+            }
 
             println!("Connecting to {} (Player {})...", target_mac, next_player);
 

@@ -3,6 +3,7 @@ pub mod calibration;
 pub mod command;
 pub mod constants;
 pub mod report;
+pub mod vibration;
 
 pub use advert::{
     accepts, host_field_from_adapter, mac_to_int, AcceptPolicy, AdvertInfo, HostBinding,
@@ -18,3 +19,7 @@ pub use command::{
 };
 pub use constants::*;
 pub use report::InputReport;
+pub use vibration::{
+    amplitude, block, is_stop, layout_for, payload, stop_payload, Layout, Sample, Sequencer,
+    Sustainer, STOP_THRESHOLD, SUSTAIN_INTERVAL,
+};
