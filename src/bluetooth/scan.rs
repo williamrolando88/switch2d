@@ -6,14 +6,22 @@
 //! time. It is pure bookkeeping — the caller supplies the monotonic clock, so
 //! the whole state machine is unit-testable without a radio.
 //!
-//! [`ShellScanControl`] is the ADR-2 shell-out implementation of
-//! [`ScanControl`]. Every child gets a 1.5 s deadline and is killed and reaped
-//! on expiry: a hung `btmgmt` must never block the hub.
+//! [`ShellScanControl`] is the ADR-2 implementation of [`ScanControl`].
 //!
-//! Deviation from legacy `prepare_bluez_global()`: that function also issued a
-//! D-Bus `Adapter1.StopDiscovery` call. We skip it because this daemon has no
-//! D-Bus dependency and `bluetoothctl scan off` already drops an active
-//! discovery session.
+//! Discovery start/stop goes through the unprivileged BlueZ D-Bus API
+//! (`busctl call ... org.bluez.Adapter1 StartDiscovery/StopDiscovery`), which
+//! returns immediately and is exactly what BlueZ uses internally. We no longer
+//! shell out to `bluetoothctl` for discovery at all: `busctl` replaces both the
+//! old `bluetoothctl scan on/off` calls (ADR-6).
+//!
+//! The privileged `btmgmt -i N stop-find -l` + `stop-find` pair remains: that
+//! part must reach the HCI layer to clear a scan another client left running,
+//! and it is short-lived, so the 1.5 s child deadline is correct for it.
+//! `btmgmt find -l` is deliberately *not* used for discovery — it is a
+//! long-running command and would always be killed at the deadline.
+//!
+//! Every child gets a 1.5 s deadline and is killed and reaped on expiry: a hung
+//! helper must never block the hub.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -207,8 +215,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Poll interval while waiting for a child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// [`ScanControl`] implemented with the proven `btmgmt` / `bluetoothctl`
-/// shell-outs.
+/// [`ScanControl`] implemented with the proven `busctl` / `sudo btmgmt` /
+/// `bluetoothctl` shell-outs.
 #[derive(Debug)]
 pub struct ShellScanControl {
     hci_index: u8,
@@ -235,6 +243,19 @@ impl ShellScanControl {
     pub fn hci_index(&self) -> u8 {
         self.hci_index
     }
+
+    /// `busctl call ... org.bluez.Adapter1 <method>` on this adapter.
+    fn adapter_call(&self, method: &str) -> io::Result<()> {
+        let path = format!("/org/bluez/hci{}", self.hci_index);
+        run_command(Command::new("busctl").args([
+            "call",
+            "org.bluez",
+            path.as_str(),
+            "org.bluez.Adapter1",
+            method,
+        ]))
+        .map(|_| ())
+    }
 }
 
 impl ScanControl for ShellScanControl {
@@ -247,9 +268,9 @@ impl ScanControl for ShellScanControl {
             // pkill exits non-zero when nothing matches; log and move on.
             warn!("pkill decky-bluetooth-wake-control: {}", err);
         }
-        if let Err(err) = run_command(Command::new("bluetoothctl").args(["scan", "off"])) {
+        if let Err(err) = self.adapter_call("StopDiscovery") {
             warn!(
-                "bluetoothctl scan off failed: {} (continuing to stop-find)",
+                "Adapter1.StopDiscovery failed: {} (continuing to stop-find)",
                 err
             );
         }
@@ -257,8 +278,9 @@ impl ScanControl for ShellScanControl {
     }
 
     fn start_le_scan(&self) -> io::Result<()> {
-        let index = self.hci_index.to_string();
-        run_command(Command::new("btmgmt").args(["-i", index.as_str(), "find", "-l"])).map(|_| ())
+        // D-Bus StartDiscovery returns immediately; `btmgmt find -l` would run
+        // until killed and could never report success through our deadline.
+        self.adapter_call("StartDiscovery")
     }
 
     fn stop_le_scan(&self, force: bool) -> io::Result<()> {
@@ -280,14 +302,20 @@ impl ScanControl for ShellScanControl {
         }
 
         let index = self.hci_index.to_string();
+        // `sudo -n` is mandatory: btmgmt stop-find needs CAP_NET_ADMIN, plain
+        // btmgmt fails with EPERM and the HCI scan would keep running, breaking
+        // create-connection (HANDOVER Bug 3). `-n` also guarantees a missing
+        // sudoers rule fails fast instead of waiting on a password prompt for
+        // the whole 1.5 s child deadline. The least-privilege rule lives in
+        // /etc/sudoers.d/nso-gc-btmgmt.
         let attempts: [&[&str]; 2] = [
-            &["-i", index.as_str(), "stop-find", "-l"],
-            &["-i", index.as_str(), "stop-find"],
+            &["-n", "btmgmt", "-i", index.as_str(), "stop-find", "-l"],
+            &["-n", "btmgmt", "-i", index.as_str(), "stop-find"],
         ];
 
         let mut first_error = None;
         for args in attempts {
-            if let Err(err) = run_command(Command::new("btmgmt").args(args)) {
+            if let Err(err) = run_command(Command::new("sudo").args(args)) {
                 debug!("btmgmt {} failed: {}", args.join(" "), err);
                 first_error.get_or_insert(err);
             }
