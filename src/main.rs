@@ -1,4 +1,4 @@
-//! switch2-daemon: High-performance Linux userspace bridge and virtual gamepad daemon
+//! switch2d: High-performance Linux userspace bridge and virtual gamepad daemon
 //! for Nintendo Switch 2 controllers (Joy-Con 2, Pro Controller 2, NSO GameCube).
 
 use clap::{Parser, Subcommand};
@@ -6,12 +6,12 @@ use std::process::Command;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use switch2_daemon::config::{BondedController, DaemonConfig, DaemonMode};
-use switch2_daemon::daemon::Daemon;
-use switch2_daemon::protocol::constants::*;
+use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
+use switch2d::daemon::Daemon;
+use switch2d::protocol::constants::*;
 
 #[derive(Parser)]
-#[command(name = "switch2-daemon")]
+#[command(name = "switch2d")]
 #[command(
     version = "0.1.0",
     about = "High-performance userspace Bluetooth bridge & virtual gamepad daemon for Nintendo Switch 2 controllers",
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Status => {
             println!("===========================================================");
-            println!("   switch2-daemon Status");
+            println!("   switch2d Status");
             println!("===========================================================");
             println!("Adapter MAC:  {}", if config.adapter_mac.is_empty() { "None (not configured)" } else { &config.adapter_mac });
             println!("Joy-Con Mode: {:?}", config.mode);

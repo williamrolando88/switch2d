@@ -64,16 +64,29 @@ impl Default for DaemonConfig {
 impl DaemonConfig {
     pub fn config_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config/switch2-daemon/config.json")
+        PathBuf::from(home).join(".config/switch2d/config.json")
     }
 
-    /// Load config from file, migrating from legacy python config if necessary.
+    /// Load config from file, migrating from previous config formats if necessary.
     pub fn load() -> Self {
         let path = Self::config_path();
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(cfg) = serde_json::from_str::<DaemonConfig>(&content) {
                     info!("Loaded config from {}", path.display());
+                    return cfg;
+                }
+            }
+        }
+
+        // Try migrating from ~/.config/switch2-daemon/config.json
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let prev_path = PathBuf::from(&home).join(".config/switch2-daemon/config.json");
+        if prev_path.exists() {
+            if let Ok(content) = fs::read_to_string(&prev_path) {
+                if let Ok(cfg) = serde_json::from_str::<DaemonConfig>(&content) {
+                    info!("Migrated config from {}", prev_path.display());
+                    let _ = cfg.save();
                     return cfg;
                 }
             }

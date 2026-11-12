@@ -1,5 +1,5 @@
 [package]
-name = "switch2-daemon"
+name = "switch2d"
 version = "0.1.0"
 edition = "2021"
 authors = ["wmorales"]

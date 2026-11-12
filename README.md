@@ -1,8 +1,8 @@
-# switch2-daemon
+# switch2d
 
 **High-performance Linux userspace bridge and virtual gamepad daemon for Nintendo Switch 2 controllers.**
 
-Written in pure Rust, `switch2-daemon` connects Nintendo Switch 2 controllers (Joy-Con 2 Left & Right, Pro Controller 2, and NSO GameCube controllers) over Bluetooth Low Energy (BLE) and exposes them as native Linux `/dev/uinput` gamepads.
+Written in pure Rust, `switch2d` connects Nintendo Switch 2 controllers (Joy-Con 2 Left & Right, Pro Controller 2, and NSO GameCube controllers) over Bluetooth Low Energy (BLE) and exposes them as native Linux `/dev/uinput` gamepads.
 
 ---
 

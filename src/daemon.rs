@@ -30,15 +30,15 @@ impl Daemon {
         if adapter_mac.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "No Bluetooth adapter MAC configured. Run 'switch2-daemon pair' first.",
+                "No Bluetooth adapter MAC configured. Run 'switch2d add <MAC>' first.",
             ));
         }
 
-        info!("Starting switch2-daemon with adapter {}", adapter_mac);
+        info!("Starting switch2d with adapter {}", adapter_mac);
         info!("Active mode: {:?}", self.config.mode);
 
         if self.config.controllers.is_empty() {
-            warn!("No controllers paired yet. Run 'switch2-daemon pair' to bond Joy-Cons.");
+            warn!("No controllers paired yet. Run 'switch2d add <MAC>' to bond Joy-Cons.");
             return Ok(());
         }
 
