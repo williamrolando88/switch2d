@@ -44,9 +44,12 @@ use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
 use crate::hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
 use crate::protocol::constants::{button_mask, PRO_CONTROLLER2_PID};
 use crate::protocol::report::InputReport;
+use crate::protocol::vibration::SUSTAIN_INTERVAL;
+use crate::rumble::{RumbleAction, RumbleEngine};
 use crate::status::{
     battery_pct_from_mv, ControllerStatus, DaemonStatus, ServiceState, StatusPublisher,
 };
+use crate::uinput::ff::FfEvent;
 use crate::uinput::{PadSink, VirtualGamepad, STICK_MAX};
 use crate::worker::{Worker, WorkerConfig};
 
@@ -577,7 +580,7 @@ enum Side {
 #[allow(clippy::too_many_arguments)]
 async fn run_pad_worker<S>(
     pad: PadSpec,
-    sink: S,
+    mut sink: S,
     mut sessions: tokio_mpsc::Receiver<SwitchController>,
     mut reports: tokio_mpsc::Receiver<InputReport>,
     drops: Arc<AtomicU64>,
@@ -585,12 +588,12 @@ async fn run_pad_worker<S>(
     sup_tx: UnboundedSender<SupervisorMsg>,
     idle_timeout: Duration,
 ) where
-    S: PadSink + Clone,
+    S: PadSink + FfPad + Clone,
 {
     while let Some(controller) = sessions.recv().await {
         run_session(
             &pad,
-            &sink,
+            &mut sink,
             controller,
             &mut reports,
             &drops,
@@ -606,15 +609,15 @@ async fn run_pad_worker<S>(
 #[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     pad: &PadSpec,
-    sink: &S,
-    controller: SwitchController,
+    sink: &mut S,
+    mut controller: SwitchController,
     reports: &mut tokio_mpsc::Receiver<InputReport>,
     drops: &AtomicU64,
     hub_tx: &StdSender<HubMsg>,
     sup_tx: &UnboundedSender<SupervisorMsg>,
     idle_timeout: Duration,
 ) where
-    S: PadSink + Clone,
+    S: PadSink + FfPad + Clone,
 {
     // Frames queued for a previous session must not be applied to this one.
     while reports.try_recv().is_ok() {}
@@ -637,10 +640,24 @@ async fn run_session<S>(
         })
         .ok();
 
+    // Rumble: profile-routed engine (HD sustainer or GameCube presets), fed by
+    // the uinput FF queue drained from the pad sink.
+    let mut rumble = RumbleEngine::new(controller_profile(&controller));
+    // Kernel-space level last handed to the engine. Comparing the level (not
+    // the event alone) keeps the two halves of a combined node coherent: either
+    // worker may drain the shared node's events, and `ff_target()` is the
+    // authoritative state afterwards.
+    let mut last_ff = (0u16, 0u16);
+    // Absolute 16 ms rumble grid. The timer arm below wakes exactly at the next
+    // slot, so a silent pad costs one wake-up per slot and a rumbling one can
+    // never burst (the sustainer also refuses more than one packet per slot).
+    let mut next_rumble = Instant::now();
+
     let mut battery_mv = 0u16;
     let mut idle_sleep = false;
 
     loop {
+        let rumble_deadline = tokio::time::Instant::from_std(next_rumble);
         tokio::select! {
             maybe = reports.recv() => {
                 let Some(report) = maybe else { break };
@@ -659,7 +676,11 @@ async fn run_session<S>(
                         })
                         .ok();
                 }
-                let sleep_now = worker.should_sleep(Instant::now());
+                let now = Instant::now();
+                if rumble_due(&mut next_rumble, now) {
+                    pump_rumble(sink, &mut rumble, &mut controller, now, &mut last_ff);
+                }
+                let sleep_now = worker.should_sleep(now);
                 if !controller.is_connected() {
                     break;
                 }
@@ -667,6 +688,13 @@ async fn run_session<S>(
                     idle_sleep = true;
                     break;
                 }
+            }
+            _ = tokio::time::sleep_until(rumble_deadline) => {
+                // No report is needed to keep a sustained rumble alive: the
+                // pad only ever sees the 16 ms sustain packets from here.
+                let now = Instant::now();
+                next_rumble = now + SUSTAIN_INTERVAL;
+                pump_rumble(sink, &mut rumble, &mut controller, now, &mut last_ff);
             }
             _ = sleep(SESSION_POLL_INTERVAL) => {
                 if !controller.is_connected() {
@@ -686,9 +714,16 @@ async fn run_session<S>(
             pad.mac, idle_timeout
         );
     }
-    // Teardown order (deviation 6): rumble stop (not wired yet), release every
-    // key/axis, keep the node open for the next session.
-    teardown_session(&mut worker, &pad.mac);
+    // Teardown order (deviation 6): silence rumble first (exactly one stop
+    // packet on HD pads; the GameCube path cancels its queued clip), then
+    // release every key/axis. The uinput node stays open for the next session.
+    teardown_with_rumble(
+        &mut worker,
+        &mut rumble,
+        &mut controller,
+        &pad.mac,
+        Instant::now(),
+    );
     if idle_sleep {
         // Waits (<= 1 s) for the HCI-state reply, then closes the link.
         controller.sleep();
@@ -718,6 +753,115 @@ fn teardown_session<S: PadSink>(worker: &mut Worker<S>, mac: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rumble routing
+// ---------------------------------------------------------------------------
+
+/// Pad-side force-feedback source: the uinput node owned by the worker's sink.
+trait FfPad {
+    fn poll_ff(&mut self) -> io::Result<Vec<FfEvent>>;
+    fn ff_target(&self) -> (u16, u16);
+}
+
+/// Destination for [`RumbleAction`]s: the session's controller, or a test fake.
+trait RumbleSink {
+    fn deliver(&mut self, action: &RumbleAction) -> io::Result<()>;
+}
+
+impl RumbleSink for SwitchController {
+    fn deliver(&mut self, action: &RumbleAction) -> io::Result<()> {
+        match action {
+            RumbleAction::HdPacket(payload) => self.write_vibration(payload),
+            // Blocks up to 2 s for the ACK on the GameCube path: called from
+            // the session task, never while a pad mutex is held.
+            RumbleAction::Preset(preset) => self.play_vibration_preset(*preset),
+        }
+    }
+}
+
+/// Profile of the controller that is actually connected (PID from its info).
+fn controller_profile(
+    controller: &SwitchController,
+) -> &'static crate::profiles::ControllerProfile {
+    let pid = controller
+        .info
+        .as_ref()
+        .map(|info| info.product_id)
+        .unwrap_or(PRO_CONTROLLER2_PID);
+    crate::profiles::profile_or_default(pid)
+}
+
+/// Should the rumble pump run now? Advances the absolute 16 ms grid.
+///
+/// `false` means the caller arrived early and must not pump: this is what keeps
+/// a stream of reports from turning into a packet burst.
+fn rumble_due(next: &mut Instant, now: Instant) -> bool {
+    if now < *next {
+        return false;
+    }
+    *next = now + SUSTAIN_INTERVAL;
+    true
+}
+
+/// Drain the uinput FF queue and dispatch at most one rumble action.
+///
+/// Draining is mandatory even when nothing is playing: upload/erase requests
+/// are acknowledged through this queue and would otherwise block the
+/// application that issued them.
+fn pump_rumble<P: FfPad, R: RumbleSink>(
+    pad: &mut P,
+    engine: &mut RumbleEngine,
+    out: &mut R,
+    now: Instant,
+    last_ff: &mut (u16, u16),
+) {
+    if let Err(err) = pad.poll_ff() {
+        debug!("uinput FF poll failed: {err}");
+    }
+
+    // `Played`/`Stopped` change this level, global gain changes do not (the
+    // kernel freezes the gained magnitudes of the running effect), so a level
+    // comparison is exactly the required set_target trigger.
+    let target = pad.ff_target();
+    if target != *last_ff {
+        *last_ff = target;
+        engine.set_target(target.0, target.1, now);
+    }
+
+    deliver_action(engine.tick(now), out);
+}
+
+/// Ordered teardown (deviation 6): rumble stop, then key/axis release.
+///
+/// Kept as one function so the order cannot be flipped by accident, and so the
+/// order itself is testable without a socket or a uinput node.
+fn teardown_with_rumble<S: PadSink, R: RumbleSink>(
+    worker: &mut Worker<S>,
+    engine: &mut RumbleEngine,
+    out: &mut R,
+    mac: &str,
+    now: Instant,
+) {
+    stop_rumble(engine, out, now);
+    teardown_session(worker, mac);
+}
+
+/// Stop rumble: one silent target, one tick (deviation 6, before releasing keys).
+fn stop_rumble<R: RumbleSink>(engine: &mut RumbleEngine, out: &mut R, now: Instant) {
+    engine.set_target(0, 0, now);
+    deliver_action(engine.tick(now), out);
+}
+
+/// Send one action, swallowing (but logging) write errors: a pad that refuses a
+/// vibration packet still streams input, so the session must survive.
+fn deliver_action<R: RumbleSink>(action: Option<RumbleAction>, out: &mut R) {
+    if let Some(action) = action {
+        if let Err(err) = out.deliver(&action) {
+            debug!("rumble write failed (session continues): {err}");
+        }
+    }
+}
+
 fn lock_gamepad(
     gamepad: &Arc<StdMutex<VirtualGamepad>>,
 ) -> std::sync::MutexGuard<'_, VirtualGamepad> {
@@ -730,6 +874,17 @@ fn lock_gamepad(
 #[derive(Clone)]
 struct SharedPadSink {
     gamepad: Arc<StdMutex<VirtualGamepad>>,
+}
+
+impl FfPad for SharedPadSink {
+    fn poll_ff(&mut self) -> io::Result<Vec<FfEvent>> {
+        let mut gamepad = lock_gamepad(&self.gamepad);
+        gamepad.poll_ff()
+    }
+
+    fn ff_target(&self) -> (u16, u16) {
+        lock_gamepad(&self.gamepad).ff_target()
+    }
 }
 
 impl PadSink for SharedPadSink {
@@ -766,6 +921,20 @@ struct CombinedSideSink {
     gamepad: Arc<StdMutex<VirtualGamepad>>,
     side: Side,
     horizontal: bool,
+}
+
+impl FfPad for CombinedSideSink {
+    // The combined node has one kernel FF queue shared by both halves; either
+    // worker may drain it, and `ff_target()` afterwards reports the same level
+    // to both, which the level comparison in `pump_rumble` relies on.
+    fn poll_ff(&mut self) -> io::Result<Vec<FfEvent>> {
+        let mut gamepad = lock_gamepad(&self.gamepad);
+        gamepad.poll_ff()
+    }
+
+    fn ff_target(&self) -> (u16, u16) {
+        lock_gamepad(&self.gamepad).ff_target()
+    }
 }
 
 impl PadSink for CombinedSideSink {
@@ -1158,12 +1327,15 @@ mod tests {
 
     // --- Sink fake -------------------------------------------------------
 
+    type CallLog = Arc<StdMutex<Vec<&'static str>>>;
+
     #[derive(Default)]
     struct FakeSink {
         updates: usize,
         buttons: u32,
         sticks: (f32, f32, f32, f32),
         releases: usize,
+        log: Option<CallLog>,
     }
 
     impl PadSink for FakeSink {
@@ -1183,6 +1355,11 @@ mod tests {
             self.releases += 1;
             self.buttons = 0;
             self.sticks = (0.0, 0.0, 0.0, 0.0);
+            if let Some(log) = &self.log {
+                log.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("release");
+            }
             Ok(())
         }
 
@@ -1430,5 +1607,284 @@ mod tests {
         ));
         assert!(status.hub_scanning);
         assert_eq!(status_headline(&status), "Scanning");
+    }
+
+    // --- Rumble ----------------------------------------------------------
+
+    use crate::profiles::profile_for;
+    use crate::protocol::constants::JOYCON2_LEFT_PID;
+    use crate::protocol::vibration::{Preset, Sample};
+
+    #[derive(Default)]
+    struct FakePad {
+        target: (u16, u16),
+        events: Vec<FfEvent>,
+        polls: usize,
+    }
+
+    impl PadSink for FakePad {
+        fn update(
+            &mut self,
+            _buttons: u32,
+            _sticks: (f32, f32, f32, f32),
+            _triggers: (u8, u8),
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_player(&mut self, _player: u8) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl FfPad for FakePad {
+        fn poll_ff(&mut self) -> io::Result<Vec<FfEvent>> {
+            self.polls += 1;
+            Ok(std::mem::take(&mut self.events))
+        }
+
+        fn ff_target(&self) -> (u16, u16) {
+            self.target
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeController {
+        attempts: usize,
+        hd: Vec<Vec<u8>>,
+        presets: Vec<Preset>,
+        fail: bool,
+        log: Option<CallLog>,
+    }
+
+    impl RumbleSink for FakeController {
+        fn deliver(&mut self, action: &RumbleAction) -> io::Result<()> {
+            self.attempts += 1;
+            if let Some(log) = &self.log {
+                log.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("rumble");
+            }
+            if self.fail {
+                return Err(io::Error::other("pad refused the vibration packet"));
+            }
+            match action {
+                RumbleAction::HdPacket(payload) => self.hd.push(payload.clone()),
+                RumbleAction::Preset(preset) => self.presets.push(*preset),
+            }
+            Ok(())
+        }
+    }
+
+    fn joycon_engine() -> RumbleEngine {
+        RumbleEngine::new(profile_for(JOYCON2_LEFT_PID).expect("joycon profile"))
+    }
+
+    /// Payload sample bytes used by the vibration tests (after the 2-byte header).
+    fn sample(payload: &[u8]) -> &[u8] {
+        &payload[2..7]
+    }
+
+    #[test]
+    fn worker_dispatches_hd_packets_on_a_16ms_cadence() {
+        let t0 = Instant::now();
+        let mut engine = joycon_engine();
+        let mut pad = FakePad::default();
+        let mut out = FakeController::default();
+        let mut last_ff = (0, 0u16);
+        let mut next = t0;
+
+        // The application starts a full-strength effect: the kernel level moves.
+        pad.target = (u16::MAX, 0);
+        pad.events.push(FfEvent::Played { id: 1, gain: 1.0 });
+
+        // Slot 0: due, one packet.
+        assert!(rumble_due(&mut next, t0));
+        pump_rumble(&mut pad, &mut engine, &mut out, t0, &mut last_ff);
+        assert_eq!(out.hd.len(), 1, "first packet starts the rumble");
+        assert_eq!(out.hd[0].len(), 17, "Joy-Con uses one 17-byte block");
+
+        // Within the same slot the loop must not pump (no burst).
+        assert!(!rumble_due(&mut next, t0 + Duration::from_millis(8)));
+        assert!(!rumble_due(&mut next, t0 + Duration::from_millis(15)));
+
+        // Exactly one sustained packet per 16 ms slot, with no reports at all.
+        for slot in 1..=4u32 {
+            let now = t0 + SUSTAIN_INTERVAL * slot;
+            assert!(rumble_due(&mut next, now), "slot {slot} is due");
+            pump_rumble(&mut pad, &mut engine, &mut out, now, &mut last_ff);
+            assert_eq!(out.hd.len(), slot as usize + 1, "one packet per slot");
+
+            // A redundant pump at the same instant cannot add another packet.
+            pump_rumble(&mut pad, &mut engine, &mut out, now, &mut last_ff);
+            assert_eq!(out.hd.len(), slot as usize + 1);
+        }
+
+        assert!(out.presets.is_empty(), "Joy-Con never uses the preset path");
+        assert!(pad.polls >= 5, "every slot drained the FF queue");
+    }
+
+    #[test]
+    fn worker_sends_one_stop_packet_on_teardown() {
+        let t0 = Instant::now();
+        let mut engine = joycon_engine();
+        let mut pad = FakePad::default();
+        let mut out = FakeController::default();
+        let mut last_ff = (0, 0u16);
+
+        pad.target = (u16::MAX, 0);
+        pump_rumble(&mut pad, &mut engine, &mut out, t0, &mut last_ff);
+        assert_eq!(out.hd.len(), 1, "rumble is running");
+
+        let teardown_at = t0 + Duration::from_millis(5);
+        stop_rumble(&mut engine, &mut out, teardown_at);
+        assert_eq!(out.hd.len(), 2, "exactly one stop packet");
+        assert_eq!(sample(&out.hd[1]), &Sample::default().to_u40());
+
+        // A second teardown (or any later tick) sends nothing more.
+        stop_rumble(&mut engine, &mut out, teardown_at + Duration::from_secs(1));
+        pump_rumble(
+            &mut pad,
+            &mut engine,
+            &mut out,
+            teardown_at + Duration::from_secs(2),
+            &mut last_ff,
+        );
+        assert_eq!(out.hd.len(), 2, "stop is emitted once and parks");
+    }
+
+    #[test]
+    fn rumble_write_error_does_not_end_the_session() {
+        let t0 = Instant::now();
+        let mut engine = joycon_engine();
+        let mut pad = FakePad::default();
+        let mut out = FakeController {
+            fail: true,
+            ..FakeController::default()
+        };
+        let mut last_ff = (0, 0u16);
+        let mut next = t0;
+
+        pad.target = (u16::MAX, 0);
+        assert!(rumble_due(&mut next, t0));
+        pump_rumble(&mut pad, &mut engine, &mut out, t0, &mut last_ff);
+        assert_eq!(out.attempts, 1, "the write was attempted");
+        assert!(out.hd.is_empty(), "nothing was recorded");
+
+        // The session keeps pumping on the next slot: the error was swallowed,
+        // not propagated, so the input loop is still alive.
+        let t16 = t0 + SUSTAIN_INTERVAL;
+        assert!(rumble_due(&mut next, t16));
+        pump_rumble(&mut pad, &mut engine, &mut out, t16, &mut last_ff);
+        assert_eq!(out.attempts, 2, "the pump retried after the failure");
+        assert!(out.hd.is_empty());
+
+        // Teardown over a failing write must not panic either.
+        stop_rumble(&mut engine, &mut out, t16 + Duration::from_millis(1));
+        assert_eq!(out.attempts, 3);
+    }
+
+    #[test]
+    fn no_rumble_when_the_pad_is_silent() {
+        let t0 = Instant::now();
+        let mut engine = joycon_engine();
+        let mut pad = FakePad::default();
+        let mut out = FakeController::default();
+        let mut last_ff = (0, 0u16);
+        let mut next = t0;
+
+        for slot in 0..3u32 {
+            let now = t0 + SUSTAIN_INTERVAL * slot;
+            assert!(rumble_due(&mut next, now));
+            pump_rumble(&mut pad, &mut engine, &mut out, now, &mut last_ff);
+        }
+        stop_rumble(&mut engine, &mut out, t0 + Duration::from_secs(1));
+
+        assert!(out.hd.is_empty(), "silent pad: no sustain packets");
+        assert!(out.presets.is_empty(), "silent pad: no presets");
+        assert_eq!(out.attempts, 0);
+        assert!(pad.polls >= 3, "the FF queue is drained even when silent");
+    }
+
+    #[test]
+    fn preset_pads_cancel_instead_of_sending_a_stop_packet() {
+        // The GameCube path has no stop subcommand: teardown cancels the queued
+        // clip and must not emit an HD packet.
+        let t0 = Instant::now();
+        let profile =
+            profile_for(crate::protocol::constants::NSO_GAMECUBE_PID).expect("gamecube profile");
+        let mut engine = RumbleEngine::new(profile);
+        let mut pad = FakePad::default();
+        let mut out = FakeController::default();
+        let mut last_ff = (0, 0u16);
+
+        pad.target = (u16::MAX, 0);
+        pump_rumble(&mut pad, &mut engine, &mut out, t0, &mut last_ff);
+        assert_eq!(out.presets, vec![Preset::Strong]);
+        assert!(out.hd.is_empty());
+
+        // Release before the next tick cancels any queued clip.
+        pad.target = (0, 0);
+        pump_rumble(
+            &mut pad,
+            &mut engine,
+            &mut out,
+            t0 + Duration::from_millis(10),
+            &mut last_ff,
+        );
+        stop_rumble(&mut engine, &mut out, t0 + Duration::from_millis(20));
+        assert_eq!(out.presets, vec![Preset::Strong], "no second clip");
+        assert!(out.hd.is_empty(), "never an HD packet on the GC path");
+    }
+
+    #[test]
+    fn teardown_stops_rumble_before_releasing_input() {
+        let t0 = Instant::now();
+        let log: CallLog = Arc::new(StdMutex::new(Vec::new()));
+
+        let mut worker = Worker::new(
+            WorkerConfig {
+                mac: PAD.to_string(),
+                player: 2,
+                idle_timeout: Duration::from_secs(300),
+            },
+            FakeSink {
+                log: Some(Arc::clone(&log)),
+                ..FakeSink::default()
+            },
+        );
+        worker
+            .on_report(&report(button_mask::A), &calibrated(), t0)
+            .expect("sink accepts the report");
+
+        let mut engine = joycon_engine();
+        let mut out = FakeController {
+            log: Some(Arc::clone(&log)),
+            ..FakeController::default()
+        };
+        // Rumble is running when the session ends.
+        engine.set_target(u16::MAX, 0, t0);
+        let _ = engine.tick(t0);
+        assert_eq!(out.attempts, 0, "the engine action is still queued");
+
+        teardown_with_rumble(
+            &mut worker,
+            &mut engine,
+            &mut out,
+            PAD,
+            t0 + Duration::from_millis(5),
+        );
+
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["rumble", "release"],
+            "rumble must stop before keys are released (deviation 6)"
+        );
+        assert_eq!(out.hd.len(), 1, "exactly one stop packet");
+        assert_eq!(sample(&out.hd[0]), &Sample::default().to_u40());
     }
 }
