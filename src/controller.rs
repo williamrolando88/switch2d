@@ -29,6 +29,8 @@ const MIN_ATT_MTU_FOR_REPORTS: u16 = 66;
 const MAX_MEMORY_READ_LEN: u8 = 0x4F;
 /// Legacy calibration reads 0x0B bytes (three packed 12-bit pairs plus slack).
 const CALIBRATION_LEN: u8 = 0x0B;
+/// Only the first three packed triples are consumed by `get_stick_xy`.
+const CALIBRATION_MIN_PARSE_LEN: usize = 9;
 /// Timeout for each bonding command ACK.
 const BOND_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -798,16 +800,6 @@ impl SwitchController {
             return Err(io::Error::other("Invalid memory read response"));
         }
 
-        let echoed_address = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        if echoed_address != address {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Memory read echoed address 0x{echoed_address:08X}, expected 0x{address:08X}"
-                ),
-            ));
-        }
-
         // Evidence before validation-by-parsing: what the pad actually sent.
         debug!(
             "memory read addr=0x{address:08X} req_len={length} resp_len={} resp_first8={:02X?}",
@@ -815,7 +807,9 @@ impl SwitchController {
             &data[..data.len().min(8)]
         );
 
-        Ok(data[8..].to_vec())
+        // `memory_read_payload` re-checks the header (legacy parity) and, like
+        // legacy, does NOT require the full requested payload length.
+        Ok(memory_read_payload(length, address, &data)?.to_vec())
     }
 
     pub fn read_controller_info(&self) -> io::Result<ControllerInfo> {
@@ -859,8 +853,19 @@ impl SwitchController {
             CALIBRATION_LEN,
             &user_result,
         );
-        let user = match user_result {
-            Ok(data) => Some(data),
+        if let Ok(data) = &user_result {
+            if let Some(message) =
+                calibration_short_read_warning(stick, "user", user_address, data)
+            {
+                warn!("{message}");
+            } else if let Some(message) =
+                calibration_short_parseable_note(stick, "user", user_address, data)
+            {
+                debug!("{message}");
+            }
+        }
+        let user = match &user_result {
+            Ok(data) => Some(data.clone()),
             Err(err) => {
                 warn!(
                     "Reading {stick} stick user calibration (0x{user_address:08X}) failed: {err}"
@@ -869,33 +874,56 @@ impl SwitchController {
             }
         };
 
-        let factory = if needs_factory_calibration(user.as_deref()) {
-            let factory_result = self.read_memory(CALIBRATION_LEN, factory_address);
+        let factory_result = if needs_factory_calibration(user.as_deref()) {
+            let result = self.read_memory(CALIBRATION_LEN, factory_address);
             crate::protocol::calibration::log_calibration_read(
                 stick,
                 "factory",
                 factory_address,
                 CALIBRATION_LEN,
-                &factory_result,
+                &result,
             );
-            match factory_result {
-                Ok(data) => Some(data),
-                Err(err) => {
-                    warn!(
-                        "Reading {stick} stick factory calibration \
-                         (0x{factory_address:08X}) failed: {err}"
-                    );
-                    None
+            if let Ok(data) = &result {
+                if let Some(message) =
+                    calibration_short_read_warning(stick, "factory", factory_address, data)
+                {
+                    warn!("{message}");
+                } else if let Some(message) =
+                    calibration_short_parseable_note(stick, "factory", factory_address, data)
+                {
+                    debug!("{message}");
                 }
             }
+            Some(result)
         } else {
             None
+        };
+
+        let factory = match factory_result.as_ref() {
+            Some(Ok(data)) => Some(data.clone()),
+            Some(Err(err)) => {
+                warn!(
+                    "Reading {stick} stick factory calibration \
+                     (0x{factory_address:08X}) failed: {err}"
+                );
+                None
+            }
+            None => None,
         };
 
         let (calibration, source) = choose_calibration(user.as_deref(), factory.as_deref());
         match source {
             CalibrationSource::Default => {
-                warn!("Using default {stick} stick calibration (controller reports none)");
+                warn!(
+                    "{}",
+                    default_calibration_warning(
+                        stick,
+                        user_address,
+                        &user_result,
+                        factory_address,
+                        factory_result.as_ref()
+                    )
+                );
             }
             _ => debug!("{stick} stick calibration source: {source:?}"),
         }
@@ -1039,6 +1067,110 @@ impl SwitchController {
         }
         self.att.close();
     }
+}
+
+/// Validate the fixed 8-byte memory-read response header and return the memory
+/// bytes.
+///
+/// Mirrors legacy `device.py:248-250`: only `data[0] == length` and the echoed
+/// address are checked. It deliberately does NOT require
+/// `data.len() == 8 + length`, so a truncated response passes here and is
+/// rejected later by [`StickCalibration::from_bytes`].
+fn memory_read_payload<'a>(
+    length: u8,
+    address: u32,
+    data: &'a [u8],
+) -> io::Result<&'a [u8]> {
+    if data.len() < 8 || data[0] != length {
+        return Err(io::Error::other("Invalid memory read response"));
+    }
+
+    let echoed_address = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    if echoed_address != address {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Memory read echoed address 0x{echoed_address:08X}, expected 0x{address:08X}"
+            ),
+        ));
+    }
+
+    Ok(&data[8..])
+}
+
+/// Uppercase hex preview for short-read diagnostics.
+fn hex_bytes(data: &[u8], limit: usize) -> String {
+    data.iter()
+        .take(limit)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Warning text for a calibration payload shorter than the 9 bytes consumed by
+/// `get_stick_xy`; `None` when the payload is long enough to parse.
+fn calibration_short_read_warning(
+    stick: &str,
+    area: &str,
+    address: u32,
+    data: &[u8],
+) -> Option<String> {
+    if data.len() >= CALIBRATION_MIN_PARSE_LEN {
+        return None;
+    }
+    Some(format!(
+        "Short {stick} stick {area} calibration read: addr=0x{address:08X} \
+         returned {} bytes (need {CALIBRATION_MIN_PARSE_LEN} for three 12-bit pairs), \
+         first=[{}]; continuing",
+        data.len(),
+        hex_bytes(data, 8)
+    ))
+}
+
+/// Debug text for a payload that is shorter than the requested 0x0B but still
+/// has the 9 bytes `get_stick_xy` consumes.
+fn calibration_short_parseable_note(
+    stick: &str,
+    area: &str,
+    address: u32,
+    data: &[u8],
+) -> Option<String> {
+    let len = data.len();
+    if !(CALIBRATION_MIN_PARSE_LEN..usize::from(CALIBRATION_LEN)).contains(&len) {
+        return None;
+    }
+    Some(format!(
+        "Short but parseable {stick} stick {area} calibration read: \
+         addr=0x{address:08X} returned {len} bytes; parsing first {CALIBRATION_MIN_PARSE_LEN}"
+    ))
+}
+
+fn calibration_read_evidence(result: &io::Result<Vec<u8>>) -> String {
+    match result {
+        Ok(data) => format!("{} bytes", data.len()),
+        Err(err) => format!("error: {err}"),
+    }
+}
+
+/// Final fallback warning: names both areas and why they were rejected, so a
+/// default-log user report is actionable without RUST_LOG=debug.
+fn default_calibration_warning(
+    stick: &str,
+    user_address: u32,
+    user_result: &io::Result<Vec<u8>>,
+    factory_address: u32,
+    factory_result: Option<&io::Result<Vec<u8>>>,
+) -> String {
+    let factory = match factory_result {
+        Some(result) => calibration_read_evidence(result),
+        None => "not read (user payload did not match FF sentinel)".to_string(),
+    };
+    format!(
+        "Using default {stick} stick calibration: \
+         user=0x{user_address:08X} ({}), factory=0x{factory_address:08X} ({factory}), \
+         decision=defaults",
+        calibration_read_evidence(user_result)
+    )
 }
 
 /// Whether the user calibration area is absent or still unwritten.
@@ -1435,5 +1567,161 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(control.removals.get(), 0, "never remove under a live session");
         assert_eq!(report.device_removal, "skipped (live session)");
+    }
+
+    #[test]
+    fn memory_read_header_validation_rejects_bad_length_and_address() {
+        let address = 0x001F_C062u32;
+        let mut response = vec![CALIBRATION_LEN, 0x7E, 0x00, 0x00];
+        response.extend_from_slice(&address.to_le_bytes());
+        response.extend_from_slice(&[0u8; 11]);
+        assert_eq!(
+            memory_read_payload(CALIBRATION_LEN, address, &response)
+                .expect("header parses")
+                .len(),
+            11
+        );
+
+        let mut wrong_len = response.clone();
+        wrong_len[0] = CALIBRATION_LEN - 1;
+        assert!(memory_read_payload(CALIBRATION_LEN, address, &wrong_len).is_err());
+
+        let mut wrong_address = response.clone();
+        wrong_address[4..8].copy_from_slice(&0x001F_C042u32.to_le_bytes());
+        assert!(memory_read_payload(CALIBRATION_LEN, address, &wrong_address).is_err());
+
+        assert!(memory_read_payload(CALIBRATION_LEN, address, &response[..7]).is_err());
+    }
+
+    #[test]
+    fn memory_read_header_validation_accepts_truncated_payload() {
+        // Pins the audit finding: a response with a valid 8-byte header but
+        // only 3 of the 11 requested memory bytes passes read_memory and
+        // becomes a 3-byte Vec, which StickCalibration::from_bytes rejects.
+        let address = 0x001F_C062u32;
+        let mut response = vec![CALIBRATION_LEN, 0x7E, 0x00, 0x00];
+        response.extend_from_slice(&address.to_le_bytes());
+        response.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let payload = memory_read_payload(CALIBRATION_LEN, address, &response)
+            .expect("header checks pass");
+        assert_eq!(payload.len(), 3, "requested length is not enforced");
+        assert!(StickCalibration::from_bytes(payload).is_none());
+
+        // The 3-byte case must now take the loud short-read path.
+        let warning = calibration_short_read_warning("right", "user", address, payload)
+            .expect("3-byte payload warns");
+        assert!(warning.contains("returned 3 bytes"), "warning: {warning}");
+        assert!(warning.contains("first=[AA BB CC]"), "warning: {warning}");
+    }
+
+    #[test]
+    fn calibration_length_policy_9_bytes_parses_without_short_warning() {
+        let nine = [0x00, 0x08, 0x80, 0xA4, 0x46, 0x6A, 0xA4, 0x46, 0x6A];
+        let address = 0x001F_C062u32;
+
+        assert!(StickCalibration::from_bytes(&nine).is_some());
+        assert_eq!(
+            calibration_short_read_warning("right", "user", address, &nine),
+            None,
+            "9 bytes are enough to parse; no short-read warning"
+        );
+        let note = calibration_short_parseable_note("right", "user", address, &nine)
+            .expect("9..10 byte debug note");
+        assert!(note.contains("returned 9 bytes"), "note: {note}");
+    }
+
+    #[test]
+    fn calibration_length_policy_8_bytes_warns_and_falls_back() {
+        let eight = [0x00, 0x08, 0x80, 0xA4, 0x46, 0x6A, 0xA4, 0x46];
+        let address = 0x001F_C062u32;
+
+        let warning = calibration_short_read_warning("right", "user", address, &eight)
+            .expect("8-byte payload warns");
+        assert!(warning.contains("addr=0x001FC062"), "warning: {warning}");
+        assert!(warning.contains("returned 8 bytes"), "warning: {warning}");
+        assert!(warning.contains("need 9"), "warning: {warning}");
+        assert!(
+            warning.contains("first=[00 08 80 A4 46 6A A4 46]"),
+            "warning: {warning}"
+        );
+        assert_eq!(
+            calibration_short_parseable_note("right", "user", address, &eight),
+            None,
+            "8 bytes is not parseable"
+        );
+
+        assert!(StickCalibration::from_bytes(&eight).is_none());
+        assert_eq!(
+            choose_calibration(Some(&eight), None),
+            (StickCalibration::default(), CalibrationSource::Default)
+        );
+    }
+
+    #[test]
+    fn default_calibration_warning_names_both_areas() {
+        let user_address = 0x001F_C062u32;
+        let factory_address = 0x0001_30E8u32;
+        let user = Ok(vec![0xFF; 11]);
+        let factory = Ok(Vec::new());
+
+        let message = default_calibration_warning(
+            "right",
+            user_address,
+            &user,
+            factory_address,
+            Some(&factory),
+        );
+        assert_eq!(
+            message,
+            "Using default right stick calibration: user=0x001FC062 (11 bytes), \
+             factory=0x000130E8 (0 bytes), decision=defaults"
+        );
+        assert!(message.contains("decision=defaults"), "message: {message}");
+
+        // Factory not attempted: the warning still says why.
+        let skipped = default_calibration_warning(
+            "right",
+            user_address,
+            &Ok(vec![0x00, 0x08, 0x80]),
+            factory_address,
+            None,
+        );
+        assert!(
+            skipped.contains("factory=0x000130E8 (not read (user payload did not match FF sentinel))"),
+            "message: {skipped}"
+        );
+    }
+
+    #[test]
+    fn short_calibration_warning_includes_evidence() {
+        let message = calibration_short_read_warning(
+            "right",
+            "user",
+            0x001F_C062,
+            &[0xAA, 0xBB, 0xCC],
+        )
+        .expect("3-byte payload warns");
+        assert!(message.contains("Short right stick user calibration read"));
+        assert!(message.contains("addr=0x001FC062"));
+        assert!(message.contains("returned 3 bytes"));
+        assert!(message.contains("first=[AA BB CC]"));
+        assert!(message.contains("need 9"));
+        assert!(message.contains("continuing"));
+    }
+
+    #[test]
+    fn needs_factory_calibration_is_per_stick() {
+        // Left and right each call this with their own user result, so one
+        // side can never short-circuit the other.
+        assert!(needs_factory_calibration(None));
+        assert!(needs_factory_calibration(Some(&[])));
+        assert!(needs_factory_calibration(Some(&[0x00, 0x08])));
+        assert!(needs_factory_calibration(Some(&[
+            0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ])));
+        assert!(!needs_factory_calibration(Some(&[
+            0x00, 0x08, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ])));
     }
 }
