@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    match cli.command.unwrap_or(Commands::Run) {
+    match cli.command.unwrap_or(Commands::Status) {
         Commands::Run => {
             println!("===========================================================");
             println!("   Nintendo Switch 2 Linux Gamepad Daemon (Rust)");
@@ -142,21 +142,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Status => {
             println!("===========================================================");
-            println!("   switch2d Status");
+            println!("   switch2d Overview");
             println!("===========================================================");
             println!("Adapter MAC:  {}", if config.adapter_mac.is_empty() { "None (not configured)" } else { &config.adapter_mac });
             println!("Joy-Con Mode: {:?}", config.mode);
             println!("Bonded Controllers ({}):", config.controllers.len());
-            for (idx, c) in config.controllers.iter().enumerate() {
-                println!(
-                    "  [{}] {} ({}) - Player {}",
-                    idx + 1,
-                    c.name,
-                    c.mac,
-                    c.player
-                );
+            if config.controllers.is_empty() {
+                println!("  (No controllers paired yet)");
+            } else {
+                for (idx, c) in config.controllers.iter().enumerate() {
+                    println!(
+                        "  [{}] {} ({}) - Player {}",
+                        idx + 1,
+                        c.name,
+                        c.mac,
+                        c.player
+                    );
+                }
             }
-            println!("Configuration file: {}", DaemonConfig::config_path().display());
+            println!("Configuration: {}", DaemonConfig::config_path().display());
+            println!("-----------------------------------------------------------");
+            println!("Available Commands:");
+            println!("  switch2d pair           Scan & bond Joy-Cons (LED locks solid)");
+            println!("  switch2d mode <c|s>     Toggle Combined (1P) or Split (2P) mode");
+            println!("  switch2d status         Show detailed status");
+            println!("  switch2d run            Run daemon in foreground (debugging)");
+            println!("===========================================================");
         }
         Commands::Mode { mode } => {
             match mode.to_lowercase().as_str() {
