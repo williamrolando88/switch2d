@@ -13,6 +13,7 @@ use crate::protocol::calibration::{StickCalibration, GC_TRIGGER_DEFAULT_NEUTRAL}
 use crate::protocol::command::{mac_to_le, ControllerInfo};
 use crate::protocol::constants::*;
 use crate::protocol::report::InputReport;
+use crate::protocol::vibration::{preset_command_data, Preset};
 
 pub type ControllerInputCallback = Box<dyn Fn(&InputReport) + Send + Sync + 'static>;
 
@@ -334,6 +335,32 @@ impl SwitchController {
         controller.is_ready.store(true, Ordering::Relaxed);
 
         Ok(controller)
+    }
+
+    /// Play a built-in GameCube rumble preset (command `0x0A`, subcommand
+    /// `0x02`, data = preset id + three zero bytes).
+    ///
+    /// **Blocks until the command ACK arrives** (up to 2 s, legacy parity), so
+    /// it serialises with memory reads, LED writes, bonding and sleep.
+    ///
+    /// GameCube pad only: HD-rumble controllers (Pro Controller 2, Joy-Con 2)
+    /// use [`Self::write_vibration`] with a
+    /// [`crate::protocol::vibration::Sustainer`] instead. There is no stop
+    /// subcommand — the controller plays a finite clip, and a held rumble is
+    /// emulated by re-issuing the preset (see
+    /// [`crate::protocol::vibration::PresetGate`]).
+    ///
+    /// Deliberately does **not** reproduce legacy's unconditional soft preset
+    /// at connect time (analysis §8.4 / deviation 7): connecting a pad must not
+    /// rattle it.
+    pub fn play_vibration_preset(&self, preset: Preset) -> io::Result<()> {
+        self.write_command(
+            COMMAND_VIBRATION,
+            SUBCOMMAND_VIBRATION_PLAY_PRESET,
+            &preset_command_data(preset),
+            Duration::from_secs(2),
+        )?;
+        Ok(())
     }
 
     /// Write an HD-rumble payload (see [`crate::protocol::vibration`]).

@@ -15,6 +15,14 @@ pub const SUSTAIN_INTERVAL: Duration = Duration::from_millis(16);
 /// Below/at this magnitude the target counts as stopped (legacy 0.001).
 pub const STOP_THRESHOLD: f32 = 0.001;
 
+/// GameCube preset rumble: magnitude at/below which nothing is sent at all
+/// (legacy `GC_LIGHT_THRESHOLD`).
+pub const GC_LIGHT_THRESHOLD: f32 = 0.06;
+/// GameCube preset rumble: magnitude at/above which the strong clip is used.
+pub const GC_IMPACT_THRESHOLD: f32 = 0.52;
+/// GameCube preset rumble: minimum wall-clock gap between held retriggers.
+pub const GC_SUSTAIN_INTERVAL: Duration = Duration::from_millis(220);
+
 /// One 40-bit HD-rumble sample.
 ///
 /// Field widths: `lf_freq`/`hf_freq` 9 bits, amplitudes 10 bits. Values wider
@@ -236,10 +244,114 @@ impl Sustainer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GameCube preset rumble (0x0A/0x02)
+// ---------------------------------------------------------------------------
+
+/// Built-in GameCube vibration clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    Soft,
+    Strong,
+}
+
+impl Preset {
+    /// Wire id of the preset (`0x03` soft, `0x02` strong).
+    pub fn id(self) -> u8 {
+        match self {
+            Preset::Soft => crate::protocol::constants::GC_VIBRATION_PRESET_SOFT,
+            Preset::Strong => crate::protocol::constants::GC_VIBRATION_PRESET_STRONG,
+        }
+    }
+}
+
+/// Classify a combined FF magnitude into a preset.
+///
+/// `NaN` and magnitudes below 0.06 yield `None`; `>= 0.52` is [`Preset::Strong`];
+/// anything in between is [`Preset::Soft`]. Preset `0x01` (medium) is never
+/// chosen, matching legacy `_gc_preset_for_magnitude`.
+pub fn gc_preset_for_magnitude(magnitude: f32) -> Option<Preset> {
+    if magnitude.is_nan() || magnitude < GC_LIGHT_THRESHOLD {
+        return None;
+    }
+    if magnitude >= GC_IMPACT_THRESHOLD {
+        Some(Preset::Strong)
+    } else {
+        Some(Preset::Soft)
+    }
+}
+
+/// Command payload for `play_vibration_preset` (preset id + 3 pad bytes).
+pub fn preset_command_data(preset: Preset) -> [u8; 4] {
+    [preset.id(), 0, 0, 0]
+}
+
+/// Wall-clock gate for GameCube preset retriggers (legacy `set_rumble` GC branch).
+///
+/// The pad must not be re-issued a clip on every FF event: a *rising* edge
+/// fires immediately, a held target only once per [`GC_SUSTAIN_INTERVAL`], and
+/// a release sends nothing at all (the last clip plays out).
+#[derive(Debug, Clone)]
+pub struct PresetGate {
+    /// When a preset was last actually sent; only ever set on `Some`.
+    last_sent: Option<Instant>,
+    /// Magnitude seen on the previous call (updated even when nothing is sent).
+    last_mag: f32,
+}
+
+impl Default for PresetGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PresetGate {
+    pub fn new() -> Self {
+        Self {
+            last_sent: None,
+            last_mag: 0.0,
+        }
+    }
+
+    /// Decide whether this FF update should send a preset.
+    ///
+    /// `last_mag` is refreshed on every call (so a release is remembered as a
+    /// rising-edge opportunity), `last_sent` only when `Some` is returned.
+    pub fn consider(&mut self, now: Instant, strong: f32, weak: f32) -> Option<Preset> {
+        // Rust's `f32::max` prefers the non-NaN operand, and NaN/NaN stays NaN.
+        let magnitude = strong.max(weak);
+        let previous = self.last_mag;
+        self.last_mag = magnitude;
+
+        // Below/or at the noise floor (and NaN): send nothing at all. Note the
+        // classifier above is inclusive at 0.06; the gate is not, like legacy.
+        if magnitude.is_nan() || magnitude <= GC_LIGHT_THRESHOLD {
+            return None;
+        }
+
+        let preset = gc_preset_for_magnitude(magnitude)?;
+        let rising = previous <= GC_LIGHT_THRESHOLD || previous.is_nan();
+        let due = match self.last_sent {
+            Some(last) => now.saturating_duration_since(last) >= GC_SUSTAIN_INTERVAL,
+            None => true,
+        };
+
+        if rising || due {
+            self.last_sent = Some(now);
+            Some(preset)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::constants::{JOYCON2_LEFT_PID, PRO_CONTROLLER2_PID};
+    use crate::protocol::constants::{
+        build_command, COMMAND_VIBRATION, JOYCON2_LEFT_PID, PRO_CONTROLLER2_PID,
+        SUBCOMMAND_VIBRATION_PLAY_PRESET,
+    };
 
     fn sample_bytes(payload: &[u8]) -> &[u8] {
         &payload[2..7]
@@ -441,5 +553,163 @@ mod tests {
             "resumed packet carries the new amplitude"
         );
         assert!(sustainer.tick(t0 + Duration::from_millis(16)).is_none());
+    }
+
+    #[test]
+    fn gc_preset_thresholds() {
+        assert_eq!(gc_preset_for_magnitude(0.0), None);
+        assert_eq!(gc_preset_for_magnitude(0.059), None);
+        assert_eq!(gc_preset_for_magnitude(0.06), Some(Preset::Soft));
+        assert_eq!(gc_preset_for_magnitude(0.3), Some(Preset::Soft));
+        assert_eq!(gc_preset_for_magnitude(0.519), Some(Preset::Soft));
+        assert_eq!(gc_preset_for_magnitude(0.52), Some(Preset::Strong));
+        assert_eq!(gc_preset_for_magnitude(1.0), Some(Preset::Strong));
+        // Preset 0x01 (medium) is never produced.
+        assert_eq!(Preset::Soft.id(), 0x03);
+        assert_eq!(Preset::Strong.id(), 0x02);
+    }
+
+    #[test]
+    fn gc_preset_nan_is_ignored() {
+        assert_eq!(gc_preset_for_magnitude(f32::NAN), None);
+        assert_eq!(gc_preset_for_magnitude(f32::NEG_INFINITY), None);
+
+        let mut gate = PresetGate::new();
+        let t0 = Instant::now();
+        assert_eq!(gate.consider(t0, f32::NAN, f32::NAN), None);
+        assert_eq!(gate.consider(t0, f32::NAN, 0.9), Some(Preset::Strong));
+    }
+
+    #[test]
+    fn preset_command_matches_legacy_pdu() {
+        let soft = build_command(
+            COMMAND_VIBRATION,
+            SUBCOMMAND_VIBRATION_PLAY_PRESET,
+            &preset_command_data(Preset::Soft),
+        );
+        assert_eq!(
+            soft,
+            vec![0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00]
+        );
+
+        let strong = build_command(
+            COMMAND_VIBRATION,
+            SUBCOMMAND_VIBRATION_PLAY_PRESET,
+            &preset_command_data(Preset::Strong),
+        );
+        assert_eq!(
+            strong,
+            vec![0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]
+        );
+
+        assert_eq!(preset_command_data(Preset::Soft), [0x03, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            preset_command_data(Preset::Strong),
+            [0x02, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn preset_gate_rising_edge_bypasses_interval() {
+        let mut gate = PresetGate::new();
+        let t0 = Instant::now();
+
+        // First call ever: rising edge, fires immediately.
+        assert_eq!(gate.consider(t0, 0.3, 0.0), Some(Preset::Soft));
+
+        // Held: interval applies.
+        assert_eq!(gate.consider(t0 + Duration::from_millis(1), 0.3, 0.0), None);
+
+        // Release sends nothing...
+        assert_eq!(gate.consider(t0 + Duration::from_millis(2), 0.0, 0.0), None);
+        // ...but the next press is a fresh rising edge: no waiting.
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(3), 0.3, 0.0),
+            Some(Preset::Soft)
+        );
+        // And it is now held again.
+        assert_eq!(gate.consider(t0 + Duration::from_millis(4), 0.3, 0.0), None);
+    }
+
+    #[test]
+    fn preset_gate_retriggers_at_220ms() {
+        let mut gate = PresetGate::new();
+        let t0 = Instant::now();
+
+        assert_eq!(gate.consider(t0, 0.2, 0.0), Some(Preset::Soft));
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(219), 0.2, 0.0),
+            None
+        );
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(220), 0.2, 0.0),
+            Some(Preset::Soft),
+            "retrigger allowed exactly at the interval"
+        );
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(300), 0.2, 0.0),
+            None
+        );
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(440), 0.2, 0.0),
+            Some(Preset::Soft)
+        );
+    }
+
+    #[test]
+    fn preset_gate_ignores_release() {
+        let mut gate = PresetGate::new();
+        let t0 = Instant::now();
+
+        assert_eq!(gate.consider(t0, 0.9, 0.0), Some(Preset::Strong));
+
+        // Releasing never sends a stop packet, no matter how often it is polled.
+        for ms in [1u64, 100, 219, 500, 5000] {
+            assert_eq!(
+                gate.consider(t0 + Duration::from_millis(ms), 0.0, 0.0),
+                None,
+                "release at +{ms} ms must not send"
+            );
+        }
+
+        // The last release above is remembered as `last_mag = 0`, so the next
+        // press is a fresh rising edge: immediate, not gated by the old send.
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(5001), 0.9, 0.0),
+            Some(Preset::Strong)
+        );
+        // And once held again the 220 ms interval applies from that send.
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(5100), 0.9, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn preset_gate_escalates_after_gate() {
+        let mut gate = PresetGate::new();
+        let t0 = Instant::now();
+
+        assert_eq!(gate.consider(t0, 0.1, 0.0), Some(Preset::Soft));
+
+        // Harder hit mid-hold: classified Strong immediately, but the gate
+        // holds it back until 220 ms after the soft clip was sent.
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(50), 0.9, 0.0),
+            None
+        );
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(219), 0.9, 0.0),
+            None
+        );
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(220), 0.9, 0.0),
+            Some(Preset::Strong)
+        );
+        // Weak-only magnitudes count via max(strong, weak).
+        assert_eq!(
+            gate.consider(t0 + Duration::from_millis(500), 0.0, 0.9),
+            Some(Preset::Strong)
+        );
     }
 }

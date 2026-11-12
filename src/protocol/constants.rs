@@ -36,6 +36,14 @@ pub fn vibration_uuid_for(pid: u16) -> &'static str {
 }
 
 // Commands / Subcommands
+pub const COMMAND_VIBRATION: u8 = 0x0A;
+pub const SUBCOMMAND_VIBRATION_PLAY_PRESET: u8 = 0x02;
+
+/// Built-in GameCube rumble presets (`0x0A/0x02`). Preset `0x01` (medium) is
+/// deliberately never selected — it reads too harsh for ambient rumble.
+pub const GC_VIBRATION_PRESET_STRONG: u8 = 0x02;
+pub const GC_VIBRATION_PRESET_SOFT: u8 = 0x03;
+
 pub const COMMAND_LEDS: u8 = 0x09;
 pub const SUBCOMMAND_LEDS_SET_PLAYER: u8 = 0x07;
 
