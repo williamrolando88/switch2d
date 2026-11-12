@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, Sender as StdSender, TryRecvError};
@@ -41,7 +42,8 @@ use tracing::{debug, info, warn};
 use crate::bluetooth::bluez::BluezAdvertSource;
 use crate::bluetooth::scan::{AdvertSource, ScanControl, ShellScanControl};
 use crate::config::{BondedController, DaemonConfig, DaemonMode};
-use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
+use crate::controller::{BondPolicy, CalibratedInput, ConnectOptions, SwitchController};
+use crate::dsu_bridge::DsuBridge;
 use crate::hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
 use crate::players::{path_in, LedPlayers};
 use crate::protocol::constants::{button_mask, PRO_CONTROLLER2_PID};
@@ -155,6 +157,10 @@ impl Daemon {
             receivers.push((pad.clone(), session_rx, report_rx, drops));
         }
 
+        // DSU motion (ADR-3). Optional: a failed bind/spawn leaves a no-op
+        // bridge, and neither outcome may abort startup.
+        let motion = start_motion();
+
         // Sinks. Combined mode maps both pads into one node; split mode gives
         // each pad its own node (created once, reused by every session).
         let combined_gamepad = match self.config.mode {
@@ -187,6 +193,7 @@ impl Daemon {
                         idle_timeout,
                         Arc::clone(&planner),
                         Arc::clone(&led_plan),
+                        Arc::clone(&motion),
                     ));
                 }
                 None => {
@@ -208,6 +215,7 @@ impl Daemon {
                         idle_timeout,
                         Arc::clone(&planner),
                         Arc::clone(&led_plan),
+                        Arc::clone(&motion),
                     ));
                 }
             }
@@ -609,6 +617,7 @@ async fn run_pad_worker<S>(
     idle_timeout: Duration,
     planner: Arc<PlayerPlanner>,
     led_plan: Arc<StdMutex<HashMap<String, u8>>>,
+    motion: SharedMotion,
 ) where
     S: PadSink + FfPad + Clone,
 {
@@ -624,6 +633,7 @@ async fn run_pad_worker<S>(
             idle_timeout,
             &planner,
             &led_plan,
+            &motion,
         )
         .await;
     }
@@ -642,6 +652,7 @@ async fn run_session<S>(
     idle_timeout: Duration,
     planner: &PlayerPlanner,
     led_plan: &Arc<StdMutex<HashMap<String, u8>>>,
+    motion_sink: &SharedMotion,
 ) where
     S: PadSink + FfPad + Clone,
 {
@@ -673,6 +684,17 @@ async fn run_session<S>(
     let mut led_player = pad.player;
     let wanted = planner.player_for(&pad.mac);
     sync_player_led(&mut controller, &pad.mac, wanted, &mut led_player);
+
+    // DSU slot uses the same effective player as the LED, so the two views can
+    // never disagree. Battery is still unknown at handshake end: the bridge
+    // gets the initial value 0 and is not re-notified on the first report.
+    let motion = MotionSession::start(motion_sink.as_ref(), wanted, &pad.mac, 0);
+    debug!(
+        "{}: DSU slot {} (effective player {})",
+        pad.mac,
+        motion.slot(),
+        wanted
+    );
 
     // Rumble: profile-routed engine (HD sustainer or GameCube presets), fed by
     // the uinput FF queue drained from the pad sink.
@@ -714,6 +736,10 @@ async fn run_session<S>(
                 if rumble_due(&mut next_rumble, now) {
                     pump_rumble(sink, &mut rumble, &mut controller, now, &mut last_ff);
                 }
+                // Fire-and-forget: the bridge never blocks or fails the
+                // session, and the pad mutex is not held here.
+                motion.update(&report, &calibrated);
+
                 let sleep_now = worker.should_sleep(now);
                 if !controller.is_connected() {
                     break;
@@ -775,12 +801,16 @@ async fn run_session<S>(
         );
     }
 
-    hub_tx.send(HubMsg::SessionEnded(pad.mac.clone())).ok();
-    sup_tx
-        .send(SupervisorMsg::TornDown {
-            mac: pad.mac.clone(),
-        })
-        .ok();
+    // Drop the DSU slot *before* the hub re-arms the pad: a stale slot must
+    // never advertise motion for a pad that is gone.
+    finish_session(&motion, || {
+        hub_tx.send(HubMsg::SessionEnded(pad.mac.clone())).ok();
+        sup_tx
+            .send(SupervisorMsg::TornDown {
+                mac: pad.mac.clone(),
+            })
+            .ok();
+    });
 }
 
 /// Release input without closing the node (deviation 6).
@@ -1094,6 +1124,106 @@ fn hat_x(buttons: u32) -> i32 {
 
 fn hat_y(buttons: u32) -> i32 {
     i32::from(buttons & button_mask::DOWN != 0) - i32::from(buttons & button_mask::UP != 0)
+}
+
+// ---------------------------------------------------------------------------
+// DSU motion (ADR-3)
+// ---------------------------------------------------------------------------
+
+/// DSU port from the protocol (`DSU_PORT`, dsu.py).
+const DSU_PORT: u16 = 26760;
+
+/// The DSU motion sink: the real bridge, or a test fake.
+///
+/// Local to the daemon so the session loop can be tested without sockets; the
+/// bridge itself is unchanged.
+trait MotionSink: Send + Sync {
+    fn session_started(&self, player: u8, mac: &str, battery_mv: u16) -> u8;
+    fn update(&self, slot: u8, report: &InputReport, cal: &CalibratedInput);
+    fn session_ended(&self, slot: u8);
+}
+
+impl MotionSink for DsuBridge {
+    fn session_started(&self, player: u8, mac: &str, battery_mv: u16) -> u8 {
+        DsuBridge::session_started(self, player, mac, battery_mv)
+    }
+
+    fn update(&self, slot: u8, report: &InputReport, cal: &CalibratedInput) {
+        DsuBridge::update(self, slot, report, cal)
+    }
+
+    fn session_ended(&self, slot: u8) {
+        DsuBridge::session_ended(self, slot)
+    }
+}
+
+/// No-op sink for the (unexpected) case where even the no-op bridge cannot be
+/// constructed: the daemon still runs without motion.
+struct NullMotion;
+
+impl MotionSink for NullMotion {
+    fn session_started(&self, player: u8, _mac: &str, _battery_mv: u16) -> u8 {
+        crate::dsu::slot_for_player(player)
+    }
+
+    fn update(&self, _slot: u8, _report: &InputReport, _cal: &CalibratedInput) {}
+
+    fn session_ended(&self, _slot: u8) {}
+}
+
+type SharedMotion = Arc<dyn MotionSink>;
+
+/// Start the DSU bridge once; motion failure is logged, never fatal.
+fn start_motion() -> SharedMotion {
+    let bind = SocketAddr::from(([127, 0, 0, 1], DSU_PORT));
+    match DsuBridge::start(bind) {
+        Ok(bridge) => match bridge.local_addr() {
+            Ok(addr) => {
+                info!("DSU motion listening on {addr}");
+                Arc::new(bridge)
+            }
+            Err(err) => {
+                warn!("DSU motion unavailable ({err}); continuing without motion");
+                Arc::new(bridge)
+            }
+        },
+        Err(err) => {
+            warn!("DSU motion unavailable ({err}); continuing without motion");
+            Arc::new(NullMotion)
+        }
+    }
+}
+
+/// One session's DSU slot.
+struct MotionSession<'a> {
+    sink: &'a dyn MotionSink,
+    slot: u8,
+}
+
+impl<'a> MotionSession<'a> {
+    fn start(sink: &'a dyn MotionSink, player: u8, mac: &str, battery_mv: u16) -> Self {
+        Self {
+            sink,
+            slot: sink.session_started(player, mac, battery_mv),
+        }
+    }
+
+    /// Publish one frame. Fire-and-forget: motion is optional and must never
+    /// block or fail the input session.
+    fn update(&self, report: &InputReport, cal: &CalibratedInput) {
+        self.sink.update(self.slot, report, cal);
+    }
+
+    fn slot(&self) -> u8 {
+        self.slot
+    }
+}
+
+/// End the slot, then let the caller re-arm the pad. Kept as one function so
+/// the order (DSU first, hub second) cannot be flipped by accident.
+fn finish_session<F: FnOnce()>(motion: &MotionSession<'_>, after_motion_end: F) {
+    motion.sink.session_ended(motion.slot);
+    after_motion_end();
 }
 
 // ---------------------------------------------------------------------------
@@ -2273,5 +2403,215 @@ mod tests {
             dir.root.join("does-not-exist.json"),
         );
         assert_eq!(missing.player_for(PAD), 1);
+    }
+
+    // --- DSU motion ------------------------------------------------------
+
+    use crate::dsu::slot_for_player;
+    use crate::dsu_bridge::stick_to_dsu;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct MotionRecord {
+        slot: u8,
+        buttons: u32,
+        /// Calibrated left/right X mapped exactly like the real bridge.
+        left: u8,
+        right: u8,
+    }
+
+    #[derive(Default)]
+    struct FakeMotion {
+        available: bool,
+        log: Option<CallLog>,
+        starts: Arc<StdMutex<Vec<(String, u8, u8)>>>,
+        updates: Arc<StdMutex<Vec<MotionRecord>>>,
+        ends: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl FakeMotion {
+        fn available() -> Self {
+            Self {
+                available: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl MotionSink for FakeMotion {
+        fn session_started(&self, player: u8, mac: &str, _battery_mv: u16) -> u8 {
+            let slot = slot_for_player(player);
+            self.starts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((mac.to_string(), player, slot));
+            slot
+        }
+
+        fn update(&self, slot: u8, report: &InputReport, cal: &CalibratedInput) {
+            if !self.available {
+                // Same early-return as the real bridge with no server.
+                return;
+            }
+            self.updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(MotionRecord {
+                    slot,
+                    buttons: report.buttons,
+                    left: stick_to_dsu(cal.left.0),
+                    right: stick_to_dsu(cal.right.0),
+                });
+        }
+
+        fn session_ended(&self, slot: u8) {
+            if !self.available {
+                return;
+            }
+            self.ends
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(slot);
+            if let Some(log) = &self.log {
+                log.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("dsu_end");
+            }
+        }
+    }
+
+    fn pad(mac: &str, player: u8, is_left: bool) -> PadSpec {
+        PadSpec {
+            mac: mac.to_string(),
+            player,
+            name: if is_left {
+                "Joy-Con 2 (Left)".to_string()
+            } else {
+                "Joy-Con 2 (Right)".to_string()
+            },
+            bonded: true,
+            product_id: if is_left { 0x2067 } else { 0x2066 },
+            is_left,
+        }
+    }
+
+    #[test]
+    fn dsu_slot_follows_the_combined_pair_number() {
+        // Combined pair configured as players 3 and 5: the pair number is 3
+        // (min), which is DSU slot 2 for *both* halves - never slot 4 + clamp.
+        let dir = TempDir::new("dsu-slot");
+        let other = "AA:BB:CC:DD:EE:02";
+        let pads = vec![pad(PAD, 3, true), pad(other, 5, false)];
+        let planner =
+            PlayerPlanner::with_path(pads, DaemonMode::Combined, dir.root.join(LED_PLAYERS_FILE));
+        let plan = planner.read_plan();
+        assert_eq!(plan.get(PAD), Some(&3), "pair number is the min");
+        assert_eq!(plan.get(other), Some(&3));
+
+        let motion = FakeMotion::available();
+        for mac in [PAD, other] {
+            let effective = *plan.get(mac).expect("pad planned");
+            let session = MotionSession::start(&motion, effective, mac, 0);
+            assert_eq!(session.slot(), 2, "player 3 -> ADR-3 slot 2");
+        }
+
+        let starts = motion
+            .starts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            starts,
+            vec![(PAD.to_string(), 3, 2), (other.to_string(), 3, 2),],
+            "both halves start the same player/slot as the LED uses"
+        );
+    }
+
+    #[test]
+    fn dsu_session_ended_is_called_before_rearm() {
+        let log: CallLog = Arc::new(StdMutex::new(Vec::new()));
+        let motion = FakeMotion {
+            log: Some(Arc::clone(&log)),
+            ..FakeMotion::available()
+        };
+
+        let session = MotionSession::start(&motion, 1, PAD, 0);
+        finish_session(&session, || {
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("rearm")
+        });
+
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["dsu_end", "rearm"],
+            "the slot must be dropped before the hub re-arms the pad"
+        );
+        assert_eq!(
+            *motion
+                .ends
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn dsu_update_is_skipped_when_motion_is_unavailable() {
+        // A no-op bridge (bind failed): start/update/end must all be silent and
+        // harmless, and the session still finishes normally.
+        let motion = FakeMotion {
+            available: false,
+            ..FakeMotion::default()
+        };
+        let session = MotionSession::start(&motion, 1, PAD, 0);
+        assert_eq!(session.slot(), 0, "slot is still reported");
+
+        session.update(&report(button_mask::A), &calibrated());
+        finish_session(&session, || {});
+
+        assert!(motion
+            .updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(motion
+            .ends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    fn dsu_update_carries_the_calibrated_sticks() {
+        let motion = FakeMotion::available();
+        let session = MotionSession::start(&motion, 2, PAD, 4000);
+
+        let mut report = report(button_mask::A);
+        // Raw sticks are centred-ish; the bridge must see the calibrated values.
+        report.left_stick_raw = (3302, 2048);
+        let cal = CalibratedInput {
+            left: (-1.0, 0.0),
+            right: (0.75, -0.25),
+            lt: 10,
+            rt: 20,
+        };
+        session.update(&report, &cal);
+
+        let updates = motion
+            .updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            updates,
+            vec![MotionRecord {
+                slot: 1,
+                buttons: button_mask::A,
+                left: stick_to_dsu(-1.0),
+                right: stick_to_dsu(0.75),
+            }]
+        );
+        assert_ne!(updates[0].left, 128, "not the raw centre value");
+        assert_eq!(updates[0].left, 1);
     }
 }
