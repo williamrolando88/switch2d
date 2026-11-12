@@ -3,10 +3,12 @@
 
 use clap::{Parser, Subcommand};
 use std::process::Command;
+use std::time::Duration;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
+use switch2d::controller::SwitchController;
 use switch2d::daemon::Daemon;
 use switch2d::protocol::constants::*;
 
@@ -48,7 +50,21 @@ enum Commands {
         mode: String,
     },
 
-    /// Register / bond a Switch 2 controller MAC address
+    /// Pair, bond, and register a Switch 2 controller (sets player LED and saves to config)
+    Pair {
+        /// Bluetooth MAC address (e.g. BC:89:A6:45:83:CC). If omitted, scans automatically.
+        mac: Option<String>,
+
+        /// Optional friendly name (e.g. "Joy-Con 2 (Left)")
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Player assignment (1-8, defaults to next available slot)
+        #[arg(short, long)]
+        player: Option<u8>,
+    },
+
+    /// Register / add a Switch 2 controller MAC address directly
     Add {
         /// Bluetooth MAC address (e.g. BC:89:A6:45:83:CC)
         mac: String,
@@ -160,6 +176,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Pair { mac, name, player } => {
+            let target_mac = match mac {
+                Some(m) => m.trim().to_uppercase(),
+                None => {
+                    println!("===========================================================");
+                    println!("   Scanning for Nintendo Switch 2 controllers (10s)...");
+                    println!("   👉 Hold the circular SYNC button on your Joy-Con");
+                    println!("      until the green LEDs cycle back and forth.");
+                    println!("===========================================================");
+                    match scan_for_joycon().await {
+                        Some(found) => {
+                            println!("Found Switch 2 controller: {}", found);
+                            found
+                        }
+                        None => {
+                            println!("No Switch 2 controllers found in pairing mode.");
+                            println!("Tip: If you know the MAC address, run: switch2d pair <MAC>");
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+
+            let next_player = player.unwrap_or_else(|| {
+                (config.controllers.len() as u8 + 1).min(8)
+            });
+
+            println!("Connecting to {} (Player {})...", target_mac, next_player);
+
+            let adapter_mac = config.adapter_mac.clone();
+            let mac_for_task = target_mac.clone();
+
+            let res = tokio::task::spawn_blocking(move || {
+                SwitchController::connect(
+                    &mac_for_task,
+                    &adapter_mac,
+                    next_player,
+                    Box::new(|_| {}),
+                )
+            }).await?;
+
+            match res {
+                Ok(ctrl) => {
+                    let final_name = name.unwrap_or_else(|| {
+                        if let Some(info) = &ctrl.info {
+                            info.name().to_string()
+                        } else if target_mac.ends_with("CC") {
+                            "Joy-Con 2 (Left)".to_string()
+                        } else if target_mac.ends_with("74") {
+                            "Joy-Con 2 (Right)".to_string()
+                        } else {
+                            "Switch 2 Controller".to_string()
+                        }
+                    });
+
+                    let pid = ctrl.info.as_ref().map(|i| i.product_id).unwrap_or_else(|| {
+                        if final_name.contains("Left") {
+                            JOYCON2_LEFT_PID
+                        } else if final_name.contains("Right") {
+                            JOYCON2_RIGHT_PID
+                        } else {
+                            PRO_CONTROLLER2_PID
+                        }
+                    });
+
+                    let serial = ctrl.info.as_ref().map(|i| i.serial_number.clone()).unwrap_or_default();
+
+                    config.add_or_update_controller(BondedController {
+                        mac: target_mac.clone(),
+                        name: final_name.clone(),
+                        product_id: pid,
+                        serial,
+                        player: next_player,
+                        bonded: true,
+                    });
+                    config.save()?;
+
+                    println!("===========================================================");
+                    println!("  ✅ Controller Successfully Paired & Bonded!");
+                    println!("  Device:  {}", final_name);
+                    println!("  Address: {}", target_mac);
+                    println!("  Player:  {}", next_player);
+                    println!("===========================================================");
+                    println!("The LED on your controller is now set to Player {}.", next_player);
+                    println!("Saved to config. switch2d will now connect to it automatically!");
+                }
+                Err(e) => {
+                    println!("❌ Failed to connect to {}: {}", target_mac, e);
+                    println!("Make sure the Joy-Con's LEDs are still cycling and try again.");
+                }
+            }
+        }
         Commands::Add { mac, name, player } => {
             let clean_mac = mac.trim().to_uppercase();
             let default_name = if clean_mac.ends_with("CC") {
@@ -204,6 +312,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn scan_for_joycon() -> Option<String> {
+    // Start discovery via bluetoothctl in background for 8 seconds
+    let mut child = Command::new("bluetoothctl")
+        .args(&["scan", "on"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let _ = child.kill();
+    let output = child.wait_with_output().ok()?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if line.contains("Device") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for part in parts {
+                if is_valid_mac(part) && (part.starts_with("BC:") || line.to_lowercase().contains("joy-con")) {
+                    return Some(part.to_uppercase());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn is_valid_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6 && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn auto_detect_adapter() -> Option<String> {
