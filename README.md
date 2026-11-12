@@ -96,9 +96,22 @@ systemctl --user enable switch2d.service
 If an older `switch2d.service` exists from a previous install, disable it first with
 `systemctl --user disable --now switch2d.service` and replace the file.
 
+**6. Verify before going further:**
+
+```fish
+switch2d doctor
+```
+
+Do not continue while any line says `FAIL`, and the `udev uaccess rule` line must say `PASS`.
+In particular a `FAIL` on `le-privacy unit` means controller reconnects cannot work yet, and
+every later symptom would be a symptom of that.
+
 ---
 
 ## 🚀 Usage
+
+Start with the preflight — it tells you what is wrong and how to fix it, with a stable
+`PASS`/`WARN`/`FAIL` line per check:
 
 ```fish
 switch2d doctor        # preflight: says exactly what is wrong and how to fix it
@@ -120,6 +133,8 @@ switch2d pair XX:XX:XX:XX:XX:XX     # skip the scan when you know the MAC (real 
 
 The player LED settles solid while the link is held and goes dark when `pair` exits — that is
 normal: a Joy-Con only shows LEDs while a host is connected. `switch2d run` lights it again.
+If the LEDs keep cycling instead of settling, the pad never accepted the connection: check
+`switch2d doctor` for the privacy unit before retrying.
 
 Re-pairing an already bonded controller keeps its player number.
 
@@ -136,11 +151,16 @@ switch2d mode split      # one gamepad per Joy-Con
 switch2d monitor --seconds 30     # live decoded input, one line per report; creates no device
 switch2d advert --seconds 15      # what the pads are advertising, including the host they want
 switch2d selftest                 # create a virtual pad and report what the kernel sees
-switch2d selftest --seconds 8 --drive   # ...and sweep sticks/buttons (close Steam first!)
+switch2d selftest --seconds 8 --drive   # sweep sticks/buttons on a virtual pad
 ```
 
 `monitor` is the safe way to check a controller: it creates no virtual device, so it cannot
 disturb the desktop or steal focus.
+
+`selftest` without `--drive` is also safe: it creates a pad, prints what the kernel reports,
+and drives nothing. With `--drive` it moves sticks and presses every button, and **anything
+that maps gamepads will claim that node** — Steam Input will move the mouse or open its
+overlay, antimicrox will act on the presses. Close those first, or skip `--drive`.
 
 ---
 
