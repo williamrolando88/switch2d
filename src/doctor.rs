@@ -495,8 +495,9 @@ fn query_systemd_unit(unit: &str, user: bool) -> SystemdUnit {
 
 fn parse_enabled(raw: &str) -> UnitEnabled {
     match raw.trim() {
-        "enabled" => UnitEnabled::Enabled,
-        "disabled" => UnitEnabled::Disabled,
+        "enabled" | "enabled-runtime" => UnitEnabled::Enabled,
+        // Units without [Install] report one of these; none can be enabled.
+        "disabled" | "static" | "indirect" | "alias" | "generated" => UnitEnabled::Disabled,
         "not-found" => UnitEnabled::NotFound,
         other => UnitEnabled::Unknown(other.to_string()),
     }
@@ -764,12 +765,12 @@ fn check_legacy_bridge_units(probes: &dyn SystemProbes) -> CheckResult {
     };
 
     let mut offending = Vec::new();
-    let mut unknown = false;
+    let mut unknown = Vec::new();
     for (name, unit) in &units {
         if matches!(unit.enabled, UnitEnabled::Unknown(_))
             || matches!(unit.active, UnitActive::Unknown(_))
         {
-            unknown = true;
+            unknown.push(format!("{name}: {}", unit.detail()));
         }
         if unit.enabled == UnitEnabled::Enabled || unit.active == UnitActive::Active {
             offending.push(*name);
@@ -785,11 +786,11 @@ fn check_legacy_bridge_units(probes: &dyn SystemProbes) -> CheckResult {
         };
     }
 
-    if unknown {
+    if !unknown.is_empty() {
         return CheckResult {
             name: "legacy bridge units",
             status: Status::Skip,
-            detail: "could not determine all nso-gc unit states".to_string(),
+            detail: format!("could not determine: {}", unknown.join("; ")),
             remedy: "run `systemctl --user list-unit-files 'nso-gc*'` as the logged-in user"
                 .to_string(),
         };
@@ -868,6 +869,16 @@ fn check_user_unit(probes: &dyn SystemProbes) -> CheckResult {
             };
         }
     };
+    if status.enabled == UnitEnabled::NotFound {
+        return CheckResult {
+            name: "user unit",
+            status: Status::Pass,
+            detail: "not installed (optional; run ./install.sh --service to enable at login)"
+                .to_string(),
+            remedy: String::new(),
+        };
+    }
+
     let text = match probes.user_unit_text() {
         Ok(text) => text,
         Err(err) => {
@@ -1017,6 +1028,7 @@ pub fn exit_code(checks: &[CheckResult]) -> i32 {
 
 /// Run the real checks, print them, and return the process exit code.
 pub fn run() -> i32 {
+    println!("switch2d doctor");
     let checks = evaluate(&RealProbes);
     for check in &checks {
         println!("{}", format_check(check));
@@ -1288,6 +1300,112 @@ mod tests {
             "{}",
             discovery.detail
         );
+    }
+
+    #[test]
+    fn static_units_do_not_warn() {
+        for raw in ["static", "indirect", "alias", "generated"] {
+            assert_eq!(
+                parse_enabled(raw),
+                UnitEnabled::Disabled,
+                "{raw} must not count as enabled"
+            );
+        }
+
+        let probes = FakeProbes {
+            legacy_bridge_units: Ok(vec![(
+                "nso-gc.service",
+                SystemdUnit {
+                    enabled: parse_enabled("static"),
+                    active: UnitActive::Inactive,
+                },
+            )]),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let legacy = check_named(&checks, "legacy bridge units");
+        assert_eq!(legacy.status, Status::Pass, "{}", legacy.detail);
+    }
+
+    #[test]
+    fn enabled_unit_warns_with_disable_command() {
+        let probes = FakeProbes {
+            legacy_bridge_units: Ok(vec![(
+                "nso-gc.service",
+                SystemdUnit {
+                    enabled: UnitEnabled::Enabled,
+                    active: UnitActive::Inactive,
+                },
+            )]),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let legacy = check_named(&checks, "legacy bridge units");
+        assert_eq!(legacy.status, Status::Warn);
+        assert!(
+            legacy
+                .remedy
+                .contains("systemctl --user disable --now nso-gc.service"),
+            "{}",
+            legacy.remedy
+        );
+    }
+
+    #[test]
+    fn active_unit_warns_even_if_disabled() {
+        let probes = FakeProbes {
+            legacy_bridge_units: Ok(vec![(
+                "nso-gc-watchdog.timer",
+                SystemdUnit {
+                    enabled: UnitEnabled::Disabled,
+                    active: UnitActive::Active,
+                },
+            )]),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let legacy = check_named(&checks, "legacy bridge units");
+        assert_eq!(legacy.status, Status::Warn);
+        assert!(
+            legacy
+                .remedy
+                .contains("systemctl --user disable --now nso-gc-watchdog.timer"),
+            "{}",
+            legacy.remedy
+        );
+    }
+
+    #[test]
+    fn missing_user_unit_passes_as_optional() {
+        let probes = FakeProbes {
+            user_unit: SystemdUnit {
+                enabled: UnitEnabled::NotFound,
+                active: UnitActive::Inactive,
+            },
+            user_unit_text: Err("No files found for switch2d.service.".to_string()),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let unit = check_named(&checks, "user unit");
+        assert_eq!(unit.status, Status::Pass);
+        assert!(
+            unit.detail
+                .contains("not installed (optional; run ./install.sh --service"),
+            "{}",
+            unit.detail
+        );
+    }
+
+    #[test]
+    fn unreadable_user_unit_skips() {
+        let probes = FakeProbes {
+            user_unit_text: Err("permission denied".to_string()),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let unit = check_named(&checks, "user unit");
+        assert_eq!(unit.status, Status::Skip);
+        assert!(unit.detail.contains("permission denied"), "{}", unit.detail);
     }
 
     #[test]
