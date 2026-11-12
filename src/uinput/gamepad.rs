@@ -7,7 +7,10 @@ use std::sync::Mutex;
 use evdev::{AbsoluteAxisType, BusType, EventType, Key, Synchronization};
 use tracing::info;
 
-use super::rawio::{AbsInfo, InputId, RawInputEvent, RawUinput};
+use super::ff::{FfEvent, FfState, FF_RUMBLE};
+use super::rawio::{
+    AbsInfo, FfEffect, InputId, RawInputEvent, RawUinput, UinputFfErase, UinputFfUpload,
+};
 use crate::protocol::constants::{button_mask, NINTENDO_VENDOR_ID};
 
 pub const STICK_MIN: i32 = -32768;
@@ -18,6 +21,11 @@ pub const TRIGGER_MAX: i32 = 255;
 /// Prefix for every node this daemon exposes. udev rules and the evdev `uniq`
 /// shim key off it, so it must not be changed casually.
 const PHYS_PREFIX: &str = "ngc/";
+
+/// Number of simultaneous force-feedback effects the kernel may allocate for
+/// one node. Four is plenty for rumble (games typically use one or two) and
+/// keeps the per-node allocation small.
+pub const FF_EFFECTS_MAX: u32 = 4;
 
 /// Kernel `phys` string for a node tag (typically the controller MAC):
 /// `ngc/<TAG>` with the tag uppercased. A leading `ngc/` prefix is stripped
@@ -98,6 +106,7 @@ pub struct VirtualGamepad {
     device: RawUinput,
     last_keys: Mutex<HashMap<u16, i32>>,
     last_abs: Mutex<HashMap<u16, i32>>,
+    ff: FfState,
     player: u8,
     pub name: String,
 }
@@ -118,6 +127,7 @@ impl VirtualGamepad {
         let device = RawUinput::open()?;
         device.set_evbit(EventType::KEY)?;
         device.set_evbit(EventType::ABSOLUTE)?;
+        device.set_evbit(EventType::FORCEFEEDBACK)?;
 
         for key in KEYS {
             device.set_keybit(key)?;
@@ -125,6 +135,9 @@ impl VirtualGamepad {
         for (axis, absinfo) in AXES {
             device.abs_setup(axis, absinfo)?;
         }
+        // Only rumble: periodic/condition effects are deliberately not
+        // advertised (analysis §8.3; the Rust state only stores rumble).
+        device.set_ffbit(FF_RUMBLE)?;
 
         let id = InputId {
             bustype: BusType::BUS_BLUETOOTH.0,
@@ -132,7 +145,7 @@ impl VirtualGamepad {
             product: product_id,
             version: 0x0100,
         };
-        device.device_setup(&id, name, 0)?;
+        device.device_setup(&id, name, FF_EFFECTS_MAX)?;
         device.set_phys(&phys)?;
         device.create()?;
 
@@ -142,9 +155,101 @@ impl VirtualGamepad {
             device,
             last_keys: Mutex::new(HashMap::new()),
             last_abs: Mutex::new(HashMap::new()),
+            ff: FfState::new(),
             player: 0,
             name: name.to_string(),
         })
+    }
+
+    /// Drain pending force-feedback events without blocking.
+    ///
+    /// The uinput fd is non-blocking (`rawio::RawUinput::open`), so an idle
+    /// node returns `Ok(Vec::new())`. Upload/erase requests are acknowledged
+    /// with the matching `UI_BEGIN_*`/`UI_END_*` ioctls before being returned;
+    /// failing to send the END ioctl would leave the kernel's caller blocked.
+    ///
+    /// The retained [`FfState`] keeps uploaded effects and the global gain
+    /// across calls, so callers only need to forward the returned events
+    /// (play/stop/gain/upload/erase) to their rumble path.
+    pub fn poll_ff(&mut self) -> io::Result<Vec<FfEvent>> {
+        let mut decoded = Vec::new();
+        let mut buf = [RawInputEvent::new(0, 0, 0); 32];
+
+        loop {
+            let count = self.device.read_events(&mut buf)?;
+            if count == 0 {
+                break;
+            }
+
+            for event in &buf[..count] {
+                if let Some(ff_event) = self.handle_ff_event(event)? {
+                    decoded.push(ff_event);
+                }
+            }
+
+            // A full buffer may mean more events are queued; drain them now.
+            if count < buf.len() {
+                break;
+            }
+        }
+
+        Ok(decoded)
+    }
+
+    /// Current gained rumble target `(strong, weak)` after all events drained
+    /// by [`Self::poll_ff`]. `(0, 0)` means stop/silence.
+    pub fn ff_target(&self) -> (u16, u16) {
+        self.ff.current_target()
+    }
+
+    /// Decode one event, performing the kernel round-trip for upload/erase.
+    fn handle_ff_event(&mut self, event: &RawInputEvent) -> io::Result<Option<FfEvent>> {
+        if event.kind == EventType::FORCEFEEDBACK.0 {
+            return Ok(decode_ff_playback(&mut self.ff, event));
+        }
+        if event.kind != EventType::UINPUT.0 {
+            return Ok(None);
+        }
+
+        match event.code {
+            UI_FF_UPLOAD => {
+                let mut request = UinputFfUpload {
+                    request_id: event.value as u32,
+                    ..UinputFfUpload::default()
+                };
+
+                if let Err(err) = self.device.begin_ff_upload(&mut request) {
+                    // Return the request to the kernel even on failure so the
+                    // uploading application does not hang.
+                    request.retval = -(libc::EIO as i32);
+                    let _ = self.device.end_ff_upload(&request);
+                    return Err(err);
+                }
+
+                let decoded = decode_ff_upload(&mut self.ff, &request.effect);
+                request.retval = 0;
+                self.device.end_ff_upload(&request)?;
+                Ok(decoded)
+            }
+            UI_FF_ERASE => {
+                let mut request = UinputFfErase {
+                    request_id: event.value as u32,
+                    ..UinputFfErase::default()
+                };
+
+                if let Err(err) = self.device.begin_ff_erase(&mut request) {
+                    request.retval = -(libc::EIO as i32);
+                    let _ = self.device.end_ff_erase(&request);
+                    return Err(err);
+                }
+
+                let decoded = decode_ff_erase(&mut self.ff, request.effect_id);
+                request.retval = 0;
+                self.device.end_ff_erase(&request)?;
+                Ok(decoded)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Emit button state if changed.
@@ -312,6 +417,32 @@ impl PadSink for VirtualGamepad {
     }
 }
 
+/// `EV_UINPUT` request codes carried by `input_event.value`.
+const UI_FF_UPLOAD: u16 = 1;
+const UI_FF_ERASE: u16 = 2;
+
+/// Apply one uploaded effect; `None` means "not a rumble effect, do not
+/// forward". Split out so the upload/erase id round-trip is testable without a
+/// device.
+fn decode_ff_upload(state: &mut FfState, effect: &FfEffect) -> Option<FfEvent> {
+    match state.on_upload(effect) {
+        FfEvent::Ignored => None,
+        event => Some(event),
+    }
+}
+
+fn decode_ff_erase(state: &mut FfState, effect_id: u32) -> Option<FfEvent> {
+    Some(state.on_erase(effect_id as u16))
+}
+
+/// Decode an `EV_FF` play/stop/gain event; `None` for irrelevant codes.
+fn decode_ff_playback(state: &mut FfState, event: &RawInputEvent) -> Option<FfEvent> {
+    match state.handle(event) {
+        FfEvent::Ignored => None,
+        event => Some(event),
+    }
+}
+
 /// `-1.0..=1.0` -> `-32768..=32767`, clamped and NaN-safe (NaN -> 0).
 fn axis_from_unit(value: f32) -> i32 {
     let scaled = value.clamp(-1.0, 1.0) * (STICK_MAX as f32);
@@ -476,6 +607,135 @@ mod tests {
         assert_eq!(abs[AbsoluteAxisType::ABS_RZ.0 as usize].value, 200);
         assert_eq!(abs[AbsoluteAxisType::ABS_HAT0X.0 as usize].value, 1);
         assert_eq!(abs[AbsoluteAxisType::ABS_HAT0Y.0 as usize].value, -1);
+    }
+
+    #[test]
+    fn ff_effect_ids_round_trip_through_upload_and_erase() {
+        let mut state = FfState::new();
+
+        // Upload -> event carries the same id -> play resolves that id.
+        assert_eq!(
+            decode_ff_upload(&mut state, &FfEffect::rumble(7, 0xFFFF, 0x8000)),
+            Some(FfEvent::Uploaded {
+                id: 7,
+                magnitudes: super::super::ff::EffectMagnitudes {
+                    strong: 0xFFFF,
+                    weak: 0x8000,
+                },
+            })
+        );
+        assert_eq!(
+            decode_ff_playback(
+                &mut state,
+                &RawInputEvent::new(EventType::FORCEFEEDBACK.0, 7, 1)
+            ),
+            Some(FfEvent::Played { id: 7, gain: 1.0 })
+        );
+        assert_eq!(state.current_target(), (0xFFFF, 0x8000));
+
+        // Erase -> the same id disappears; replay resolves to zero.
+        assert_eq!(
+            decode_ff_erase(&mut state, 7),
+            Some(FfEvent::Erased { id: 7 })
+        );
+        assert_eq!(
+            decode_ff_playback(
+                &mut state,
+                &RawInputEvent::new(EventType::FORCEFEEDBACK.0, 7, 1)
+            ),
+            Some(FfEvent::Played { id: 7, gain: 1.0 })
+        );
+        assert_eq!(state.current_target(), (0, 0));
+    }
+
+    #[test]
+    fn ff_gain_change_does_not_renumber_effects() {
+        let mut state = FfState::new();
+        decode_ff_upload(&mut state, &FfEffect::rumble(5, 0xFFFF, 0x8000));
+
+        let gain = crate::uinput::ff::FF_GAIN;
+        assert!(matches!(
+            decode_ff_playback(
+                &mut state,
+                &RawInputEvent::new(EventType::FORCEFEEDBACK.0, gain, 0x8000)
+            ),
+            Some(FfEvent::GainChanged(_))
+        ));
+
+        // The stored effect is still id 5, now scaled by the new gain.
+        let expected_gain = f32::from(0x8000u16) / f32::from(u16::MAX);
+        assert_eq!(
+            decode_ff_playback(
+                &mut state,
+                &RawInputEvent::new(EventType::FORCEFEEDBACK.0, 5, 1)
+            ),
+            Some(FfEvent::Played {
+                id: 5,
+                gain: expected_gain,
+            })
+        );
+        assert_eq!(state.current_target(), (0x8000, 0x4000));
+    }
+
+    #[test]
+    fn poll_ff_on_idle_node_returns_empty_without_blocking() {
+        if !uinput_writable() {
+            return;
+        }
+
+        let name = format!("switch2d test ff idle {}", std::process::id());
+        let mut pad = VirtualGamepad::new(&name, 0x2069, "test-ff-idle").unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            assert!(
+                pad.poll_ff().expect("idle poll").is_empty(),
+                "a fresh node has no pending FF events"
+            );
+        }
+        assert_eq!(pad.ff_target(), (0, 0), "idle target is silence");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "poll_ff must not block on the non-blocking uinput fd"
+        );
+    }
+
+    #[test]
+    fn created_node_advertises_ff_rumble_and_effect_slots() {
+        if !uinput_writable() {
+            return;
+        }
+
+        let name = format!("switch2d test ff caps {}", std::process::id());
+        let _pad = VirtualGamepad::new(&name, 0x2069, "test-ff-caps").unwrap();
+
+        let Some((_path, device)) = find_node(&name) else {
+            eprintln!(
+                "skipped FF capability assertions: {name:?} evdev node is not readable \
+                 (needs the ngc uaccess udev rule)"
+            );
+            return;
+        };
+
+        assert!(
+            device.supported_events().contains(EventType::FORCEFEEDBACK),
+            "EV_FF must be advertised"
+        );
+        let effects = device.supported_ff().expect("force-feedback bits");
+        assert!(
+            effects.contains(evdev::FFEffectType::FF_RUMBLE),
+            "FF_RUMBLE must be advertised"
+        );
+        assert_eq!(
+            effects.iter().count(),
+            1,
+            "only rumble is implemented, so only FF_RUMBLE is advertised"
+        );
+        assert_eq!(
+            device.max_ff_effects(),
+            FF_EFFECTS_MAX as usize,
+            "ff_effects_max must be visible in evdev"
+        );
     }
 
     #[test]
