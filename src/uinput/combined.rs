@@ -237,16 +237,17 @@ pub struct PadState {
 /// This is a direct port of the mapping that lived in `daemon.rs`
 /// (`CombinedSideSink`) and, before the worker split, in
 /// `CombinedJoyConManager::update_left/right` and the horizontal variants.
-/// It deliberately keeps the daemon's current trigger rule: `ABS_Z`/`ABS_RZ`
-/// are digital 0/255 derived from `ZL`/`ZR` in the button mask, not from the
-/// `triggers` argument. The argument exists because this is a [`PadSink`]
-/// mapping; changing to calibrated triggers would be a behaviour change.
+/// Normal (non-horizontal) sides emit `ABS_Z`/`ABS_RZ` from the calibrated
+/// trigger values, matching `gamepad.py:194-195` and the direct [`PadSink`].
+/// The mapping does not force 255 when `ZL`/`ZR` is pressed: `calibrate`
+/// already guarantees that, and duplicating it would collapse partial analog
+/// pulls.
 pub fn combined_side_state(
     side: Side,
     horizontal: bool,
     buttons: u32,
     sticks: (f32, f32, f32, f32),
-    _triggers: (u8, u8),
+    triggers: (u8, u8),
 ) -> PadState {
     let (lx, ly, rx, ry) = sticks;
     let pressed = |mask: u32| u8::from(buttons & mask != 0);
@@ -273,14 +274,9 @@ pub fn combined_side_state(
             state
                 .keys
                 .push((Key::BTN_THUMBL, pressed(button_mask::L_STICK_BTN)));
-            state.axes.push((
-                AbsoluteAxisType::ABS_Z,
-                if pressed(button_mask::ZL) != 0 {
-                    255
-                } else {
-                    0
-                },
-            ));
+            state
+                .axes
+                .push((AbsoluteAxisType::ABS_Z, i32::from(triggers.0)));
         }
         (Side::Right, false) => {
             state.axes.push((AbsoluteAxisType::ABS_RX, axis_from_unit(rx)));
@@ -307,14 +303,9 @@ pub fn combined_side_state(
             state
                 .keys
                 .push((Key::BTN_THUMBR, pressed(button_mask::R_STICK_BTN)));
-            state.axes.push((
-                AbsoluteAxisType::ABS_RZ,
-                if pressed(button_mask::ZR) != 0 {
-                    255
-                } else {
-                    0
-                },
-            ));
+            state
+                .axes
+                .push((AbsoluteAxisType::ABS_RZ, i32::from(triggers.1)));
         }
         (Side::Left, true) => {
             // Split mode: 90 deg CCW, rail buttons on the bumpers.
@@ -592,7 +583,7 @@ mod tests {
             false,
             bm::ZL | bm::RIGHT | bm::UP,
             NEUTRAL,
-            (200, 200),
+            (255, 255),
         );
         let axes = axis_map(&left);
         assert_eq!(axes.get(&AbsoluteAxisType::ABS_Z.0), Some(&255));
@@ -604,18 +595,44 @@ mod tests {
             false,
             bm::ZR | bm::LEFT | bm::DOWN,
             NEUTRAL,
-            (200, 200),
+            (255, 255),
         );
         let axes = axis_map(&right);
         assert_eq!(axes.get(&AbsoluteAxisType::ABS_RZ.0), Some(&255));
+    }
 
-        // The daemon-derived rule is digital ZL/ZR, not the calibrated trigger
-        // argument (which is part of the PadSink contract only).
-        let left_plain = combined_side_state(Side::Left, false, 0, NEUTRAL, (200, 200));
+    #[test]
+    fn partial_analog_trigger_reaches_the_axis() {
+        let left = combined_side_state(Side::Left, false, 0, NEUTRAL, (128, 200));
+        assert_eq!(axis_map(&left).get(&AbsoluteAxisType::ABS_Z.0), Some(&128));
+
+        let right = combined_side_state(Side::Right, false, 0, NEUTRAL, (128, 200));
         assert_eq!(
-            axis_map(&left_plain).get(&AbsoluteAxisType::ABS_Z.0),
-            Some(&0)
+            axis_map(&right).get(&AbsoluteAxisType::ABS_RZ.0),
+            Some(&200)
         );
+    }
+
+    #[test]
+    fn digital_zl_still_arrives_as_full_scale() {
+        let left = combined_side_state(Side::Left, false, bm::ZL | bm::ZR, NEUTRAL, (255, 255));
+        assert_eq!(axis_map(&left).get(&AbsoluteAxisType::ABS_Z.0), Some(&255));
+
+        let right = combined_side_state(Side::Right, false, bm::ZL | bm::ZR, NEUTRAL, (255, 255));
+        assert_eq!(
+            axis_map(&right).get(&AbsoluteAxisType::ABS_RZ.0),
+            Some(&255)
+        );
+    }
+
+    #[test]
+    fn horizontal_mapping_still_has_no_trigger_axis() {
+        for side in [Side::Left, Side::Right] {
+            let state = combined_side_state(side, true, 0, NEUTRAL, (128, 200));
+            let axes = axis_map(&state);
+            assert!(!axes.contains_key(&AbsoluteAxisType::ABS_Z.0));
+            assert!(!axes.contains_key(&AbsoluteAxisType::ABS_RZ.0));
+        }
     }
 
     #[test]

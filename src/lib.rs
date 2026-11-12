@@ -3,6 +3,7 @@ pub mod config;
 pub mod controller;
 pub mod daemon;
 pub mod dsu;
+pub mod dsu_bridge;
 pub mod hub;
 pub mod monitor;
 pub mod players;
@@ -14,6 +15,7 @@ pub mod uinput;
 pub mod worker;
 
 pub use dsu::{DsuConfig, DsuServer, MotionInput};
+pub use dsu_bridge::DsuBridge;
 pub use hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
 pub use players::LedPlayers;
 pub use status::{ControllerStatus, DaemonStatus, StatusPublisher};
