@@ -152,6 +152,32 @@ pub fn choose_stick_calibrations(
     }
 }
 
+/// Whether each stick's calibration areas need to be read at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickReadPlan {
+    pub read_left: bool,
+    pub read_right: bool,
+}
+
+/// Plan the calibration reads for a profile without touching the device.
+///
+/// A Left-only pad has no right stick, so reading the right areas would only
+/// produce a misleading "default right stick calibration" warning. A
+/// Right-only pad still reads both because its own block may be unwritten and
+/// the left block is the documented fallback source.
+pub fn stick_read_plan(sticks: Sticks) -> StickReadPlan {
+    match sticks {
+        Sticks::Left => StickReadPlan {
+            read_left: true,
+            read_right: false,
+        },
+        Sticks::Right | Sticks::Both => StickReadPlan {
+            read_left: true,
+            read_right: true,
+        },
+    }
+}
+
 /// GC trigger neutral byte, rejecting the `0x00`/`0xFF` sentinels.
 pub fn gc_trigger_neutral(raw: u8) -> u8 {
     if raw == 0x00 || raw == 0xFF {
@@ -1049,18 +1075,29 @@ impl SwitchController {
     /// returns an error so the session survives.
     fn read_calibration(&mut self) {
         let addresses = self.profile.calibration;
-        // Always read both areas: the profile decides which block feeds which
-        // physical stick afterwards.
-        let left_block = self.read_stick_calibration(
-            addresses.user_left,
-            addresses.factory_left,
-            "left",
-        );
-        let right_block = self.read_stick_calibration(
-            addresses.user_right,
-            addresses.factory_right,
-            "right",
-        );
+        let plan = stick_read_plan(self.profile.sticks);
+
+        let left_block = if plan.read_left {
+            self.read_stick_calibration(
+                addresses.user_left,
+                addresses.factory_left,
+                "left",
+            )
+        } else {
+            None
+        };
+        let right_block = if plan.read_right {
+            self.read_stick_calibration(
+                addresses.user_right,
+                addresses.factory_right,
+                "right",
+            )
+        } else {
+            // No right stick on this profile: skip the read entirely so the
+            // default-calibration evidence WARN cannot fire for a missing side.
+            debug!("single-stick pad: no right stick, keeping default calibration");
+            None
+        };
 
         let choice = choose_stick_calibrations(self.profile.sticks, left_block, right_block);
         if choice.right_from_left {
@@ -1554,6 +1591,40 @@ mod tests {
         assert_eq!(choice.right, StickCalibration::default());
         assert_ne!(choice.right, expected_right, "left pad must not read the right block");
         assert!(!choice.right_from_left);
+    }
+
+    #[test]
+    fn left_only_profile_reads_only_the_left_block() {
+        let plan = stick_read_plan(Sticks::Left);
+        assert!(plan.read_left);
+        assert!(
+            !plan.read_right,
+            "no right stick: the right areas must not be read or warned about"
+        );
+
+        // With the right read skipped, the chooser must keep the default right
+        // calibration and cannot fall back to anything.
+        let choice = choose_stick_calibrations(
+            Sticks::Left,
+            Some(REAL_STICK_CALIBRATION.to_vec()),
+            None,
+        );
+        assert_eq!(choice.right, StickCalibration::default());
+        assert!(!choice.right_from_left);
+    }
+
+    #[test]
+    fn right_only_profile_reads_both() {
+        let plan = stick_read_plan(Sticks::Right);
+        assert!(plan.read_left, "left block is the documented fallback source");
+        assert!(plan.read_right, "the right stick's own block is still read first");
+    }
+
+    #[test]
+    fn both_profile_reads_both() {
+        let plan = stick_read_plan(Sticks::Both);
+        assert!(plan.read_left);
+        assert!(plan.read_right);
     }
 
     #[test]
