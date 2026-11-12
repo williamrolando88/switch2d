@@ -89,7 +89,7 @@ without hardware, and USB becomes a second `Transport` impl later.
 
 Commit policy: one commit per approved task, each verified to build on its own.
 
-## 4. Decisions required before tasks 06-09
+## 4. Decisions required before tasks 06-09 — **all resolved, see §6**
 
 These change the public contract, so they are the human Project Lead's call:
 
@@ -115,7 +115,7 @@ These change the public contract, so they are the human Project Lead's call:
 
 ---
 
-## 5. Protocol details confirmed by t12 (report §8), binding on tasks 03/05/07
+## 5. Protocol details confirmed by t12 (report §8), binding on tasks 05/08
 
 ### 5.1 CCCD discovery (task 03) — do not guess `value_handle + 1`
 Legacy `att.py::discover_cccds` issues `ATT_FIND_INFO_REQ (0x04)` over
@@ -219,6 +219,37 @@ Bazzite detectors classify by uinput name string, the combined pad must publish 
 recognise — the agreed name is `Nintendo Switch 2 Combined Joy-Cons` (accepted as `generic`
 in v1; a detector-side change is out of scope here).
 
+### ADR-6 — advertisement source: BlueZ `GetManagedObjects` over `busctl` *(task 04B)*
+**Decision (Project Lead approved):** new `src/bluetooth/bluez.rs` implements `AdvertSource`
+by invoking
+
+```
+busctl call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects --json=short
+```
+
+**Verified on the target machine before adoption** (unprivileged, `systemd 262`): one call
+returns every object, including `/org/bluez/hciN` with `org.bluez.Adapter1.Address` and — once
+discovery has run — `org.bluez.Device1` objects carrying `Address`, `RSSI`, `Connected` and
+`ManufacturerData` as an `a{qv}` dict. `serde_json` (already a dependency) parses it directly;
+no new crate, no root, no D-Bus binding.
+
+Consequences:
+* Replaces adapter auto-detection (`bluetoothctl list` scraping) — the adapter MAC comes from
+  the same payload.
+* `bluetoothctl scan on` (via `ScanControl`) is what makes BlueZ populate device objects; the
+  hub therefore starts discovery before polling and stops it via ADR-2 before dialing.
+* Rejected alternatives: raw `mgmt` sockets (needs CAP_NET_ADMIN for discovery, which would
+  break the zero-sudo claim) and the `bluer` crate (works, but adds a D-Bus stack to a project
+  that deliberately bypasses BlueZ GATT).
+
+**Known risk — staleness.** `GetManagedObjects` exposes a *cached* property set, so a pad that
+stops advertising may keep its `ManufacturerData` in BlueZ for a while, whereas legacy saw
+only live adverts. Mitigation: require `RSSI` to be present and greater than -127 (BlueZ only
+sets it from live adverts) before an entry becomes eligible for `SeenAdverts::record`, and keep
+per-MAC connect-attempt rate limiting in the hub. This is a bounded degradation (a retry every
+wake TTL) rather than a correctness break, because the hub only ever dials known bonded MACs
+that BlueZ reports as `Connected: false`.
+
 ### Config schema after these ADRs
 ```json
 {
@@ -238,7 +269,7 @@ All new fields `#[serde(default)]` so existing configs keep loading; `partner_ma
 
 ---
 
-## 7. Hub/worker reference behavior confirmed by t12 (report §9) — binding on tasks 04/08
+## 7. Hub/worker reference behavior confirmed by t12 (report §9) — binding on tasks 06B/09
 
 ### 7.1 Scan loop (legacy `bridge.py::_scan_loop`)
 1. Snapshot workers. **If no worker is disconnected**: set `scanning=false`, sleep 1.5 s,
@@ -317,34 +348,33 @@ it is the audit trail for "why does Rust behave differently".
 | 7 | Vibration preset on connect (`0x0A/0x02`) | sent as a vibration self-test | deferred until the payload is confirmed by the Analyzer | not guessing wire formats |
 | 8 | `FF_GAIN` / `FF_AUTOCENTER` | alias into the effect map (ids 96/97) and stop rumble | handled explicitly or ignored, never aliased | legacy bug |
 | 9 | Idle-sleep timer | button-mask changes only; stick and gyro do not count | same, kept for behavioural parity | deliberate parity, revisit if users complain |
+| 10 | Scan timing | 500 ms start/stop scan window, 100 ms settle, 50/25 ms cycle sleeps | no window: BlueZ device cache is polled once per uniform 250 ms cycle | `GetManagedObjects` reads live cached properties, so there is nothing to start or stop per cycle (ADR-6) |
+| 11 | Reconnect topology | one isolated reconnecting worker loop per pad (`switch2d`), or a hub in `.old/` | a single hub owns every dial; workers never dial | removes the parallel-connect EBUSY class of bug structurally instead of by per-worker locking |
 
-### ADR-6 — advertisement source: BlueZ `GetManagedObjects` over `busctl` *(task 04B)*
-**Decision (Project Lead approved):** new `src/bluetooth/bluez.rs` implements `AdvertSource`
-by invoking
+---
 
-```
-busctl call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects --json=short
-```
+## 9. `HANDOVER.md` invariants — where each is enforced
 
-**Verified on the target machine before adoption** (unprivileged, `systemd 262`): one call
-returns every object, including `/org/bluez/hciN` with `org.bluez.Adapter1.Address` and — once
-discovery has run — `org.bluez.Device1` objects carrying `Address`, `RSSI`, `Connected` and
-`ManufacturerData` as an `a{qv}` dict. `serde_json` (already a dependency) parses it directly;
-no new crate, no root, no D-Bus binding.
+`HANDOVER.md` is the Project Lead's "do not revert these" list. This table is the reverse
+index: every item, and the precise code that must keep satisfying it.
 
-Consequences:
-* Replaces adapter auto-detection (`bluetoothctl list` scraping) — the adapter MAC comes from
-  the same payload.
-* `bluetoothctl scan on` (via `ScanControl`) is what makes BlueZ populate device objects; the
-  hub therefore starts discovery before polling and stops it via ADR-2 before dialing.
-* Rejected alternatives: raw `mgmt` sockets (needs CAP_NET_ADMIN for discovery, which would
-  break the zero-sudo claim) and the `bluer` crate (works, but adds a D-Bus stack to a project
-  that deliberately bypasses BlueZ GATT).
+| HANDOVER | Invariant | Enforced by | Guard |
+|---|---|---|---|
+| Bug 1 — dual-controller lockout | Never stop listening for pad B because pad A connected | `hub.rs`: early-out only when **no known pad is disconnected** (analysis §7.1) | test `scanning_continues_while_any_pad_is_disconnected` |
+| Bug 2 — `EBUSY` on parallel connect | Only one LE create-connection outstanding | `Hub::connect_lock` held across the whole `dial_pending` batch; the hub is the **only** caller of `Dialer::dial` | single-dialer design; task 09 must not spawn per-pad connect tasks |
+| Bug 3 — connect times out while scanning | HCI-level scan stop before every dial | `scan.rs`: `busctl … StopDiscovery` (unprivileged) **then** `sudo -n btmgmt -i N stop-find -l` | the `sudo -n` prefix is mandatory: unprivileged `btmgmt` fails `EPERM` and the stop silently no-ops |
+| Bug 4 — SMP disconnect | Never let BlueZ pair; raw L2CAP only | `l2cap.rs`: `BT_SECURITY_LOW` on every socket, `ATT_CID` seqpacket | existing; do not add an SMP path |
+| Bug 5 — marquee LEDs / dropped commands | Subscribe the command-response CCCD *before* any command; await each ACK; keep the 4-step bond sequence | `controller.rs` handshake order (task 05) + `build_command` framing | ATT_READ_REQ is used **only** for GATT discovery, never for command replies |
+| Bug 6 — stick endianness / sign | `raw_x = v & 0xFFF`, `raw_y = (v >> 12) & 0xFFF`, evdev Y negated | `calibration.rs`, `uinput/combined.rs` | existing unit test unpacks `[0x00,0x08,0x80]` to `(2048,2048)` |
+| Bug 7 — split-mode rotation | Left CCW, Right CW stick and button remap | `uinput/combined.rs` horizontal mappers | must survive the task 12 rewrite |
+| Bug 8 — `/dev/uinput` permissions | Daemon runs fully unprivileged; only `btmgmt` uses the sudoers rule | user units + uaccess ACLs; `sudo -n` is the sole privileged call in the tree | never add another privileged invocation |
 
-**Known risk — staleness.** `GetManagedObjects` exposes a *cached* property set, so a pad that
-stops advertising may keep its `ManufacturerData` in BlueZ for a while, whereas legacy saw
-only live adverts. Mitigation: require `RSSI` to be present and greater than -127 (BlueZ only
-sets it from live adverts) before an entry becomes eligible for `SeenAdverts::record`, and keep
-per-MAC connect-attempt rate limiting in the hub. This is a bounded degradation (a retry every
-wake TTL) rather than a correctness break, because the hub only ever dials known bonded MACs
-that BlueZ reports as `Connected: false`.
+Two structural notes, so a future reader does not mistake them for regressions:
+
+* **Bug 1 vs Bug 2 conflict.** HANDOVER prescribes *isolated per-controller reconnect loops*
+  and, separately, *a serializing connect lock*. A single hub satisfies both at once: it keeps
+  scanning while any pad is disconnected, and it is physically incapable of two concurrent
+  dials. Workers own sessions, not connections. Do not reintroduce per-pad dialing.
+* **Non-goals from HANDOVER, tracked but not yet actioned:** the `< 5 MB` RSS target is
+  unmeasured (no measurement harness yet), and user-facing console text must use Fish shell
+  syntax — relevant when `main.rs` output is revisited, note it in the CLI task.
