@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -57,7 +58,7 @@ impl Daemon {
         )?);
 
         let manager = Arc::new(CombinedJoyConManager::new(combined_gamepad));
-
+        let connect_lock = Arc::new(Mutex::new(()));
         let mut handles = Vec::new();
 
         for ctrl_cfg in &self.config.controllers {
@@ -65,6 +66,7 @@ impl Daemon {
             let adapter_mac = self.config.adapter_mac.clone();
             let running = self.running.clone();
             let mgr = manager.clone();
+            let conn_lock = connect_lock.clone();
 
             let handle = tokio::spawn(async move {
                 let is_left = ctrl_cfg.name.to_lowercase().contains("left");
@@ -73,6 +75,9 @@ impl Daemon {
                     let mgr_cb = mgr.clone();
                     let mac_str = ctrl_cfg.mac.clone();
                     let adapter_str = adapter_mac.clone();
+
+                    // Serialize connection attempts so hardware adapter does not hit EBUSY
+                    let conn_permit = conn_lock.lock().await;
 
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
@@ -91,6 +96,9 @@ impl Daemon {
                         )
                     }).await;
 
+                    // Release connect lock regardless of success or failure
+                    drop(conn_permit);
+
                     match res {
                         Ok(Ok(controller)) => {
                             info!("Controller {} connected and streaming inputs!", ctrl_cfg.mac);
@@ -100,13 +108,12 @@ impl Daemon {
                             warn!("Controller {} disconnected.", ctrl_cfg.mac);
                         }
                         Ok(Err(_e)) => {
-                            // Connection failed / controller asleep; retry after short interval
                             trace_or_debug(&ctrl_cfg.mac);
-                            sleep(Duration::from_millis(2000)).await;
+                            sleep(Duration::from_millis(1500)).await;
                         }
                         Err(e) => {
                             error!("Spawn task error: {}", e);
-                            sleep(Duration::from_millis(2000)).await;
+                            sleep(Duration::from_millis(1500)).await;
                         }
                     }
                 }
@@ -115,7 +122,6 @@ impl Daemon {
             handles.push(handle);
         }
 
-        // Wait for all worker tasks
         for h in handles {
             let _ = h.await;
         }
@@ -125,11 +131,13 @@ impl Daemon {
 
     async fn run_split(&self) -> std::io::Result<()> {
         let mut handles = Vec::new();
+        let connect_lock = Arc::new(Mutex::new(()));
 
         for ctrl_cfg in &self.config.controllers {
             let ctrl_cfg = ctrl_cfg.clone();
             let adapter_mac = self.config.adapter_mac.clone();
             let running = self.running.clone();
+            let conn_lock = connect_lock.clone();
 
             let handle = tokio::spawn(async move {
                 let gp_name = format!("Nintendo Switch 2 {}", ctrl_cfg.name);
@@ -149,6 +157,8 @@ impl Daemon {
                     let adapter_str = adapter_mac.clone();
                     let is_left = ctrl_cfg.name.to_lowercase().contains("left");
 
+                    let conn_permit = conn_lock.lock().await;
+
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
@@ -166,6 +176,8 @@ impl Daemon {
                         )
                     }).await;
 
+                    drop(conn_permit);
+
                     match res {
                         Ok(Ok(controller)) => {
                             info!("Controller {} connected in split mode!", ctrl_cfg.mac);
@@ -175,11 +187,11 @@ impl Daemon {
                             warn!("Controller {} disconnected.", ctrl_cfg.mac);
                         }
                         Ok(Err(_)) => {
-                            sleep(Duration::from_millis(2000)).await;
+                            sleep(Duration::from_millis(1500)).await;
                         }
                         Err(e) => {
                             error!("Spawn task error: {}", e);
-                            sleep(Duration::from_millis(2000)).await;
+                            sleep(Duration::from_millis(1500)).await;
                         }
                     }
                 }
