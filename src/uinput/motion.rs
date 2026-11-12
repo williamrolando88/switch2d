@@ -264,8 +264,8 @@ mod tests {
         // the MAC uppercased (motion_evdev.py:44-45) and stay idempotent for
         // callers that already pass the prefix.
         assert_eq!(
-            phys_for_tag("bc:89:a6:45:83:cc"),
-            "ngc/BC:89:A6:45:83:CC"
+            phys_for_tag("aa:bb:cc:dd:ee:01"),
+            "ngc/AA:BB:CC:DD:EE:01"
         );
         assert_eq!(
             phys_for_tag("AA:BB:CC:DD:EE:FF"),
@@ -276,14 +276,14 @@ mod tests {
             "ngc/AA:BB:CC:DD:EE:FF"
         );
         assert_eq!(
-            phys_for_tag("ngc/bc:89:a6:45:83:cc"),
-            "ngc/BC:89:A6:45:83:CC"
+            phys_for_tag("ngc/aa:bb:cc:dd:ee:01"),
+            "ngc/AA:BB:CC:DD:EE:01"
         );
 
         // Both VirtualGamepad::new and MotionNode::new call this helper with
         // the same MAC, so the nodes agree for the same input.
-        let from_gamepad_tag = phys_for_tag("bc:89:a6:45:83:cc");
-        let from_imu_mac = phys_for_tag("bc:89:a6:45:83:cc");
+        let from_gamepad_tag = phys_for_tag("aa:bb:cc:dd:ee:01");
+        let from_imu_mac = phys_for_tag("aa:bb:cc:dd:ee:01");
         assert_eq!(from_gamepad_tag, from_imu_mac);
     }
 
@@ -346,9 +346,9 @@ mod tests {
         let name = format!("switch2d imu test {pid}");
         let display_name = format!("{name} IMU");
         let pad_name = format!("switch2d imu pad test {pid}");
-        let mac = "bc:89:a6:45:83:cc";
+        let mac = "aa:bb:cc:dd:ee:01";
         let product_id = 0x2066; // pretend Joy-Con 2 (Right)
-        let expected_phys = "ngc/BC:89:A6:45:83:CC";
+        let expected_phys = "ngc/AA:BB:CC:DD:EE:01";
 
         // Companion gamepad: both nodes carry the same controller product id
         // and must normalise the same lowercase MAC to the same phys string.

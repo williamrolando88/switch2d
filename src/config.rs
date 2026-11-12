@@ -34,6 +34,35 @@ fn default_true() -> bool {
     true
 }
 
+/// Stick deadzone applied by the mapper when the config does not set one.
+pub const DEFAULT_STICK_DEADZONE: u16 = 120;
+
+/// Accepted range for `stick_deadzone`; out-of-range values are clamped.
+const STICK_DEADZONE_MIN: u16 = 1;
+const STICK_DEADZONE_MAX: u16 = 1000;
+
+fn default_stick_deadzone() -> u16 {
+    DEFAULT_STICK_DEADZONE
+}
+
+/// Parse `stick_deadzone` tolerantly: accept integer or numeric-string input
+/// and clamp to the supported range instead of rejecting the whole config.
+fn deserialize_stick_deadzone<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let raw = match &value {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    let raw = raw.ok_or_else(|| D::Error::custom("stick_deadzone must be an integer"))?;
+    Ok(raw.clamp(i64::from(STICK_DEADZONE_MIN), i64::from(STICK_DEADZONE_MAX)) as u16)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default)]
@@ -44,6 +73,13 @@ pub struct DaemonConfig {
     pub controllers: Vec<BondedController>,
     #[serde(default = "default_idle_sleep")]
     pub idle_sleep_seconds: u64,
+    /// Stick deadzone policy value. Optional in the file; absent means 120.
+    /// Values outside `1..=1000` are clamped rather than rejected.
+    #[serde(
+        default = "default_stick_deadzone",
+        deserialize_with = "deserialize_stick_deadzone"
+    )]
+    pub stick_deadzone: u16,
 }
 
 fn default_idle_sleep() -> u64 {
@@ -57,6 +93,7 @@ impl Default for DaemonConfig {
             mode: DaemonMode::Combined,
             controllers: Vec::new(),
             idle_sleep_seconds: 300,
+            stick_deadzone: DEFAULT_STICK_DEADZONE,
         }
     }
 }
@@ -148,6 +185,7 @@ impl DaemonConfig {
             mode: DaemonMode::Combined,
             controllers,
             idle_sleep_seconds: 300,
+            stick_deadzone: DEFAULT_STICK_DEADZONE,
         })
     }
 
@@ -168,5 +206,43 @@ impl DaemonConfig {
         } else {
             self.controllers.push(controller);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> DaemonConfig {
+        serde_json::from_str(json).expect("config parses")
+    }
+
+    #[test]
+    fn stick_deadzone_defaults_when_absent() {
+        let config = parse(r#"{}"#);
+        assert_eq!(config.stick_deadzone, DEFAULT_STICK_DEADZONE);
+        assert_eq!(config.stick_deadzone, 120);
+        assert_eq!(
+            DaemonConfig::default().stick_deadzone,
+            DEFAULT_STICK_DEADZONE
+        );
+    }
+
+    #[test]
+    fn stick_deadzone_accepts_custom_value() {
+        assert_eq!(parse(r#"{"stick_deadzone": 250}"#).stick_deadzone, 250);
+        // Tolerant of a numeric string, as in a hand-edited config.
+        assert_eq!(parse(r#"{"stick_deadzone": "300"}"#).stick_deadzone, 300);
+    }
+
+    #[test]
+    fn stick_deadzone_clamps_out_of_range_values() {
+        assert_eq!(parse(r#"{"stick_deadzone": 0}"#).stick_deadzone, 1);
+        assert_eq!(parse(r#"{"stick_deadzone": -50}"#).stick_deadzone, 1);
+        assert_eq!(parse(r#"{"stick_deadzone": 5000}"#).stick_deadzone, 1000);
+        assert_eq!(
+            parse(r#"{"stick_deadzone": 999999999999}"#).stick_deadzone,
+            1000
+        );
     }
 }

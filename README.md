@@ -56,8 +56,8 @@ Pair your controllers or add their Bluetooth MAC addresses:
 
 ```bash
 # Add Left and Right Joy-Cons
-switch2d add BC:89:A6:45:83:CC --name "Joy-Con 2 (Left)" --player 1
-switch2d add BC:89:A6:49:8D:74 --name "Joy-Con 2 (Right)" --player 2
+switch2d add AA:BB:CC:DD:EE:01 --name "Joy-Con 2 (Left)" --player 1
+switch2d add AA:BB:CC:DD:EE:02 --name "Joy-Con 2 (Right)" --player 2
 ```
 
 ### 3. Check Status
@@ -71,11 +71,11 @@ Output:
 ===========================================================
    switch2d Status
 ===========================================================
-Adapter MAC:  8C:17:59:41:D6:1E
+Adapter MAC:  0A:0B:0C:0D:0E:0F
 Joy-Con Mode: Combined
 Bonded Controllers (2):
-  [1] Joy-Con 2 (Left) (BC:89:A6:45:83:CC) - Player 1
-  [2] Joy-Con 2 (Right) (BC:89:A6:49:8D:74) - Player 2
+  [1] Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01) - Player 1
+  [2] Joy-Con 2 (Right) (AA:BB:CC:DD:EE:02) - Player 2
 Configuration file: ~/.config/switch2d/config.json
 ```
 

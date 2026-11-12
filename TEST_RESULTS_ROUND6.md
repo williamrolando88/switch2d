@@ -3,7 +3,7 @@
 - **Date**: 2026-11-12
 - **Build under test**: `ab31ac3` (frozen at `~/switch2d-test/switch2d`)
 - **Binary SHA256**: `97f307e6c1f24a16dd077c8650656faafe7bcd31338c3bab8f64b16a159081a6`
-- **Host**: Linux (Bazzite) / Adapter `8C:17:59:41:D6:1E`
+- **Host**: Linux (Bazzite) / Adapter `0A:0B:0C:0D:0E:0F`
 - **Reference Plan**: [docs/TEST_PLAN_ROUND6.md](file:///var/home/wmorales/repos/switch2d/docs/TEST_PLAN_ROUND6.md)
 - **Previous Rounds**: [TEST_RESULTS_ROUND2.md](file:///var/home/wmorales/repos/switch2d/TEST_RESULTS_ROUND2.md), [TEST_RESULTS_ROUND3.md](file:///var/home/wmorales/repos/switch2d/TEST_RESULTS_ROUND3.md)
 
@@ -43,7 +43,7 @@
 
 ---
 
-## 3. Left Joy-Con Pairing (`BC:89:A6:45:83:CC`)
+## 3. Left Joy-Con Pairing (`AA:BB:CC:DD:EE:01`)
 
 - **Player Assignment**: Player 1
 - **LED pattern during 6s hold**: 1 solid LED (Player 1) (Pending visual confirmation from user)
@@ -53,28 +53,28 @@
 - **Pairing result**: ✅ Success
 - **Raw pairing log**:
   ```text
-  Found Switch 2 controller: BC:89:A6:45:83:CC
-  Connecting to BC:89:A6:45:83:CC (Player 1)...
-  INFO L2CAP link established with BC:89:A6:45:83:CC (type: LE_PUBLIC)
+  Found Switch 2 controller: AA:BB:CC:DD:EE:01
+  Connecting to AA:BB:CC:DD:EE:01 (Player 1)...
+  INFO L2CAP link established with AA:BB:CC:DD:EE:01 (type: LE_PUBLIC)
   INFO Negotiated ATT MTU: 247
   INFO Subscribed to command responses (handle 0x001B)
-  INFO Identified controller: Joy-Con 2 (Left) (serial: HBW71022994899)
-  INFO Bonding sequence completed for BC:89:A6:45:83:CC
+  INFO Identified controller: Joy-Con 2 (Left) (serial: SYNTH-L-0001)
+  INFO Bonding sequence completed for AA:BB:CC:DD:EE:01
   INFO Player LED set to Player 1
   INFO Input streaming active (handle 0x000A)
-  INFO Dial to BC:89:A6:45:83:CC succeeded after 4 rounds (8 address-type attempts)
+  INFO Dial to AA:BB:CC:DD:EE:01 succeeded after 4 rounds (8 address-type attempts)
   INFO Saved config to /home/wmorales/.config/switch2d/config.json
   ===========================================================
     ✅ Controller Successfully Paired & Bonded!
     Device:  Joy-Con 2 (Left)
-    Address: BC:89:A6:45:83:CC
+    Address: AA:BB:CC:DD:EE:01
     Player:  1
   ===========================================================
   ```
 
 ---
 
-## 4. Right Joy-Con Pairing (`BC:89:A6:49:8D:74`)
+## 4. Right Joy-Con Pairing (`AA:BB:CC:DD:EE:02`)
 
 - **Player Assignment**: Player 2
 - **LED pattern during 6s hold**: 2 solid LEDs (`0x03`, Player 2) (Pending visual confirmation from user)
@@ -87,15 +87,15 @@
 - **Pairing result**: ✅ Success
 - **Post-Pairing Status (`switch2d status`)**:
   - Bonded Controllers: 2
-  - `[1] Joy-Con 2 (Left) (BC:89:A6:45:83:CC) - Player 1`
-  - `[2] Joy-Con 2 (Right) (BC:89:A6:49:8D:74) - Player 2`
+  - `[1] Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01) - Player 1`
+  - `[2] Joy-Con 2 (Right) (AA:BB:CC:DD:EE:02) - Player 2`
   - Mode: `combined`
 
 ---
 
 ## 5. Per-Pad Live Validation (`pair $MAC --hold 60`)
 
-### 5.1 Left Pad (`BC:89:A6:45:83:CC`)
+### 5.1 Left Pad (`AA:BB:CC:DD:EE:01`)
 - **Player Assignment / LEDs**: Because slots 1 and 2 were occupied, `pair $LEFT --hold 60` without `-p` auto-assigned slot 3. The Left Joy-Con faithfully displayed **3 solid green LEDs (`0x07`, Player 3)** as confirmed by the tester. (Slot manually restored to Player 1 in `config.json`).
 - **Sticks at rest (0-5s)**: `raw=<1958,2143>`, `cal=<0.00,0.00>` (Zero drift, neutral).
 - **Left Stick range**:
@@ -110,7 +110,7 @@
 - **Calibration log check**:
   - ✅ **Pass**: Confirmed zero warnings about missing right stick. Full 5,328 reports streamed.
 
-### 5.2 Right Pad (`BC:89:A6:49:8D:74`)
+### 5.2 Right Pad (`AA:BB:CC:DD:EE:02`)
 - **Sticks at rest (0-5s)**: `raw=<2047,2047><2101,2003>`, `cal=<0.00,0.00><0.00,0.00>` (Zero drift, neutral).
 - **Right Stick range (CRITICAL TEST FOR 0.74 FIX)**:
   - Full X Range: `[-1.00, 1.00]` (Raw: `816` to `3344`)
@@ -132,10 +132,10 @@
 ## 6. Daemon, Dual Controller & Combined Node (`switch2d run`)
 
 - **Daemon startup & dual connect**:
-  - `INFO Starting switch2d with adapter 8C:17:59:41:D6:1E`
+  - `INFO Starting switch2d with adapter 0A:0B:0C:0D:0E:0F`
   - `INFO Exposed virtual gamepad 'Nintendo Switch 2 Combined Joy-Cons' (phys: ngc/SWITCH2-COMBINED)`
-  - Left Pad: `L2CAP link established with BC:89:A6:45:83:CC (type: LE_PUBLIC)` $\rightarrow$ Player 1
-  - Right Pad: `L2CAP link established with BC:89:A6:49:8D:74 (type: LE_PUBLIC)` $\rightarrow$ Player 2
+  - Left Pad: `L2CAP link established with AA:BB:CC:DD:EE:01 (type: LE_PUBLIC)` $\rightarrow$ Player 1
+  - Right Pad: `L2CAP link established with AA:BB:CC:DD:EE:02 (type: LE_PUBLIC)` $\rightarrow$ Player 2
   - ✅ **Pass**: Both pads connected simultaneously as Player 1 and Player 2 without collisions or errors.
 - **Combined `evtest` Node (`/dev/input/event27` — "Nintendo Switch 2 Combined Joy-Cons")**:
   - **Left Stick**: `ABS_X` min=`-23750`, max=`22667` | `ABS_Y` min=`-24235`, max=`23033`
@@ -158,14 +158,14 @@
 ## 7. Reconnect Without SYNC (Wake Reconnection)
 
 - **Left Pad Solo Wake Reconnect**:
-  - `INFO Dial to BC:89:A6:45:83:CC succeeded after 9 rounds (18 address-type attempts)`
+  - `INFO Dial to AA:BB:CC:DD:EE:01 succeeded after 9 rounds (18 address-type attempts)`
   - `INFO Player LED set to Player 1`
-  - `INFO Controller BC:89:A6:45:83:CC connected and streaming inputs!`
+  - `INFO Controller AA:BB:CC:DD:EE:01 connected and streaming inputs!`
   - ✅ **Pass**: Reconnected automatically on normal button press; 1 solid LED restored, no SYNC button required.
 - **Right Pad Solo Wake Reconnect**:
-  - `INFO L2CAP link established with BC:89:A6:49:8D:74 (type: LE_PUBLIC)`
+  - `INFO L2CAP link established with AA:BB:CC:DD:EE:02 (type: LE_PUBLIC)`
   - `INFO Player LED set to Player 2`
-  - `INFO Controller BC:89:A6:49:8D:74 connected and streaming inputs!`
+  - `INFO Controller AA:BB:CC:DD:EE:02 connected and streaming inputs!`
   - ✅ **Pass**: Reconnected automatically on normal button press; 2 solid LEDs (`0x03`) restored, no SYNC button required.
 - **Simultaneous Dual-Pad Wake Reconnect**:
   - ✅ **Pass**: Both controllers woken together re-established connections and streamed into the combined gamepad node.
@@ -183,8 +183,8 @@
   - `switch2d run` (PID `591721`) did **not** crash or exit.
   - Automatically detected link tear-down and re-entered discovery/dial loop.
 - **Automatic Post-Restart Reconnection**:
-  - Right Joy-Con: Dial succeeded after 12 rounds $\rightarrow$ `Player LED set to Player 2` $\rightarrow$ `Controller BC:89:A6:49:8D:74 connected and streaming inputs!`
-  - Left Joy-Con: `L2CAP link established with BC:89:A6:45:83:CC (type: LE_PUBLIC)` $\rightarrow$ `Player LED set to Player 1` $\rightarrow$ `Controller BC:89:A6:45:83:CC connected and streaming inputs!`
+  - Right Joy-Con: Dial succeeded after 12 rounds $\rightarrow$ `Player LED set to Player 2` $\rightarrow$ `Controller AA:BB:CC:DD:EE:02 connected and streaming inputs!`
+  - Left Joy-Con: `L2CAP link established with AA:BB:CC:DD:EE:01 (type: LE_PUBLIC)` $\rightarrow$ `Player LED set to Player 1` $\rightarrow$ `Controller AA:BB:CC:DD:EE:01 connected and streaming inputs!`
   - ✅ **Pass (Flawless Recovery)**: 100% automated recovery without requiring daemon restart or user intervention.
 
 ---

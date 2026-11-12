@@ -30,8 +30,8 @@ hardware.
 ## Phase A — clean slate and pair *while keeping the link*
 
 ```fish
-set LEFT  BC:89:A6:45:83:CC
-set RIGHT BC:89:A6:49:8D:74
+set LEFT  AA:BB:CC:DD:EE:01
+set RIGHT AA:BB:CC:DD:EE:02
 systemctl --user stop switch2d.service
 set LOG ~/switch2d-test/round3-(date +%H%M).log
 
@@ -80,7 +80,7 @@ The header line prints our adapter MAC; each advert line prints the pad's `host=
 | `host=` value | Meaning |
 |---|---|
 | `00:00:00:00:00:00` | the bond never landed — our `SET_MAC` is wrong or ignored |
-| `1E:D6:41:59:17:8C` (our adapter, reversed) | the bond landed; the pad wants us |
+| `0F:0E:0D:0C:0B:0A` (our adapter, reversed) | the bond landed; the pad wants us |
 | anything else | the pad is bonded to a stale/foreign host |
 
 Do this for the Right pad too, after its own pairing.
@@ -109,7 +109,7 @@ sudo -n btmgmt -i 0 connect -t le $LEFT 2>&1 | tee -a $LOG
 ```
 
 If `btmgmt info` shows privacy enabled, or an LE address different from
-`8C:17:59:41:D6:1E`, retry Phase C **after**:
+`0A:0B:0C:0D:0E:0F`, retry Phase C **after**:
 
 ```fish
 sudo -n btmgmt -i 0 privacy off

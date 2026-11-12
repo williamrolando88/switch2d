@@ -49,8 +49,8 @@ command -v evtest bluetoothctl btmgmt
 ## 1. Clean slate — purge every trace
 
 ```fish
-set LEFT  BC:89:A6:45:83:CC
-set RIGHT BC:89:A6:49:8D:74
+set LEFT  AA:BB:CC:DD:EE:01
+set RIGHT AA:BB:CC:DD:EE:02
 
 ~/switch2d-test/switch2d remove $LEFT
 ~/switch2d-test/switch2d remove $RIGHT

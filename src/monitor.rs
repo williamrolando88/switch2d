@@ -505,16 +505,16 @@ mod tests {
     fn snapshot(host: crate::protocol::advert::HostBinding, name: Option<&str>) -> AdvertSnapshot {
         // Full Nintendo block: prefix, vid 0x057E, pid 0x2067, flags, host field.
         let mut md = vec![0x00, 0x00, 0x00, 0x7E, 0x05, 0x67, 0x20, 0x00, 0x00, 0x00];
-        md.extend_from_slice(&[0x1E, 0xD6, 0x41, 0x59, 0x17, 0x8C]);
+        md.extend_from_slice(&[0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]);
         AdvertSnapshot {
-            address: "BC:89:A6:45:83:CC".to_string(),
+            address: "AA:BB:CC:DD:EE:01".to_string(),
             address_type: Some("public".to_string()),
             name: name.map(|n| n.to_string()),
             connected: false,
             rssi: Some(-53),
             manufacturer_data: Some(md),
             advert: Some(crate::protocol::advert::AdvertInfo {
-                address: "BC:89:A6:45:83:CC".to_string(),
+                address: "AA:BB:CC:DD:EE:01".to_string(),
                 vid: 0x057E,
                 pid: 0x2067,
                 host,
@@ -524,17 +524,17 @@ mod tests {
 
     #[test]
     fn advert_line_for_nintendo_shows_host_in_display_order() {
-        // Wire bytes `1E:D6:41:59:17:8C` reverse to `8C:17:59:41:D6:1E`.
+        // Wire bytes `0F:0E:0D:0C:0B:0A` reverse to `0A:0B:0C:0D:0E:0F`.
         let line = advert_line_for(&snapshot(
-            crate::protocol::advert::HostBinding::Host([0x1E, 0xD6, 0x41, 0x59, 0x17, 0x8C]),
+            crate::protocol::advert::HostBinding::Host([0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]),
             Some("Joy-Con 2 (Left)"),
         ));
 
         assert_eq!(
             line,
-            "BC:89:A6:45:83:CC public pid=0x2067 Joy-Con 2 (Left) rssi=-53 \
-             host=8C:17:59:41:D6:1E vid=0x057E \
-             md=0000007e0567200000001ed64159178c"
+            "AA:BB:CC:DD:EE:01 public pid=0x2067 Joy-Con 2 (Left) rssi=-53 \
+             host=0A:0B:0C:0D:0E:0F vid=0x057E \
+             md=0000007e0567200000000f0e0d0c0b0a"
         );
     }
 
@@ -579,9 +579,9 @@ mod tests {
 
     #[test]
     fn pair_hold_header_keeps_the_led_note_and_ctrl_c_hint() {
-        let header = pair_hold_header("BC:89:A6:45:83:CC", 2, 30);
+        let header = pair_hold_header("AA:BB:CC:DD:EE:01", 2, 30);
 
-        assert!(header.contains("BC:89:A6:45:83:CC"));
+        assert!(header.contains("AA:BB:CC:DD:EE:01"));
         assert!(header.contains("Player 2"));
         assert!(header.contains("30 s"));
         assert!(header.contains("LED"), "6 s verification note survives");
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn advert_prints_snapshot_with_md_but_no_rssi() {
         let mut item = snapshot(
-            crate::protocol::advert::HostBinding::Host([0x1E, 0xD6, 0x41, 0x59, 0x17, 0x8C]),
+            crate::protocol::advert::HostBinding::Host([0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]),
             Some("Joy-Con 2 (Left)"),
         );
         // BlueZ dropped RSSI when its adv-monitor window closed.
@@ -609,10 +609,10 @@ mod tests {
         let line = advert_line_for(&item);
         assert!(line.contains("rssi=?"), "{line}");
         assert!(
-            line.contains("md=0000007e0567200000001ed64159178c"),
+            line.contains("md=0000007e0567200000000f0e0d0c0b0a"),
             "{line}"
         );
-        assert!(line.contains("host=8C:17:59:41:D6:1E"), "{line}");
+        assert!(line.contains("host=0A:0B:0C:0D:0E:0F"), "{line}");
     }
 
     #[test]
@@ -645,14 +645,14 @@ mod tests {
     #[test]
     fn advert_dedupe_key_includes_address_type() {
         let mut public = snapshot(crate::protocol::advert::HostBinding::Pairing, None);
-        public.address = "BC:89:A6:45:83:CC".to_string();
+        public.address = "AA:BB:CC:DD:EE:01".to_string();
         public.address_type = Some("public".to_string());
 
         let mut random = public.clone();
         random.address_type = Some("random".to_string());
 
         assert_ne!(advert_dedupe_key(&public), advert_dedupe_key(&random));
-        assert_eq!(advert_dedupe_key(&public), "BC:89:A6:45:83:CC|public");
+        assert_eq!(advert_dedupe_key(&public), "AA:BB:CC:DD:EE:01|public");
 
         // The printed line changes too, so even line-based dedupe would reprint.
         assert_ne!(advert_line_for(&public), advert_line_for(&random));

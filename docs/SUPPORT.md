@@ -72,6 +72,15 @@ tests, flip its status there and in this table, and cannot regress the validated
 Joy-Con 2 path. `tests/support_matrix.rs` fails if the profile status and this table
 disagree.
 
+## Calibration policy
+
+Stick calibration is read from each controller at connect and never hardcoded per unit.
+An unwritten or unreadable area falls back to the generic legacy defaults, and we say so
+in the log (`Using default ... calibration: ... decision=defaults`). The stick deadzone is
+a fixed policy value today; if a unit drifts more than that, the remedy is a per-user
+override, not a new constant. No per-unit constants exist in the code, and a contribution
+that adds one should be rejected.
+
 ## Promoting a row from 🧪 to ✅
 
 1. Run the round's plan (at minimum: pair, hold-session decode, wake reconnect).

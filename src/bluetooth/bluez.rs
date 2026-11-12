@@ -331,19 +331,20 @@ mod tests {
     use crate::protocol::advert::HostBinding;
     use crate::protocol::constants::PRO_CONTROLLER2_PID;
 
-    /// Verified on the target machine; also carries the adapter object.
+    /// Synthetic object table shaped like a `busctl` capture; also carries
+    /// the adapter object.
     const MANAGED_OBJECTS: &str = r#"{
         "type": "a{oa{sa{sv}}}",
         "data": [
             {
                 "/org/bluez/hci0": {
                     "org.bluez.Adapter1": {
-                        "Address": {"type": "s", "data": "8C:17:59:41:D6:1E"}
+                        "Address": {"type": "s", "data": "0A:0B:0C:0D:0E:0F"}
                     }
                 },
-                "/org/bluez/hci0/dev_BC_89_A6_45_83_CC": {
+                "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01": {
                     "org.bluez.Device1": {
-                        "Address": {"type": "s", "data": "BC:89:A6:45:83:CC"},
+                        "Address": {"type": "s", "data": "AA:BB:CC:DD:EE:01"},
                         "Connected": {"type": "b", "data": false},
                         "RSSI": {"type": "n", "data": -53},
                         "ManufacturerData": {
@@ -352,7 +353,7 @@ mod tests {
                                 {
                                     "1363": {
                                         "type": "ay",
-                                        "data": [0, 0, 0, 126, 5, 105, 32, 0, 0, 0, 204, 131, 69, 166, 137, 188]
+                                        "data": [0, 0, 0, 126, 5, 105, 32, 0, 0, 0, 1, 238, 221, 204, 187, 170]
                                     }
                                 }
                             ]
@@ -384,20 +385,20 @@ mod tests {
         assert_eq!(devices.len(), 1);
 
         let device = &devices[0];
-        assert_eq!(device.address, "BC:89:A6:45:83:CC");
+        assert_eq!(device.address, "AA:BB:CC:DD:EE:01");
         assert!(!device.connected);
         assert_eq!(device.rssi, Some(-53));
         assert!(device.is_live());
 
         let advert = device.advert.as_ref().expect("manufacturer block decoded");
-        assert_eq!(advert.address, "BC:89:A6:45:83:CC");
+        assert_eq!(advert.address, "AA:BB:CC:DD:EE:01");
         assert_eq!(advert.vid, 0x057E);
         assert_eq!(advert.pid, PRO_CONTROLLER2_PID);
         assert_eq!(
             advert.host,
-            HostBinding::Host([0xCC, 0x83, 0x45, 0xA6, 0x89, 0xBC])
+            HostBinding::Host([0x01, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA])
         );
-        assert!(advert.host.matches_adapter("BC:89:A6:45:83:CC"));
+        assert!(advert.host.matches_adapter("AA:BB:CC:DD:EE:01"));
     }
 
     #[test]
@@ -443,7 +444,7 @@ mod tests {
             "data": [{
                 "/org/bluez/hci0": {
                     "org.bluez.Adapter1": {
-                        "Address": {"type": "s", "data": "8C:17:59:41:D6:1E"}
+                        "Address": {"type": "s", "data": "0A:0B:0C:0D:0E:0F"}
                     }
                 },
                 "/org/bluez/hci0/dev_AA": {
@@ -463,7 +464,7 @@ mod tests {
     fn extracts_adapter_address() {
         assert_eq!(
             parse_adapter_mac(MANAGED_OBJECTS, 0),
-            Some("8C:17:59:41:D6:1E".to_string())
+            Some("0A:0B:0C:0D:0E:0F".to_string())
         );
         // Unknown index maps to an object path that does not exist.
         assert_eq!(parse_adapter_mac(MANAGED_OBJECTS, 1), None);

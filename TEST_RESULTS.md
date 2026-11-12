@@ -2,7 +2,7 @@
 
 Date: 2026-11-11
 Target Hardware: Nintendo Switch 2 Controllers (Joy-Con 2 Left & Joy-Con 2 Right)
-Host: Linux (Bazzite) / Adapter `8C:17:59:41:D6:1E`
+Host: Linux (Bazzite) / Adapter `0A:0B:0C:0D:0E:0F`
 Initial Commit: `eb41905`
 
 ---
@@ -11,9 +11,9 @@ Initial Commit: `eb41905`
 
 - **uinput Permissions**: Verified `/dev/uinput` is writable by user (`uinput OK`).
 - **Required Tools**: `evtest`, `btmgmt`, `bluetoothctl` verified present.
-- **Background Daemon**: `switch2d.service` was found running in an active auto-restart loop (restarting every 3s because 0 controllers were paired, restart counter >2300). The service was explicitly stopped with `systemctl --user stop switch2d` to prevent radio contention on adapter `8C:17:59:41:D6:1E`.
+- **Background Daemon**: `switch2d.service` was found running in an active auto-restart loop (restarting every 3s because 0 controllers were paired, restart counter >2300). The service was explicitly stopped with `systemctl --user stop switch2d` to prevent radio contention on adapter `0A:0B:0C:0D:0E:0F`.
 - **Controllers to Test**:
-  - Joy-Con 2 (Left): Serial `HBW71022994899`, MAC `BC:89:A6:45:83:CC`
+  - Joy-Con 2 (Left): Serial `SYNTH-L-0001`, MAC `AA:BB:CC:DD:EE:01`
   - Joy-Con 2 (Right): Pending pairing & validation
 
 ---
@@ -26,7 +26,7 @@ Initial Commit: `eb41905`
 FINDING
   severity: blocks-testing
   build:    eb41905
-  controller: Joy-Con 2 (Left) (BC:89:A6:45:83:CC)
+  controller: Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01)
   command:  cargo run --release -- pair
   expected: Scan for 10s, detect controller in pairing mode, print "Found Switch 2 controller: <MAC>" and connect.
   actual:   
@@ -58,25 +58,25 @@ Modified `scan_for_joycon()` to execute `bluetoothctl --timeout 8 scan on` synch
 FINDING
   severity: wrong-behaviour
   build:    eb41905
-  controller: Joy-Con 2 (Left) (BC:89:A6:45:83:CC)
-  command:  cargo run --release -- pair BC:89:A6:45:83:CC
+  controller: Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01)
+  command:  cargo run --release -- pair AA:BB:CC:DD:EE:01
   expected: 
     README states: "the controller's player LED settles solid on Player 1 for the first and Player 2 for the second."
   actual:   
-    INFO Connecting to Switch 2 controller BC:89:A6:45:83:CC...
-    INFO L2CAP link established with BC:89:A6:45:83:CC (type: 1)
+    INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:01...
+    INFO L2CAP link established with AA:BB:CC:DD:EE:01 (type: 1)
     INFO Negotiated ATT MTU: 247
     INFO Subscribed to command responses (handle 0x001B)
-    INFO Identified controller: Joy-Con 2 (Left) (serial: HBW71022994899)
+    INFO Identified controller: Joy-Con 2 (Left) (serial: SYNTH-L-0001)
     WARN Using default right stick calibration (controller reports none)
-    INFO Bonding sequence completed for BC:89:A6:45:83:CC
+    INFO Bonding sequence completed for AA:BB:CC:DD:EE:01
     INFO Player LED set to Player 1
     INFO Input streaming active (handle 0x000A)
     INFO Saved config to /home/wmorales/.config/switch2d/config.json
     ===========================================================
       ✅ Controller Successfully Paired & Bonded!
       Device:  Joy-Con 2 (Left)
-      Address: BC:89:A6:45:83:CC
+      Address: AA:BB:CC:DD:EE:01
       Player:  1
     ===========================================================
     The LED on your controller is now set to Player 1.
@@ -96,30 +96,30 @@ FINDING
 **Resolution & Action**:
 1. Added a 6-second verification hold (`tokio::time::sleep(Duration::from_secs(6))`) in `Commands::Pair` before dropping the connection so the tester can visually observe and confirm the solid player LED pattern.
 2. Updated user-facing output to clarify that Joy-Con LEDs shut off when disconnected after `pair` exits, and will illuminate when `switch2d run` or `switch2d monitor` actively holds the connection.
-3. **Verification**: Re-ran `cargo run --release -- pair` with Left Joy-Con in sync mode. Auto-scan detected `BC:89:A6:45:83:CC` immediately, connected, and held link for 6s. Tester confirmed: **"it stopped with 2 leds on then they turned off again"** (Player 2 pattern `0x03` = 2 LEDs). Confirmed `COMMAND_LEDS` is operational and the prior issue was solely link teardown on process exit. Left Joy-Con configuration restored to Player 1.
+3. **Verification**: Re-ran `cargo run --release -- pair` with Left Joy-Con in sync mode. Auto-scan detected `AA:BB:CC:DD:EE:01` immediately, connected, and held link for 6s. Tester confirmed: **"it stopped with 2 leds on then they turned off again"** (Player 2 pattern `0x03` = 2 LEDs). Confirmed `COMMAND_LEDS` is operational and the prior issue was solely link teardown on process exit. Left Joy-Con configuration restored to Player 1.
 
 ---
 
 ### Step 2 Pairing: Joy-Con 2 (Right)
 
 ```text
-Found Switch 2 controller: BC:89:A6:49:8D:74
-Connecting to BC:89:A6:49:8D:74 (Player 2)...
-INFO Connecting to Switch 2 controller BC:89:A6:49:8D:74...
-INFO L2CAP link established with BC:89:A6:49:8D:74 (type: 1)
+Found Switch 2 controller: AA:BB:CC:DD:EE:02
+Connecting to AA:BB:CC:DD:EE:02 (Player 2)...
+INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:02...
+INFO L2CAP link established with AA:BB:CC:DD:EE:02 (type: 1)
 INFO Negotiated ATT MTU: 247
 WARN GATT discovery incomplete; using NSO GameCube fallback handles: vibration=0x0012
 INFO Subscribed to command responses (handle 0x001B)
-INFO Identified controller: Joy-Con 2 (Right) (serial: HCW71024337199)
+INFO Identified controller: Joy-Con 2 (Right) (serial: SYNTH-R-0001)
 WARN Using default right stick calibration (controller reports none)
-INFO Bonding sequence completed for BC:89:A6:49:8D:74
+INFO Bonding sequence completed for AA:BB:CC:DD:EE:02
 INFO Player LED set to Player 2
 INFO Input streaming active (handle 0x000A)
 INFO Saved config to ~/.config/switch2d/config.json
 ===========================================================
   ✅ Controller Successfully Paired & Bonded!
   Device:  Joy-Con 2 (Right)
-  Address: BC:89:A6:49:8D:74
+  Address: AA:BB:CC:DD:EE:02
   Player:  2
 ===========================================================
 The LED on your controller is now set to Player 2.
@@ -133,7 +133,7 @@ Tester confirmed: **"two leds turned on in the right joycon, then they went off"
 *Hardware Behavior Note (Wake & Discovery)*:
 When disconnected, pressing any key on either Joy-Con triggers wake advertisement, where the green LEDs cycle back and forth (marquee) searching for a Bluetooth host. Because peripheral Joy-Cons do not illuminate static LEDs without an active BLE host connection, the LEDs continue cycling until an active host (such as `switch2d run` or `switch2d monitor`) connects and issues `COMMAND_LEDS`. If no host connects, the controller times out and sleeps.
 
-*Note*: Discovered warning `WARN GATT discovery incomplete; using NSO GameCube fallback handles: vibration=0x0012` during GATT layout resolution. Controller successfully identified as `Joy-Con 2 (Right)` with serial `HCW71024337199`.
+*Note*: Discovered warning `WARN GATT discovery incomplete; using NSO GameCube fallback handles: vibration=0x0012` during GATT layout resolution. Controller successfully identified as `Joy-Con 2 (Right)` with serial `SYNTH-R-0001`.
 
 ---
 
@@ -143,10 +143,10 @@ When disconnected, pressing any key on either Joy-Con triggers wake advertisemen
 FINDING
   severity: blocks-testing
   build:    eb41905
-  controller: Both Joy-Con 2 Left (BC:89:A6:45:83:CC) and Right (BC:89:A6:49:8D:74)
+  controller: Both Joy-Con 2 Left (AA:BB:CC:DD:EE:01) and Right (AA:BB:CC:DD:EE:02)
   command:  
     cargo run --release -- monitor --seconds 60
-    cargo run --release -- monitor BC:89:A6:49:8D:74 --seconds 60
+    cargo run --release -- monitor AA:BB:CC:DD:EE:02 --seconds 60
   expected: Connects to bonded Joy-Con, illuminates solid Player LED (1 or 2), and streams decoded input reports for 60s.
   actual:   
     ===========================================================
@@ -171,15 +171,15 @@ FINDING
 FINDING
   severity: blocks-testing
   build:    eb41905
-  controller: Both Joy-Con 2 Left (BC:89:A6:45:83:CC) and Right (BC:89:A6:49:8D:74)
+  controller: Both Joy-Con 2 Left (AA:BB:CC:DD:EE:01) and Right (AA:BB:CC:DD:EE:02)
   command:  cargo run --release -- run
   expected: Daemon creates `/dev/uinput` node, connects to bonded Joy-Cons upon wake button press, sets Player LEDs (1 and 2 solid), and forwards inputs to the unified virtual gamepad.
   actual:   
-    INFO Starting switch2d with adapter 8C:17:59:41:D6:1E
+    INFO Starting switch2d with adapter 0A:0B:0C:0D:0E:0F
     INFO Active mode: Combined
     INFO Exposed virtual gamepad 'Nintendo Switch 2 Combined Joy-Cons' (phys: ngc/switch2-combined)
-    INFO Connecting to Switch 2 controller BC:89:A6:45:83:CC...
-    INFO Connecting to Switch 2 controller BC:89:A6:49:8D:74...
+    INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:01...
+    INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:02...
     (repeats every 1.5s in continuous reconnection loop, failing on every attempt)
 
     Tester observation:
@@ -281,8 +281,8 @@ index 55d6e6b..eee978b 100644
 ## 4. Current State & Next Steps
 
 Both controllers are bonded in `~/.config/switch2d/config.json`:
-- `[1] Joy-Con 2 (Left) (BC:89:A6:45:83:CC) - Player 1`
-- `[2] Joy-Con 2 (Right) (BC:89:A6:49:8D:74) - Player 2`
+- `[1] Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01) - Player 1`
+- `[2] Joy-Con 2 (Right) (AA:BB:CC:DD:EE:02) - Player 2`
 
 **Next Test**:
 - **Test A**: Live input report decode via `cargo run --release -- monitor --seconds 60` (Left, then Right).

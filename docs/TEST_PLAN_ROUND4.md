@@ -4,7 +4,7 @@ Build: **`70bf2e5`** (plus the `advert` liveness fix, commit will be given befor
 
 Round 3 settled two questions for good:
 
-- The bond is stored correctly — both pads advertise `host=8C:17:59:41:D6:1E`.
+- The bond is stored correctly — both pads advertise `host=0A:0B:0C:0D:0E:0F`.
 - Input decoding works on real hardware — sticks, 15 buttons, IMU, battery, LEDs.
 
 So the only open question is why a pad that is explicitly asking for this host still
@@ -35,7 +35,7 @@ Terminal B — wake the Left pad (button press, LEDs cycle), then:
 set LOG ~/switch2d-test/round4-(date +%H%M).log
 ~/switch2d-test/switch2d advert --seconds 15 2>&1 | tee -a $LOG
 bluetoothctl devices 2>&1 | tee -a $LOG
-RUST_LOG=debug ~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 45 2>&1 | tee -a $LOG
+RUST_LOG=debug ~/switch2d-test/switch2d monitor AA:BB:CC:DD:EE:01 --seconds 45 2>&1 | tee -a $LOG
 ```
 
 Stop `btmon` (Ctrl-C), then extract the interesting frames:
@@ -103,7 +103,7 @@ If they are still there, `bluetoothd` re-applied them on power-up; go to Phase P
 
 ```fish
 # 4. with privacy off, wake the pad and dial
-~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 45 2>&1 | tee -a $LOG
+~/switch2d-test/switch2d monitor AA:BB:CC:DD:EE:01 --seconds 45 2>&1 | tee -a $LOG
 ```
 
 ### Phase P2 — only if privacy came back in step 3
@@ -117,7 +117,7 @@ sudo systemctl stop bluetooth
 sudo btmgmt -i 0 power on
 sudo btmgmt -i 0 info 2>&1 | tee -a $LOG        # privacy now stays off
 # wake the pad, then:
-~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 45 2>&1 | tee -a $LOG
+~/switch2d-test/switch2d monitor AA:BB:CC:DD:EE:01 --seconds 45 2>&1 | tee -a $LOG
 ```
 
 This variant is also a result on its own: if the pad connects with `bluetoothd`
@@ -150,7 +150,7 @@ Both sticks, both areas, with `resp_len` and the first bytes.
 
 ## Repeat for the Right pad
 
-Same four steps with `BC:89:A6:49:8D:74`. One pad is enough to prove the mechanism; the
+Same four steps with `AA:BB:CC:DD:EE:02`. One pad is enough to prove the mechanism; the
 second confirms it is not model-specific.
 
 ## What each outcome means

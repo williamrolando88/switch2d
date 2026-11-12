@@ -2,7 +2,7 @@
 
 - **Date**: 2026-11-12
 - **Build under test**: `1e50b79` (binary frozen at `~/switch2d-test/switch2d`)
-- **Host**: Linux (Bazzite) / Adapter `8C:17:59:41:D6:1E`
+- **Host**: Linux (Bazzite) / Adapter `0A:0B:0C:0D:0E:0F`
 - **Reference Plan**: [docs/TEST_PLAN_ROUND2.md](file:///var/home/wmorales/repos/switch2d/docs/TEST_PLAN_ROUND2.md)
 - **Round 1 Results**: [TEST_RESULTS.md](file:///var/home/wmorales/repos/switch2d/TEST_RESULTS.md)
 
@@ -24,8 +24,8 @@
 Executed before pairing to ensure reproducible state:
 
 ```text
-Left MAC:  BC:89:A6:45:83:CC
-Right MAC: BC:89:A6:49:8D:74
+Left MAC:  AA:BB:CC:DD:EE:01
+Right MAC: AA:BB:CC:DD:EE:02
 ```
 
 | Step | Command | Expected | Actual / Output | Status |
@@ -39,7 +39,7 @@ Right MAC: BC:89:A6:49:8D:74
 
 ## 2. Pairing from Clean Slate
 
-### 2.1 Left Pad (`BC:89:A6:45:83:CC`)
+### 2.1 Left Pad (`AA:BB:CC:DD:EE:01`)
 - **Hold SYNC**: Green LEDs cycle back and forth
 - **Pairing result**: ✅ Success
 - **Assigned player**: Player 1
@@ -49,15 +49,15 @@ Right MAC: BC:89:A6:49:8D:74
   - Note: Contains `289326cb-a471-485d-a8f4-240c14f18241`.
 - **Raw pairing log**:
   ```text
-  Found Switch 2 controller: BC:89:A6:45:83:CC
-  Connecting to BC:89:A6:45:83:CC (Player 1)...
-  INFO Connecting to Switch 2 controller BC:89:A6:45:83:CC...
-  INFO L2CAP link established with BC:89:A6:45:83:CC (type: LE_PUBLIC)
+  Found Switch 2 controller: AA:BB:CC:DD:EE:01
+  Connecting to AA:BB:CC:DD:EE:01 (Player 1)...
+  INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:01...
+  INFO L2CAP link established with AA:BB:CC:DD:EE:01 (type: LE_PUBLIC)
   INFO Negotiated ATT MTU: 247
   INFO Subscribed to command responses (handle 0x001B)
-  INFO Identified controller: Joy-Con 2 (Left) (serial: HBW71022994899)
+  INFO Identified controller: Joy-Con 2 (Left) (serial: SYNTH-L-0001)
   WARN Using default right stick calibration (controller reports none)
-  INFO Bonding sequence completed for BC:89:A6:45:83:CC
+  INFO Bonding sequence completed for AA:BB:CC:DD:EE:01
   INFO Player LED set to Player 1
   INFO Input streaming active (handle 0x000A)
   INFO Saved config to /home/wmorales/.config/switch2d/config.json
@@ -65,7 +65,7 @@ Right MAC: BC:89:A6:49:8D:74
   Saved to config. (Joy-Con LEDs will turn off now until switch2d runs or monitors).
   ```
 
-### 2.2 Right Pad (`BC:89:A6:49:8D:74`)
+### 2.2 Right Pad (`AA:BB:CC:DD:EE:02`)
 - **Hold SYNC**: Green LEDs cycle back and forth
 - **Pairing result**: ✅ Success
 - **Assigned player**: Player 2
@@ -76,16 +76,16 @@ Right MAC: BC:89:A6:49:8D:74
   - Fallback used: `WARN GATT resolution used NSO GameCube fallback handles: vibration=0x0012`
 - **Raw pairing log**:
   ```text
-  Found Switch 2 controller: BC:89:A6:49:8D:74
-  Connecting to BC:89:A6:49:8D:74 (Player 2)...
-  INFO Connecting to Switch 2 controller BC:89:A6:49:8D:74...
-  INFO L2CAP link established with BC:89:A6:49:8D:74 (type: LE_PUBLIC)
+  Found Switch 2 controller: AA:BB:CC:DD:EE:02
+  Connecting to AA:BB:CC:DD:EE:02 (Player 2)...
+  INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:02...
+  INFO L2CAP link established with AA:BB:CC:DD:EE:02 (type: LE_PUBLIC)
   INFO Negotiated ATT MTU: 247
   WARN GATT resolution used NSO GameCube fallback handles: vibration=0x0012
   INFO Subscribed to command responses (handle 0x001B)
-  INFO Identified controller: Joy-Con 2 (Right) (serial: HCW71024337199)
+  INFO Identified controller: Joy-Con 2 (Right) (serial: SYNTH-R-0001)
   WARN Using default right stick calibration (controller reports none)
-  INFO Bonding sequence completed for BC:89:A6:49:8D:74
+  INFO Bonding sequence completed for AA:BB:CC:DD:EE:02
   INFO Player LED set to Player 2
   INFO Input streaming active (handle 0x000A)
   INFO Saved config to /home/wmorales/.config/switch2d/config.json
@@ -95,24 +95,24 @@ Right MAC: BC:89:A6:49:8D:74
 
 ### 2.3 Post-Pairing Configuration Status
 - Both controllers bonded (`bonded: true`, `mode: combined`).
-- Left: Player 1 (`HBW71022994899`)
-- Right: Player 2 (`HCW71024337199`)
+- Left: Player 1 (`SYNTH-L-0001`)
+- Right: Player 2 (`SYNTH-R-0001`)
 
 ---
 
 ## 3. Connection & Decoding (`monitor`)
 
-### 3.1 Left Pad (`BC:89:A6:45:83:CC`)
+### 3.1 Left Pad (`AA:BB:CC:DD:EE:01`)
 - **LED state at command launch**: LEDs were initially cycling (looking for device/reconnecting), but went off (timed out/asleep) while the 16 rounds were executing.
 - **Dial rounds ($N$)**: 16/16 (32 attempts)
 - **Connection result**: ❌ Failed (Connection timed out)
 - **Raw Error**:
   ```text
-  Error: Custom { kind: ConnectionRefused, error: "connect to BC:89:A6:45:83:CC via adapter 8C:17:59:41:D6:1E: L2CAP connect failed (LE_PUBLIC: L2CAP connection timed out; LE_RANDOM: L2CAP connection timed out) [rounds: 16/16, attempts: 32, discovery_stop: ok, device_removal: failed: bluetoothctl exited with exit status: 1]" }
+  Error: Custom { kind: ConnectionRefused, error: "connect to AA:BB:CC:DD:EE:01 via adapter 0A:0B:0C:0D:0E:0F: L2CAP connect failed (LE_PUBLIC: L2CAP connection timed out; LE_RANDOM: L2CAP connection timed out) [rounds: 16/16, attempts: 32, discovery_stop: ok, device_removal: failed: bluetoothctl exited with exit status: 1]" }
   ```
 - **Diagnostics collected**:
-  - `bluetoothctl info BC:89:A6:45:83:CC`: `Device BC:89:A6:45:83:CC not available`
-  - Adapter `8C:17:59:41:D6:1E`: Powered `yes`, Discovering `no`.
+  - `bluetoothctl info AA:BB:CC:DD:EE:01`: `Device AA:BB:CC:DD:EE:01 not available`
+  - Adapter `0A:0B:0C:0D:0E:0F`: Powered `yes`, Discovering `no`.
 - **GATT characteristic UUIDs line**:
   *(Not reached due to connect timeout)*
 - **Calibration reads (`calib read`)**:
@@ -125,18 +125,18 @@ Right MAC: BC:89:A6:49:8D:74
 
 ---
 
-### 3.2 Right Pad (`BC:89:A6:49:8D:74`)
+### 3.2 Right Pad (`AA:BB:CC:DD:EE:02`)
 - **LED state at command launch**: LEDs were initially cycling (looking for device/reconnecting), but went off (timed out/asleep) while the 16 rounds were executing.
 - **Dial rounds ($N$)**: 16/16 (32 attempts)
 - **Connection result**: ❌ Failed
 - **Raw Error**:
   ```text
-  Error: Custom { kind: ConnectionRefused, error: "connect to BC:89:A6:49:8D:74 via adapter 8C:17:59:41:D6:1E: L2CAP connect failed (LE_PUBLIC: Function not implemented (os error 38); LE_RANDOM: L2CAP connection timed out) [rounds: 16/16, attempts: 32, discovery_stop: ok, device_removal: failed: bluetoothctl exited with exit status: 1]" }
+  Error: Custom { kind: ConnectionRefused, error: "connect to AA:BB:CC:DD:EE:02 via adapter 0A:0B:0C:0D:0E:0F: L2CAP connect failed (LE_PUBLIC: Function not implemented (os error 38); LE_RANDOM: L2CAP connection timed out) [rounds: 16/16, attempts: 32, discovery_stop: ok, device_removal: failed: bluetoothctl exited with exit status: 1]" }
   ```
 - **Diagnostics collected**:
-  - `bluetoothctl info BC:89:A6:49:8D:74`:
+  - `bluetoothctl info AA:BB:CC:DD:EE:02`:
     ```text
-    Device BC:89:A6:49:8D:74 (public)
+    Device AA:BB:CC:DD:EE:02 (public)
         Alias: BC-89-A6-49-8D-74
         Paired: no
         Bonded: no
@@ -194,7 +194,7 @@ Right MAC: BC:89:A6:49:8D:74
 FINDING
   severity: blocks-testing
   build:    1e50b79
-  controller: Joy-Con 2 (Left) (BC:89:A6:45:83:CC) & Joy-Con 2 (Right) (BC:89:A6:49:8D:74)
+  controller: Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01) & Joy-Con 2 (Right) (AA:BB:CC:DD:EE:02)
   command:  RUST_LOG=debug ~/switch2d-test/switch2d monitor <MAC> --seconds 60
   expected: Reconnect to bonded controller via L2CAP within 16 rounds while controller is advertising.
   actual:   
@@ -215,7 +215,7 @@ FINDING
 FINDING
   severity: wrong-behaviour
   build:    1e50b79
-  controller: Joy-Con 2 (Right) (BC:89:A6:49:8D:74)
+  controller: Joy-Con 2 (Right) (AA:BB:CC:DD:EE:02)
   command:  switch2d pair
   expected: Discover GATT characteristic fa19b0fb-cd1f-46a7-84a1-bbb09e00c149 and resolve vibration handle directly.
   actual:   Characteristic fa19b0fb-cd1f-46a7-84a1-bbb09e00c149 is in the discovered UUID array, but log emitted:

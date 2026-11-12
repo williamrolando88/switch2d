@@ -3,7 +3,7 @@
 - **Date**: 2026-11-12
 - **Build under test**: `b380fad` (frozen at `~/switch2d-test/switch2d`)
 - **Binary SHA256**: `afacee4ed953828d295d45165a910802fe01f5450bb692132e2e7d2f49bba003`
-- **Host**: Linux (Bazzite) / Adapter `8C:17:59:41:D6:1E`
+- **Host**: Linux (Bazzite) / Adapter `0A:0B:0C:0D:0E:0F`
 - **Reference Plan**: [docs/TEST_PLAN_ROUND6B.md](file:///var/home/wmorales/repos/switch2d/docs/TEST_PLAN_ROUND6B.md)
 - **Previous Rounds**: [TEST_RESULTS_ROUND6.md](file:///var/home/wmorales/repos/switch2d/TEST_RESULTS_ROUND6.md)
 
@@ -43,24 +43,24 @@ Testing fix `b380fad` where re-pairing an already bonded controller preserves it
 - **Initial Status**:
   - Left Joy-Con: Player 1
   - Right Joy-Con: Player 2
-- **Command Executed**: `switch2d pair BC:89:A6:45:83:CC` (without `-p`)
+- **Command Executed**: `switch2d pair AA:BB:CC:DD:EE:01` (without `-p`)
 - **Observed Log Output**:
   ```text
-  INFO re-pairing BC:89:A6:45:83:CC, keeping Player 1
-  Connecting to BC:89:A6:45:83:CC (Player 1)...
+  INFO re-pairing AA:BB:CC:DD:EE:01, keeping Player 1
+  Connecting to AA:BB:CC:DD:EE:01 (Player 1)...
   INFO Player LED set to Player 1
   ===========================================================
     ✅ Controller Successfully Paired & Bonded!
     Device:  Joy-Con 2 (Left)
-    Address: BC:89:A6:45:83:CC
+    Address: AA:BB:CC:DD:EE:01
     Player:  1
   ===========================================================
   ```
 - **Player Assigned**: **Player 1** (kept existing configured slot!)
 - **Hardware LEDs Observed**: Exactly **1 solid LED** (Confirmed by user)
 - **Post-Pairing Status (`switch2d status`)**:
-  - `[1] Joy-Con 2 (Left) (BC:89:A6:45:83:CC) - Player 1`
-  - `[2] Joy-Con 2 (Right) (BC:89:A6:49:8D:74) - Player 2`
+  - `[1] Joy-Con 2 (Left) (AA:BB:CC:DD:EE:01) - Player 1`
+  - `[2] Joy-Con 2 (Right) (AA:BB:CC:DD:EE:02) - Player 2`
   - ✅ **Pass**: Fix `b380fad` confirmed 100% operational. Re-pairing a bonded controller retains its existing player slot without drift.
 
 ---
@@ -78,15 +78,15 @@ Testing reconnect dial behavior and timing after waking a sleeping controller.
     - `device_removal=failed: bluetoothctl exited with exit status: 1` (Device not yet present in BlueZ device list, expected)
     - Connection attempt timed out as expected (`LE_PUBLIC` & `LE_RANDOM` timeouts of 800ms each) because pad radio was powered down.
 - **Wake Phase (Round 15)**:
-  - User pressed button on Left Joy-Con (`BC:89:A6:45:83:CC`).
+  - User pressed button on Left Joy-Con (`AA:BB:CC:DD:EE:01`).
   - **Log Output**:
     ```text
-    DEBUG Dial round 15/16 for BC:89:A6:45:83:CC: elapsed=24.048282689s, discovery_stop=ok, device_removal=failed: bluetoothctl exited with exit status: 1, scan_stop=ok
-    INFO Connecting to Switch 2 controller BC:89:A6:45:83:CC...
-    INFO L2CAP link established with BC:89:A6:45:83:CC (type: LE_PUBLIC)
-    DEBUG Skipping bonding for BC:89:A6:45:83:CC (BondPolicy::Skip)
-    INFO Dial to BC:89:A6:45:83:CC succeeded after 15 rounds (30 address-type attempts)
-    INFO Controller BC:89:A6:45:83:CC connected and streaming inputs!
+    DEBUG Dial round 15/16 for AA:BB:CC:DD:EE:01: elapsed=24.048282689s, discovery_stop=ok, device_removal=failed: bluetoothctl exited with exit status: 1, scan_stop=ok
+    INFO Connecting to Switch 2 controller AA:BB:CC:DD:EE:01...
+    INFO L2CAP link established with AA:BB:CC:DD:EE:01 (type: LE_PUBLIC)
+    DEBUG Skipping bonding for AA:BB:CC:DD:EE:01 (BondPolicy::Skip)
+    INFO Dial to AA:BB:CC:DD:EE:01 succeeded after 15 rounds (30 address-type attempts)
+    INFO Controller AA:BB:CC:DD:EE:01 connected and streaming inputs!
     ```
 - **Hardware Observation**: Left Joy-Con LED locked solid as **Player 1** (1 LED).
 - **Collision Diagnosis**:

@@ -58,8 +58,8 @@ Run this **before touching the controllers**. It is the step that makes the roun
 reproducible.
 
 ```fish
-set LEFT  BC:89:A6:45:83:CC
-set RIGHT BC:89:A6:49:8D:74
+set LEFT  AA:BB:CC:DD:EE:01
+set RIGHT AA:BB:CC:DD:EE:02
 
 # 1a. forget them in switch2d (config.json)
 ~/switch2d-test/switch2d remove $LEFT
@@ -107,8 +107,8 @@ Expected log:
 
 ```text
 Scanning for Nintendo Switch 2 controllers (10s)...
-Found Switch 2 controller: BC:89:A6:45:83:CC
-Connecting to BC:89:A6:45:83:CC (Player 1)...
+Found Switch 2 controller: AA:BB:CC:DD:EE:01
+Connecting to AA:BB:CC:DD:EE:01 (Player 1)...
 L2CAP link established ... type: ...
 Negotiated ATT MTU: 247
 Identified controller: Joy-Con 2 (Left) (serial: ...)
@@ -153,7 +153,7 @@ and `mode: combined`.
 Wake the pad (any button, LEDs start cycling), then immediately:
 
 ```fish
-RUST_LOG=debug ~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 60 2>&1 | tee -a $LOG
+RUST_LOG=debug ~/switch2d-test/switch2d monitor AA:BB:CC:DD:EE:01 --seconds 60 2>&1 | tee -a $LOG
 ```
 
 **While it runs**, slowly and one at a time:
@@ -177,7 +177,7 @@ RUST_LOG=debug ~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 60 2
 
 ## 6. Connect + decode — RIGHT
 
-Repeat section 5 with `BC:89:A6:49:8D:74`. This is the pad that reported the
+Repeat section 5 with `AA:BB:CC:DD:EE:02`. This is the pad that reported the
 `vibration=0x0012` fallback, so its UUID list matters most.
 
 ## 7. Daemon — only if 5 and 6 both stream
@@ -268,7 +268,7 @@ Does the Left list contain `289326cb-a471-485d-a8f4-240c14f18241`?
 ## 9. If something fails — evidence to collect
 
 ```fish
-bluetoothctl info BC:89:A6:45:83:CC     # and the Right MAC
+bluetoothctl info AA:BB:CC:DD:EE:01     # and the Right MAC
 bluetoothctl devices
 sudo -n btmgmt info                     # adapter state, LE/BRedR
 dmesg | tail -30

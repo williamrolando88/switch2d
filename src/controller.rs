@@ -1490,11 +1490,15 @@ mod tests {
     ];
     const UNWRITTEN: [u8; 11] = [0xFF; 11];
 
-    /// Realistic single-stick block: centre 2048, max/min delta 1254. This is
-    /// the shape that makes a Joy-Con report ±1.00 with its own calibration.
-    const REAL_STICK_CALIBRATION: [u8; 11] = [
-        0x00, 0x08, 0x80, 0xE6, 0x64, 0x4E, 0xE6, 0x64, 0x4E, 0x00, 0x00,
+    /// Arbitrary synthetic single-stick block: centre 2048, max/min delta 1000.
+    /// These are not measured properties of any controller; they exist only to
+    /// exercise the normalisation maths.
+    const SYNTHETIC_STICK_CALIBRATION: [u8; 11] = [
+        0x00, 0x08, 0x80, 0xE8, 0x83, 0x3E, 0xE8, 0x83, 0x3E, 0x00, 0x00,
     ];
+    /// Synthetic full-scale deflection for [`SYNTHETIC_STICK_CALIBRATION`].
+    const SYNTHETIC_STICK_MAX_DELTA: u16 = 1000;
+    const SYNTHETIC_STICK_RAW: (u16, u16) = (2048 + SYNTHETIC_STICK_MAX_DELTA, 2048);
 
     #[test]
     fn choose_calibration_matrix() {
@@ -1533,7 +1537,7 @@ mod tests {
 
     #[test]
     fn single_stick_right_falls_back_to_left_block() {
-        let left = REAL_STICK_CALIBRATION.to_vec();
+        let left = SYNTHETIC_STICK_CALIBRATION.to_vec();
         let expected_left = StickCalibration::from_bytes(&left).expect("left parses");
 
         let choice = choose_stick_calibrations(
@@ -1546,13 +1550,19 @@ mod tests {
         assert_eq!(choice.right, expected_left, "right stick uses the left block");
         assert!(choice.right_from_left);
 
-        // The reported 0.74 cap is the built-in default:
-        // (3302 - 2048) / 1700 = 0.7376. With the parsed left block the same
-        // raw sample reaches ±1.00.
-        let raw = (3302, 2048);
+        // The built-in default has a wider max delta than this synthetic
+        // block, so the same raw sample is capped below full scale. With the
+        // parsed left block it reaches ±1.00.
+        let raw = SYNTHETIC_STICK_RAW;
         let (default_x, _) = StickCalibration::default().apply(raw, 0);
         let (fixed_x, _) = choice.right.apply(raw, 0);
-        assert!((default_x - 0.7376).abs() < 1e-3, "default x = {default_x}");
+        let default_ratio =
+            f32::from(SYNTHETIC_STICK_MAX_DELTA) / f32::from(StickCalibration::default().max.0);
+        assert!(
+            (default_x - default_ratio).abs() < 1e-6,
+            "default x = {default_x}"
+        );
+        assert!(default_x < 1.0, "default must stay below full scale");
         assert!((fixed_x - 1.0).abs() < 1e-6, "fixed x = {fixed_x}");
     }
 
@@ -1621,7 +1631,7 @@ mod tests {
         // calibration and cannot fall back to anything.
         let choice = choose_stick_calibrations(
             Sticks::Left,
-            Some(REAL_STICK_CALIBRATION.to_vec()),
+            Some(SYNTHETIC_STICK_CALIBRATION.to_vec()),
             None,
         );
         assert_eq!(choice.right, StickCalibration::default());
@@ -1950,7 +1960,7 @@ mod tests {
         let _ = dial_with_budget(
             &control,
             tiny_budget(4),
-            "BC:89:A6:45:83:CC",
+            "AA:BB:CC:DD:EE:01",
             &mut |_per_type: Duration| -> io::Result<()> {
                 dial_calls += 1;
                 control.events.borrow_mut().push(format!("dial#{dial_calls}"));
@@ -1961,7 +1971,7 @@ mod tests {
         assert_eq!(control.removals.get(), 1, "exactly one bluetoothctl remove");
         let events = control.events.borrow();
         assert_eq!(events[0], "prepare", "global stop comes first");
-        assert_eq!(events[1], "remove(BC:89:A6:45:83:CC)", "removal before dialling");
+        assert_eq!(events[1], "remove(AA:BB:CC:DD:EE:01)", "removal before dialling");
         assert_eq!(events[2], "stop(force=false)", "scan stop before round 1");
         assert_eq!(events[3], "dial#1");
         // Removals never repeat between rounds.
@@ -2180,7 +2190,7 @@ mod tests {
 
     #[test]
     fn le_privacy_warning_enabled_active_state() {
-        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::EnabledActive);
+        let message = le_privacy_warning("AA:BB:CC:DD:EE:02", UnitState::EnabledActive);
         assert!(
             message.ends_with(
                 "The switch2d-disable-le-privacy unit is installed and active."
@@ -2193,7 +2203,7 @@ mod tests {
 
     #[test]
     fn le_privacy_warning_enabled_not_active_state() {
-        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::EnabledNotActive);
+        let message = le_privacy_warning("AA:BB:CC:DD:EE:02", UnitState::EnabledNotActive);
         assert!(
             message.ends_with(
                 "The unit is enabled but not active - run `sudo systemctl restart \
@@ -2207,7 +2217,7 @@ mod tests {
 
     #[test]
     fn le_privacy_warning_not_enabled_state() {
-        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::NotEnabled);
+        let message = le_privacy_warning("AA:BB:CC:DD:EE:02", UnitState::NotEnabled);
         assert!(
             message.ends_with(
                 "The switch2d-disable-le-privacy unit is NOT installed/enabled; \
@@ -2221,13 +2231,13 @@ mod tests {
 
     #[test]
     fn le_privacy_warning_unknown_state_adds_nothing() {
-        let base = "Wake reconnect to BC:89:A6:49:8D:74 failed with os error 38 \
+        let base = "Wake reconnect to AA:BB:CC:DD:EE:02 failed with os error 38 \
                     (HCI 0x3E). This usually means Bluetooth LE privacy is enabled: \
                     the kernel then connects from a random address and a pad that \
                     stored this adapter address ignores it. Run `sudo btmgmt -i 0 \
                     power off; sudo btmgmt -i 0 privacy off; sudo btmgmt -i 0 power \
                     on` or install the switch2d-disable-le-privacy unit.";
-        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::Unknown);
+        let message = le_privacy_warning("AA:BB:CC:DD:EE:02", UnitState::Unknown);
         assert_eq!(message, base);
         assert!(!message.contains("installed and active"));
         assert!(!message.contains("enabled but not active"));
@@ -2243,8 +2253,8 @@ mod tests {
             UnitState::NotEnabled,
             UnitState::Unknown,
         ] {
-            let message = le_privacy_warning("BC:89:A6:49:8D:74", state);
-            assert!(message.contains("BC:89:A6:49:8D:74"), "state: {state:?}");
+            let message = le_privacy_warning("AA:BB:CC:DD:EE:02", state);
+            assert!(message.contains("AA:BB:CC:DD:EE:02"), "state: {state:?}");
             assert!(message.contains("sudo btmgmt -i 0 power off"), "state: {state:?}");
             assert!(
                 message.contains("sudo btmgmt -i 0 privacy off"),
