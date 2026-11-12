@@ -47,7 +47,7 @@ struct Cli {
     #[arg(short, long)]
     mode: Option<String>,
 
-    /// Enable verbose / debug logging
+    /// Enable verbose / debug logging (same as RUST_LOG=debug; verbose wins)
     #[arg(short, long)]
     verbose: bool,
 }
@@ -145,11 +145,12 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let log_level = if cli.verbose {
-        Level::DEBUG
-    } else {
-        Level::INFO
-    };
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let log_level = log_level_for(cli.verbose, rust_log.as_deref());
+    // Warn after the subscriber is installed, otherwise the line is dropped.
+    let rust_log_has_unsupported_filters = rust_log
+        .as_deref()
+        .is_some_and(rust_log_has_filters);
 
     let subscriber = FmtSubscriber::builder()
         .with_max_level(log_level)
@@ -158,6 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
+
+    if rust_log_has_unsupported_filters {
+        info!(
+            "RUST_LOG contains target/field filters or offsets, which this build does not \
+             implement; only plain trace/debug/info/warn/error levels are honoured (substring \
+             match). Use -v for debug output."
+        );
+    }
 
     let mut config = DaemonConfig::load();
 
@@ -486,6 +495,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Map the CLI/env verbosity hints to a tracing level.
+///
+/// `tracing-subscriber`'s `env-filter` feature (regex, ~2.7 MB) is deliberately
+/// **not** enabled, so `RUST_LOG` is parsed by substring, not as a filter
+/// grammar:
+///
+/// - `-v/--verbose` always wins and selects `DEBUG`;
+/// - otherwise a value containing `debug` or `trace` selects `DEBUG`;
+/// - everything else (including `warn`, `error`, `off` and unsupported
+///   directives) selects `INFO`, because this build has no quieter default.
+fn log_level_for(verbose: bool, rust_log: Option<&str>) -> Level {
+    if verbose {
+        return Level::DEBUG;
+    }
+
+    match rust_log {
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            if value.contains("debug") || value.contains("trace") {
+                Level::DEBUG
+            } else {
+                Level::INFO
+            }
+        }
+        None => Level::INFO,
+    }
+}
+
+/// Whether `RUST_LOG` asks for target/field filtering (`switch2d=debug`,
+/// `info,hyper=off`) or span offsets, which this build does not implement.
+///
+/// Used to warn that the value is only being substring-matched, so nobody
+/// believes an actual filter is in effect.
+fn rust_log_has_filters(rust_log: &str) -> bool {
+    rust_log.contains('=') || rust_log.contains(',') || rust_log.contains('[')
+}
+
 // ---------------------------------------------------------------------------
 // `pair --hold` and `switch2d advert`
 // ---------------------------------------------------------------------------
@@ -597,10 +643,7 @@ async fn run_advert(seconds: u64, all: bool) -> Result<(), Box<dyn std::error::E
                         // RSSI-only rule: BlueZ drops RSSI when its monitor
                         // window closes but keeps the cached block.
                         if let Some(reason) = advert_skip_reason(item) {
-                            tracing::debug!(
-                                "advert skip {}: {reason}",
-                                item.address
-                            );
+                            tracing::debug!("advert skip {}: {reason}", item.address);
                             continue;
                         }
                         if !all && item.advert.is_none() {
@@ -1106,5 +1149,48 @@ mod selftest_tests {
 
         // The sweep ends neutral so nothing is left held.
         assert_eq!(plan.last(), Some(&Step::Neutral));
+    }
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::*;
+
+    #[test]
+    fn verbose_wins_over_rust_log() {
+        assert_eq!(log_level_for(true, None), Level::DEBUG);
+        assert_eq!(log_level_for(true, Some("warn")), Level::DEBUG);
+        assert_eq!(log_level_for(true, Some("off")), Level::DEBUG);
+    }
+
+    #[test]
+    fn rust_log_debug_and_trace_select_debug() {
+        assert_eq!(log_level_for(false, Some("debug")), Level::DEBUG);
+        assert_eq!(log_level_for(false, Some("DEBUG")), Level::DEBUG);
+        assert_eq!(log_level_for(false, Some("trace")), Level::DEBUG);
+        // Documented limitation: substring match, so a target filter also works
+        // (it is warned about separately).
+        assert_eq!(log_level_for(false, Some("switch2d=debug")), Level::DEBUG);
+    }
+
+    #[test]
+    fn other_and_missing_values_stay_info() {
+        assert_eq!(log_level_for(false, None), Level::INFO);
+        assert_eq!(log_level_for(false, Some("")), Level::INFO);
+        assert_eq!(log_level_for(false, Some("info")), Level::INFO);
+        // This build has no quieter default, so warn/error do not silence it.
+        assert_eq!(log_level_for(false, Some("warn")), Level::INFO);
+        assert_eq!(log_level_for(false, Some("error")), Level::INFO);
+        assert_eq!(log_level_for(false, Some("hyper=off")), Level::INFO);
+    }
+
+    #[test]
+    fn unsupported_directives_are_detected_for_the_warning() {
+        assert!(rust_log_has_filters("switch2d=debug"));
+        assert!(rust_log_has_filters("info,hyper=off"));
+        assert!(rust_log_has_filters("debug[span{field=value}]"));
+        assert!(!rust_log_has_filters("debug"));
+        assert!(!rust_log_has_filters("info"));
+        assert!(!rust_log_has_filters("switch2d::att"));
     }
 }

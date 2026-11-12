@@ -1,0 +1,25 @@
+[Unit]
+Description=Disable Bluetooth LE privacy so Switch 2 controllers accept reconnects
+Documentation=https://github.com/williamrolando88/switch2d
+After=bluetooth.service
+Wants=bluetooth.service
+# Re-run whenever bluetoothd is restarted: it resets the adapter's privacy
+# policy to its default (privacy on) on every power-up.
+PartOf=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/disable-le-privacy.sh
+
+[Install]
+WantedBy=bluetooth.service
+
+# Trade-off, stated plainly: disabling LE privacy makes this host use its
+# public LE address toward EVERY LE device, not only Switch 2 controllers.
+# That is what makes controller reconnects work (a pad bonded to our public
+# address ignores connections from a resolvable private address), but it also
+# means LE peers can recognise this machine across sessions instead of seeing a
+# rotating address. If you pair LE privacy-sensitive peripherals, weigh this
+# before enabling the unit; disabling it and running
+# `sudo systemctl restart bluetooth` restores the default.

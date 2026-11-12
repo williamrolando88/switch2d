@@ -29,7 +29,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::protocol::advert::{
     accepts, AcceptPolicy, AdvertInfo, HostBinding, PAIRING_TTL, WAKE_TTL,
@@ -265,11 +265,12 @@ impl ScanControl for ShellScanControl {
         if let Err(err) =
             run_command(Command::new("pkill").args(["-f", "decky-bluetooth-wake-control"]))
         {
-            // pkill exits non-zero when nothing matches; log and move on.
-            warn!("pkill decky-bluetooth-wake-control: {}", err);
+            // pkill exits 1 when no matching helper is running: the normal case.
+            debug!("pkill decky-bluetooth-wake-control: {}", err);
         }
         if let Err(err) = self.adapter_call("StopDiscovery") {
-            warn!(
+            // Fails when nothing is discovering: also the normal case.
+            debug!(
                 "Adapter1.StopDiscovery failed: {} (continuing to stop-find)",
                 err
             );

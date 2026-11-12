@@ -126,6 +126,53 @@ journalctl --user -u switch2d -f
 
 ---
 
+## 🔒 LE Privacy (required for controller reconnects)
+
+A Switch 2 controller stores the **public** Bluetooth address used during pairing. If the kernel
+runs with LE privacy enabled it initiates LE connections from a rotating resolvable private
+address (RPA); the pad never bonded that address and silently ignores the connection. Measured
+A/B on the reference machine: privacy on = 32/32 dial attempts failed (`ENOSYS` / HCI `0x3E` on
+the public address type, timeout on random); privacy off = connected on the first round and
+streamed 3975 input reports over 45 s with zero drops.
+
+Install the unit that turns the policy flag off after every bluetoothd start:
+
+```fish
+# Copy the privacy fix into place
+sudo install -Dm755 system/disable-le-privacy.sh /usr/local/bin/disable-le-privacy.sh
+sudo install -Dm644 system/switch2d-disable-le-privacy.service /etc/systemd/system/switch2d-disable-le-privacy.service
+
+# Enable it (idempotent: an adapter that is already correct is not power-cycled)
+sudo systemctl daemon-reload
+sudo systemctl enable --now switch2d-disable-le-privacy.service
+
+# Verify: "privacy" must not appear under "current settings:"
+sudo btmgmt -i 0 info
+```
+
+**Trade-off, stated honestly:** this is a host-wide setting. With LE privacy off the kernel
+advertises and connects using the adapter's public address toward *every* LE device, not only
+Joy-Cons, so LE peers can recognise this machine across sessions instead of seeing a rotating
+address. `ll-privacy` may stay enabled — only the `privacy` policy flag changes the initiator
+address the pad sees. Revert with
+`sudo systemctl disable --now switch2d-disable-le-privacy.service` followed by
+`sudo systemctl restart bluetooth`.
+
+### Troubleshooting: reconnects time out / ENOSYS 0x3E
+
+Symptom: the pad advertises (LEDs cycling) but `switch2d monitor` / `switch2d run` logs
+`L2CAP connect failed (... Function not implemented (os error 38) ...)` round after round.
+
+```fish
+sudo btmgmt -i 0 info
+```
+
+If `current settings:` lists `privacy`, the unit above is missing, not enabled, or bluetoothd was
+restarted after it ran (`PartOf=bluetooth.service` should pull it back in — check
+`systemctl status switch2d-disable-le-privacy.service`).
+
+---
+
 ## 🧪 Hardware Validation Guide
 
 This section is written for whoever is testing a **real controller** (human or assisting agent).
