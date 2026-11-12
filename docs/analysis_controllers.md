@@ -1135,3 +1135,438 @@ while self._hd_run:
 * `config.enable_rumble == false` ⇒ `rumble_cb` is never installed ⇒ `set_rumble` is never
   called, the worker (started unconditionally for HD PIDs in `initialize`) sits idle, and no
   stop packet is ever needed.
+
+---
+
+## 8.7 (t13 Q1) Connect path for an already-bonded pad
+
+Entry point `_ConnectHub._connect_sync` (`bridge.py:436-469`), called through
+`loop.run_in_executor(hub._executor, hub._connect_sync, mac)` from the scan loop
+(`bridge.py:392-395`).
+
+```python
+attempt_s = _CONNECT_ATTEMPT_S                       # 0.80  (bridge.py:52)
+dst_types = (worker.last_dst_type, other)            # if last_dst_type is not None
+            else (LE_PUBLIC, LE_RANDOM)              # bridge.py:444-448
+with _CONNECT_LOCK:                                  # threading.Lock, bridge.py:47
+    for attempt in range(_CONNECT_ATTEMPTS):         # 16    (bridge.py:53)
+        ctrl = SwitchController(mac, adapter)        # NEW controller+socket per round (:452)
+        for dst in dst_types:
+            ok, detail = self._connect_dst_with_polling(ctrl, dst, attempt_s)  # (:456)
+            if ok:
+                ctrl.att.dst_type = dst              # (:457) set by hand: _connect_once
+                worker.last_dst_type = dst           # (:458)  does not touch dst_type
+                if worker.activate(ctrl):            # (:459) handshake
+                    worker._ready.set(); return True, "ok"
+                ctrl.close(); return False, "session setup failed"
+            last_detail = detail
+        ctrl.close()                                 # (:465)
+        time.sleep(0.02)                             # (:466)
+    if worker.last_dst_type is not None:
+        worker.last_dst_type = None                  # (:467-468) forget after a full failure
+    return False, last_detail
+```
+
+* **Address type tried first**: `LE_PUBLIC` (`1`) unless this worker has ever succeeded
+  before, in which case the last successful type goes first and the other second. The
+  order is never learned from an advertisement.
+* **`last_dst_type` memory**: seeded `None` in `_Worker.__init__` (`bridge.py:503`),
+  written on every successful L2CAP connect *before* the handshake runs (`:458`), reset to
+  `None` only after all 16 rounds fail (`:467-468`). It is **in-memory only** — lost on
+  process restart, never persisted in `config.json`, so every daemon start begins with
+  public-first. If the handshake fails after a link was established, the type is left
+  recorded (`:458` happens before `activate`).
+* **Per-attempt budget**: `0.80 s` per *(round, address type)*, spent purely in
+  `select.select([], [fd], [], timeout)` (`att.py:155-158`); bind/connect are immediate.
+  Worst case per MAC ≈ 16 × 2 × 0.80 s ≈ `25.6 s`, plus 16 × 0.02 s, plus any
+  `_force_le_scan_off` subprocess time.
+* **Socket reuse**: never. `_connect_once` creates a fresh
+  `socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP)` on entry (`att.py:139`) and
+  `s.close()`s it on *every* failure exit (`att.py:143, 151, 157, 163`). The socket is only
+  retained (`self.sock = s`, `att.py:166`) on success. A fresh `SwitchController` (hence a
+  fresh `ATTClient`, `device.py:42`) is built per round (`bridge.py:452`). **Legacy therefore
+  cannot produce the Rust failure mode of re-`connect()`ing a socket whose first attempt
+  failed (`EINVAL` after `ENOSYS`)** — that is a port-side defect, not hardware behaviour.
+* **Advertisement address vs identity MAC**: legacy dials **only** the MAC from
+  `config.json`, never an RPA from an advertisement, and this is structural: the detection
+  callback keys `_last_seen` by `device.address.upper()` but immediately rejects anything
+  that is not an exact config match — `_accept()` does `self.workers_by_mac.get(addr)` and
+  returns False for unknown addresses (`bridge.py:258-265`); `pending` is then built by
+  iterating `hub.workers_by_mac` and looking *up* `_last_seen` by config MAC
+  (`bridge.py:366-376`). An RPA advert is dropped at `_accept`, never dialled. The advert is
+  used for exactly two things: the wake/pairing TTL selection and the `reconnect == 0`
+  gate.
+* Also note: `exchange_mtu(247)` failures are swallowed inside `_connect_once`
+  (`att.py:170-174`), so a link can come up with `mtu = 23` and no error.
+
+## 8.8 (t13 Q2) Scan-stop discipline
+
+`_force_le_scan_off(*, force=False)` (`bridge.py:89-134`) runs, under `_BTMGMT_LOCK`:
+
+1. rate limit: unless `force`, return if `< 0.35 s` since the last call
+   (`_LE_SCAN_OFF_MIN_INTERVAL_S`, `bridge.py:73, 103-105`);
+2. `sudo -n btmgmt -i $NGC_HCI stop-find -l`, waited on up to **1.5 s**, then `SIGKILL` +
+   `wait(0.5)` on timeout (`:112-121`);
+3. the same for `sudo -n btmgmt -i $NGC_HCI stop-find` (`:123-135`);
+4. every exception swallowed (`:132-134`).
+
+Call sites:
+
+| Line | When | `force` |
+| --- | --- | --- |
+| `bridge.py:473` (`_connect_dst_with_polling`) | **immediately before every single L2CAP connect attempt** (both address types) | no → ≤1 per 0.35 s |
+| `bridge.py:404` | after a `_connect_sync` failure in the scan loop, before the next pending MAC | **yes** |
+| `bridge.py:167` (inside `prepare_bluez_global`) | whenever `prepare_bluez_global()` runs: at scan-start "InProgress" recovery (`:291`, `:344`), before dialling when `pending` is non-empty (`:378`), hub-restart recovery (`:421`), and startup (`:806`) | **yes** |
+| `bridge.py:292, 345` | directly after `prepare_bluez_global()` during scan-start retries | no (already forced) |
+
+`prepare_bluez_global()` (`bridge.py:157-169`) additionally runs
+`pkill -f decky-bluetooth-wake-control`, `bluetoothctl scan off` and D-Bus
+`Adapter1.StopDiscovery` (`_run_quiet`, 1.5 s timeouts, all failures ignored).
+
+* **No confirmation.** Nothing reads back `Discovering`, no `btmgmt find -l` state query,
+  exit codes and stderr are discarded (`_run_quiet`, `bridge.py:76-86`), and the only
+  "proof" is that `proc.wait()` returned. Legacy never verifies scanning is off before
+  dialling; it relies on (a) issuing the stop immediately before the attempt and (b) the
+  0.35 s rate limit so the two are never far apart.
+* **Pad advertises again right after**: harmless and expected — the pad must keep
+  advertising; `btmgmt stop-find` stops the *adapter's* scan, not the pad's advertising.
+  What it cannot defend against is Steam/steamos-manager restarting its own scan, which is
+  exactly why the stop is re-issued before every attempt rather than once per cycle. On a
+  failure the entry stays in `_last_seen` (only successes and TTL expiry remove it,
+  `bridge.py:400-410`), so the next cycle retries without needing a fresh advert, for up to
+  the TTL (4 s wake / 45 s pairing).
+* **No concurrent dials**: a module-level `threading.Lock` `_CONNECT_LOCK`
+  (`bridge.py:47, 449`) plus a per-scan-loop `asyncio.Lock` (`hub._connect_lock`, entered at
+  `bridge.py:384`) — belt and braces, because the executor has 2 threads. `README.md:73-76`
+  records the motivation ("the fix for 'only one of my two controllers wakes up'").
+* **Backoff for a pad that keeps failing**: none at the dial level. 0.02 s between the 16
+  rounds, 0.35 s pacing from `_force_le_scan_off`, up to ~25.6 s per MAC, then the pad is
+  eligible again on the next scan cycle with no delay and no failure counter. The one
+  exponential backoff in the system (1 s → 2 → 4 … 30 s) applies only when `_scan_loop`
+  itself raises (`bridge.py:276-296`), not to ordinary connect failures.
+
+## 8.9 (t13 Q3) ENOSYS / HCI 0x3E — what legacy does about it
+
+**Legacy does not interpret connect status codes at all.** There is no reference to
+`0x3E`, `ENOSYS`, `ETIMEDOUT`, HCI status bytes or "Connection Failed to be Established"
+anywhere in `.old/ngc/` (grep of the whole tree finds only `att.py:161-164` and
+`tools/l2cap_test.py:67-69`, both of which merely *print* the value).
+
+Failure classification is limited to `att.py:138-175`:
+
+* `bind` failure → `"L2CAP bind failed (errno N)"`, closed, return (`:143-146`);
+* `connect()` errno not in `(115 EINPROGRESS, 114 EALREADY)` → `"connect errno N"`
+  (`:150-153`);
+* `select` times out → `"timeout (adapter may still be scanning)"` (`:155-158`);
+* `getsockopt(SO_ERROR)` non-zero → `"SO_ERROR N"` (`:161-164`) — this is the path that
+  surfaces the kernel's mapping of the controller's HCI error, so a 0x3E rejection appears
+  in legacy logs as literally `connect to <MAC> (wake) failed (SO_ERROR 38)`
+  (`bridge.py:403`). It is a string; nothing branches on it.
+
+So the recorded "workaround" is not status-aware, it is a bundle of structural
+mitigations that all serve the same goal — *make sure the adapter has no competing
+scan/initiator and retry until the controller's page-scan window catches us*:
+
+1. `_force_le_scan_off()` immediately before **every** attempt (`bridge.py:473`), with
+   `btmgmt stop-find -l` at HCI level because BlueZ's `StopDiscovery` only ends *our*
+   session and Steam keeps `Discovering` true (`bridge.py:90-101` docstring: this "blocks
+   raw L2CAP create-connection");
+2. `prepare_bluez_global()` + `_bluez_remove_device(mac)` for every pending MAC before
+   dialling (`bridge.py:378-383`); the docstring at `bridge.py:136-142` explains why:
+   *"Drop BlueZ's Device object so it can't race our raw ATT connect."* This is the closest
+   thing to a fix for bonded pads — a bonded pad is exactly the case where BlueZ has a
+   Device object and may initiate (or be asked to initiate) its own connection;
+3. strict serialization of create-connection (`_CONNECT_LOCK`, plus the asyncio lock):
+   `bridge.py:47` "Most adapters allow only ONE outstanding LE create-connection at a time";
+4. **16 retries × 2 address types** with a deliberately short 0.80 s window
+   (`bridge.py:50-53` comment: *"Short windows fail when Steam keeps LE scan busy; after
+   btmgmt stop-find -l a few hundred ms is enough"*) — i.e. legacy abandons an in-flight
+   connect quickly and re-issues it, rather than waiting on one long attempt;
+5. `_force_le_scan_off(force=True)` between failed MACs (`bridge.py:404`) and on any hub
+   restart (`bridge.py:421`).
+
+Two prerequisites these depend on, in the same tree: passwordless `sudo -n btmgmt`
+(`scripts/bt_prep.sh:18-21` prints a warning when it is unavailable) and
+`pkill decky-bluetooth-wake-control`. Both fail **silently** in the bridge. Note also that
+legacy's own `tools/grab_gatt.py:33-41` retries *BlueZ* attach 20 times with
+`bluetoothctl remove` between attempts — evidence that the author hit unreliable
+already-bonded connects and worked around them by removing the device object each round.
+
+*Speculation (not asserted by the code):* the ENOSYS/0x3E rejection on an already-bonded
+pad is consistent with two initiators competing (BlueZ auto-connect or a still-pending
+kernel create-connection from a previous abandoned attempt). Legacy's mitigations 1, 2 and
+4 are precisely the ones that would mask both. The `EINVAL` on the second address type, by
+contrast, is definitively a port bug (see 8.7: legacy always builds a fresh socket).
+
+## 8.10 (t13 Q4) Calibration read on real Joy-Con 2
+
+Addresses (`protocol.py:150-155`), lengths and order (`device.py:255-270`):
+
+| Step | Read | Address | Len |
+| --- | --- | --- | --- |
+| 1 | left **user** stick cal | `0x001FC042` (`CALIBRATION_USER_JOYSTICK_1`) | `0x0B` |
+| 1b | left **factory** stick cal, only if user[0:3] == `0xFFFFFF` | `0x000130A8` (`CALIBRATION_JOYSTICK_1`) | `0x0B` |
+| 2 | right **user** stick cal | `0x001FC062` (`CALIBRATION_USER_JOYSTICK_2`) | `0x0B` |
+| 2b | right **factory**, same `0xFFFFFF` condition | `0x000130E8` (`CALIBRATION_JOYSTICK_2`) | `0x0B` |
+| 3 | GC trigger neutrals, only if `has_analog_triggers` (NSO GC only), wrapped in try/except | `0x00013140` | `0x02` |
+
+`read_memory(length, address)` (`device.py:243-250`) sends `COMMAND_MEMORY 0x02` /
+`SUBCOMMAND_MEMORY_READ 0x04` with payload `len | 7e 00 00 | addr_le32`, requires `len ≤
+0x4F`, and validates **only** `data[0] == length` and `decodeu(data[4:8]) == address`;
+then returns `data[8:]` with **no length re-check**.
+
+Relevant properties:
+
+* **No retries.** `_read_calibration()` is called bare at `device.py:172`, *not* through
+  `_retry` (which wraps only `enable_commands`, `read info`, LEDs, vibration test, features,
+  input subscribe). Any `RuntimeError` from `read_memory` ("unexpected read response: …")
+  aborts `initialize()`, so `activate()` logs `session setup failed for <mac>` and
+  `_teardown_partial()` closes everything. **Legacy has no "default stick calibration"
+  concept at all** — there is nothing to fall back to, and it would rather drop the session
+  than run uncalibrated.
+* **Order relative to notifications.** Calibration is read *before* `enable_features` and
+  *before* the input CCCD subscribe (`device.py:172` vs `:179` and `:186`). It depends only
+  on `enable_commands` (`device.py:166`). So in legacy, calibration does **not** need input
+  notifications — the reverse of that hypothesis.
+* **Short / zero reply.** Only the `0xFFFFFF` sentinel triggers the factory fallback
+  (`device.py:268-269`). A short reply yields `data[8:]` shorter than 9 bytes and
+  `StickCalibration.from_bytes` slices safely (`protocol.py:249-255`), producing zeros — and
+  with `max == min == 0` the axis helper returns `0.0` (`protocol.py:258-264`, `if max_abs
+  else 0.0`). Result: a silently dead stick, *no* log, *no* default. So legacy handles
+  "controller reports **0xFF**", not "controller reports **nothing**".
+* **Expected layout** (`protocol.py:224-227, 244-270`): 9 meaningful bytes of an 11-byte
+  read; three `(center, max, min)` triples, each triple two 12-bit little-endian-packed
+  values — `x = decodeu(b[0:3]) & 0xFFF`, `y = decodeu(b[0:3]) >> 12`. Bytes 9-10 unused.
+* **What it logs.** On success, always at INFO: `calib L=StickCalibration(...) R=... triggers=...`
+  (`device.py:265`). On failure: nothing calibration-specific — only the generic
+  `ERROR session setup failed for <mac>: <exception>` from `bridge.py:597`.
+* **Does legacy also fall back regularly on Joy-Con 2?** No: a Joy-Con 2 is an HD-rumble
+  PID and takes the same two-read path as the Pro pad, with no model-specific special case
+  anywhere in `_read_calibration`/`_read_stick`. Since legacy reached LEDs/input on
+  hardware, its calibration reads must have returned non-`0xFFFFFF` data — but that is an
+  inference from the code's control flow, not something the source asserts.
+
+Actionable for the port: legacy parity means *fail loudly with the raw response bytes*
+rather than log "controller reports none" and continue, because the legacy read pipeline
+distinguishes "wrong length/address echo" (raise) from "`0xFFFFFF`" (factory fallback) and
+has no third state.
+
+## 8.11 (t13 Q5) GATT discovery / CCCD on a Joy-Con 2 Right
+
+Legacy resolves **everything** from discovery except the NSO-GameCube defaults, and says so
+in the code: `device.py:26-27` — *"Fallback handles for the NSO GameCube pad if dynamic
+discovery fails. Other models resolve their handles via discovery (see
+`_resolve_handles`)."* There is **no hardcoded handle table for Pro or Joy-Con anywhere**,
+and `tools/att_discover.py` exists precisely to dump the table per model on hardware.
+
+Resolution (`device.py:117-158`):
+
+* walk = `Read By Group Type (0x10)` for `0x2800` → `Read By Type (0x08)` for `0x2803` →
+  `Find Information (0x04)` for CCCDs (`att.py:274-363`);
+* a `by_uuid` dict is built from every discovered characteristic; `value_handle` is taken by
+  UUID, and CCCD handles **only** from the FIND_INFO walk (`att.py:330-355`) — there is no
+  `read(value_handle + 1)` probe and **no per-model CCCD table**;
+* three different fallback strengths:
+  1. `discover_all()` raises → `logger.warning("GATT discovery failed (%s); using default
+     handles", exc)` (`device.py:124-126`) and **all six** GC defaults survive:
+     input `0x000A`, input CCCD `0x000B`, vibration `0x0012`, cmd write `0x0014`,
+     cmd response `0x001A`, cmd response CCCD `0x001B` (`device.py:26-30, 49-55`);
+  2. discovery succeeded but a UUID is missing → that field silently keeps its GC default
+     (`val()`/`cccd()` closures, `device.py:133-141`), logged only at `debug`
+     (`device.py:146-151`);
+  3. **vibration is resolved separately and later**, after the info read, by PID:
+     `vibration_uuid_for(product_id)` — Pro `cc483f51-…`, Joy-Con **R** `fa19b0fb-cd1f-46a7-84a1-bbb09e00c149`,
+     Joy-Con **L** `289326cb-a471-485d-a8f4-240c14f18241` (`protocol.py:65-77`); on a miss it
+     keeps `0x0012` and logs only at `debug` (`device.py:153-158`).
+
+So, answering directly:
+
+* **Left/right asymmetry in legacy**: exactly one, and it is intentional — the vibration
+  UUID differs between Joy-Con 2 Left and Right (`protocol.py:70-77`). Nothing else in the
+  discovery or handle code branches on PID, side, or model. If the Rust log shows a
+  Joy-Con 2 **Right** landing on `vibration=0x0012` while the Left resolves fully, the
+  legacy-consistent reading is that the discovered UUID set contained the Pro/L UUID but
+  not the R UUID — i.e. either the R constant is wrong/absent on the Rust side, or the walk
+  stopped before that characteristic. *Speculation:* the most likely port bug is UUID
+  comparison byte order — `uuid_to_str` **reverses** the 16 raw bytes before formatting
+  (`att.py:67-76`), so a Rust comparison that does not reverse will miss 128-bit UUIDs while
+  16-bit ones (`"2902"`) still match.
+* **Does legacy emit an equivalent warning?** Only for case 1 (an exception out of
+  `discover_all`), and then it does **not** name individual handles. The Rust message naming
+  a single field is closer to legacy case 3, which is `debug`-only. On real Joy-Con 2
+  hardware legacy would therefore have been silent here — worth remembering when judging
+  whether the `0x0012` fallback is new or inherited.
+* **Why discovery can come back short without an error** (each is a silent `break` in
+  legacy, so `discover_all` still returns a partial list and case 2 applies):
+  `discover_services` breaks on `last_end >= 0xFFFF`, on `last_end == 0`, and on any
+  response that is not `READ_BY_GROUP_RSP` (`att.py:290-300`); `discover_characteristics`
+  breaks on `last_handle == 0` and on a non-`READ_BY_TYPE_RSP` (`att.py:301-329`);
+  `discover_cccds` breaks on **any** `ATTError`, including `0x0A`, and on
+  `scan_start > scan_end` (`att.py:330-345`; see 8.1 for the FIND_INFO window/`value+1`
+  details).
+* Cross-check available in the tree: `tools/att_discover.py` prints
+  `[char] <uuid> val=… props=… cccd=…` for the raw ATT walk and `tools/grab_gatt.py` dumps
+  the same table via BlueZ/bleak (with a 20× retry loop and `bluetoothctl remove` between
+  attempts). Diffing those two dumps on the Right pad will show whether the raw walk is
+  truncating or the UUID match is failing.
+
+## 8.12 (t13 R2-Q1) The host field in the manufacturer block
+
+Source of the block: `adv.manufacturer_data[0x0553]` (`NINTENDO_COMPANY_ID`,
+`protocol.py:23-24`). Legacy reads exactly **three** things out of it and nothing else:
+
+| Bytes | Read by | Meaning |
+| --- | --- | --- |
+| `manu[3:5]` | `scanner.py:43` | VID, u16 LE, must equal `0x057E` (`NINTENDO_VENDOR_ID`) |
+| `manu[5:7]` | `scanner.py:44` | PID, u16 LE — `0x2066` R / `0x2067` L / `0x2069` Pro / `0x2073` NSO GC |
+| `manu[10:16]` | `protocol.py:128-130` | bonded-host MAC, u48 LE (`decodeu`), a.k.a. the "reconnect" field |
+| `manu[0:3]`, `manu[7:10]` | — | **never read by any code in `.old/`** |
+
+Length gates are different for the two uses: identification needs `len(manu) >= 13`
+(`scanner.py:41`), the host parse needs `>= 16` (`protocol.py:128`). A block that is
+present but shorter than 16 yields `reconnect = None`.
+
+Encoding: `decodeu(manu[10:16])` is little-endian, while the comparison value
+`mac_to_int(adapter_mac)` (`protocol.py:117-118`) is **big-endian over the display byte
+order** — so the wire field is the display MAC byte-reversed (consistent with §4.1).
+
+Interpretation (`protocol.py:121-130`, `scanner.py:45-46`, `bridge.py:313-314`,
+`tools/adv_watch.py:39-49`):
+
+| Field value | Legacy meaning | Dialled? |
+| --- | --- | --- |
+| `0` | pairing mode, no host stored (SYNC) | yes, TTL 45 s |
+| `== host_mac` | bonded to us, button wake | yes, TTL 4 s |
+| any other value | bonded to a **different** host | **no — never, silently** |
+| absent / block < 16 bytes (`None`) | unknown | yes, TTL 4 s (treated as `wake`) |
+
+**A non-matching field skips dialling entirely.** Exact path: `on_adv`
+(`bridge.py:309-318`) → `_accept` (`bridge.py:258-265`):
+
+```python
+worker = self.workers_by_mac.get(addr)                    # config MAC only
+if worker is None or worker.is_connected(): return False
+reconnect = P.reconnect_mac_from_advertisement(adv)
+if reconnect is not None and self.host_mac is not None and reconnect not in (0, self.host_mac):
+    return False                                          # <- fail closed
+return True
+```
+
+and `on_adv` returns *before* `hub._last_seen[addr] = (...)` is written (`bridge.py:311-315`).
+`pending` is built exclusively from `_last_seen` keyed by config MAC (`bridge.py:366-376`),
+so the pad never reaches `_connect_sync`, produces no log line, no state change and no retry
+— until it advertises again with an acceptable field. Two escape hatches keep this forgiving:
+`reconnect is None` (short/absent block) and `self.host_mac is None` (no `adapter_mac` in
+config) both accept.
+
+`host_mac` is computed **once** in `_ConnectHub.__init__` (`bridge.py:236`:
+`P.mac_to_int(config.adapter_mac) if config.adapter_mac else None`) and never refreshed at
+runtime. The field is only ever set to our MAC by `SwitchController.bond()`, which sends
+`PAIR 0x15 / SET_MAC 0x01` with `b"\x00\x02" + adapter_le + adapter_le` (`device.py:278-286`),
+and `bond()` is called once per entry (`bridge.py:581-585`, guarded by `entry.bonded`).
+Consequences: a pad bonded to a previous adapter MAC (card replaced, MAC changed, config
+copied from another machine) is **invisible** to legacy, and the shipped remedy is a re-bond
+in SYNC mode — GUI "Re-bond Controller…" whose help text is literally *"Use this if pressing a
+button no longer wakes the controller"* (`scripts/ngc_gui.py:909-914`), or
+`python -m ngc rebond` (`__main__.py:85-120`), both of which use
+`find_first(require_pairing=True)` and refuse an address that is not already in config
+(`__main__.py:99-101`).
+
+## 8.13 (t13 R2-Q2) Wake vs pairing advertisement
+
+Legacy distinguishes exactly **one** thing: the value of the host field. There is no second
+advert shape, no state byte, no separate PID, and **no counter byte** — the variable named
+`reconnect` *is* the MAC (`protocol.py:121-126`: "the host MAC it will wake for").
+
+```python
+reconnect = P.reconnect_mac_from_advertisement(adv)
+mode = "pairing" if reconnect == 0 else "wake"        # bridge.py:313-314
+```
+
+* What sets `reconnect == 0`: the controller itself — no host stored (SYNC held, fresh pad, or
+  bond cleared). Legacy's only way to make it non-zero is the `SET_MAC` command in `bond()`
+  (`device.py:278-286`). Nothing else in the repo writes that field.
+* What legacy asserts about the shapes, in comments: `bridge.py:54-56` — *"Pairing-mode adverts
+  are brief; wake adverts repeat often. A short TTL caused missed connects when Sync was held
+  or the 0.25s scan window slipped."* (the code window is `scan_on_s = 0.50` at
+  `bridge.py:334`, used at `:358`, plus a 0.10 s settle at `:363` — the `0.25s` in the comment
+  is stale). TTLs: 45 s pairing / 4 s wake (`bridge.py:57-58`).
+* The same two-mode model appears in two other places, both **not on the shipped wake path**:
+  `scanner.wait_for_addresses(..., bonded_wake_only=True)` (`scanner.py:114-150`), which
+  ignores `reconnect == 0` and rejects `reconnect != host_mac` — this function is **dead code,
+  it has no caller anywhere in `.old/`**; and `scanner.find_first(require_pairing=True)`, used
+  only by `pair`/`rebond` (`__main__.py:65, 93`) and `tools/enumerate.py:36`. The live wake
+  path is the bridge's own `on_adv` + `_accept`.
+* Diagnostic vocabulary confirming the three states: `tools/adv_watch.py:45-49` prints
+  `mode=PAIRING`, `mode=BONDED-WAKE`, `mode=OTHER-HOST(0x…)`, and prints the full
+  `manu.hex()`; its docstring says *"Press a normal button (not Sync) on a paired pad"*.
+  `tools/scan_list.py:1` is documented as *"pairing mode or awake"*.
+* Nothing in the repo records a difference in **block length**, in bytes `0:3`/`7:10`, or in
+  RSSI between the two modes. If the Rust side observes such a difference it is new data, not
+  something legacy-derived.
+
+## 8.14 (t13 R2-Q3) What address legacy dials on reconnect
+
+Everything is string-keyed on `device.address.upper()`; nothing reconciles or learns addresses.
+
+* `on_adv`: `addr = device.address.upper()`; `workers_by_mac` is keyed by
+  `entry.mac.upper()` (`bridge.py:250`); `_accept` is an exact dict lookup (`bridge.py:259`);
+  `_last_seen[addr]` (`bridge.py:315`); dial is `SwitchController(mac, adapter)` with that same
+  string (`bridge.py:452`) and `baddr()` turns it into the sockaddr (`att.py:59-61`).
+* No write-back path exists: nothing assigns `device.address` into `Config`, and
+  `Config.add_controller` matches only by exact uppercased MAC (`config.py:147-161`),
+  otherwise appending a **new** entry (`config.py:171-172`). A pad seen under a different
+  address is therefore unknown to `_accept` and ignored; "fixing" it means re-running `pair`,
+  which would add a second config entry rather than update the first.
+* RPA handling: none. No `ResolvePrivateAddress` D-Bus call, no address-type learning beyond
+  "try public then random at connect time" (`bridge.py:444-448`, `att.py:129-137`). Legacy
+  compares the advertised string to the config string, full stop. *Inference, not documented:*
+  since legacy's hardware did reconnect (flakily) this implies these pads advertise their
+  identity address, and that legacy relied on bleak/BlueZ to surface it (BlueZ resolves RPAs
+  for bonded devices; legacy never asks). A port that scans at HCI level itself will see raw
+  RPAs and needs its own reconciliation — there is no legacy precedent to copy.
+* One more place the config MAC must match reality: `_bluez_remove_device(mac)`
+  (`bridge.py:148-155`) builds `/org/bluez/hciN/dev_XX_XX_…` from it.
+
+## 8.15 (t13 R2-Q4) Known limits — was this ever demonstrated?
+
+**No, not on Joy-Con 2, and not convincingly on anything.** The evidence, in the repo:
+
+1. `README.md:44,46` — the support table marks **Joy-Con 2 (L/R) as ⚠️ untested** with `?` in
+   every column, and the note reads *"**Joy-Con 2 is untested.** … they may connect — but this
+   has never been verified against real hardware."* The models actually tested are NSO
+   GameCube and Pro Controller 2 (`README.md:3-6, 123`).
+2. `README.md:23-26` — *"Wake-connect after pairing … This replaces the earlier blind retry
+   loop, but **still needs real-world confirmation** on your box — especially with two pads
+   waking at once."*
+3. `README.md:122-127` — *"Routine wake-connect **should** work after bonding, but **it has been
+   flaky in development** (adapter scanning conflicts, Decky BT Wake plugin). The bridge now
+   uses advertisement-driven wake-connect instead of blind retries — **please verify on your
+   box and report issues**. Simultaneous dual-pad wake is still best-effort."*
+4. `system/bazzite-nso-gc-watchdog.sh` (+ `systemd/nso-gc-watchdog.timer`, every 5 min) exists
+   to restart the service when pads never connect; its last heuristic is
+   `if "saw " in log and "connected " not in log` → `"restart: adverts seen in journal but no
+   successful connect"` (`:83-84`), with a 600 s stuck threshold (`:8`). That is a production
+   workaround for **precisely the failure under discussion** — advert seen, connect never
+   established — and the restart is a blunt fix, not a repair of the connect path.
+5. `scripts/ngc_gui.py:909-914` — the shipped user-facing remedy for "pressing a button no
+   longer wakes the controller" is to **re-bond in SYNC mode**, i.e. fall back to the pairing
+   flow, not to retry the wake flow.
+6. `tools/adv_watch.py` — a whole debug tool dedicated to inspecting wake adverts, with
+   `mode=BONDED-WAKE / OTHER-HOST` classification, i.e. the author needed to verify the field
+   by hand.
+7. `system/bluetooth-always-on.sh` — OS-level support (unblock rfkill, force `Powered true`,
+   re-enable Steam's Bluetooth, reconnect a trusted-device list after resume) needed because
+   adapter state after suspend was not reliable enough on its own.
+8. `tools/grab_gatt.py:33-41` — establishing a link at all is retried 20× with
+   `bluetoothctl remove` between rounds, in the *pairing* flow.
+
+Conclusion, stated plainly: the legacy project **never demonstrated wake-reconnect on
+Joy-Con 2** — it never ran Joy-Con 2 on hardware for anything. On the two tested models the
+wake path existed and was the shipped design (with an advert-driven gate, per 8.12), but the
+author documents it as flaky and unconfirmed and asks the user to verify; the repo's own
+mitigations are "restart the daemon" and "re-bond with SYNC". There is no logged diagnosis of
+a wake-connect failure anywhere in `.old/`, which is consistent with 8.9: legacy never
+interpreted HCI status codes, so a systematic 0x3E/ENOSYS rejection on wake would have been
+seen only as the string `SO_ERROR 38`. **If the decision rests on "did the original prove
+raw-L2CAP wake reconnect works on Joy-Con 2", the answer is no.**
