@@ -131,10 +131,7 @@ impl MotionNode {
         device.set_phys(&phys)?;
         device.create()?;
 
-        info!(
-            "Exposed motion evdev '{}' (phys: {})",
-            display_name, phys
-        );
+        info!("Exposed motion evdev '{}' (phys: {})", display_name, phys);
 
         Ok(Self {
             device,
@@ -159,11 +156,8 @@ impl MotionNode {
             if self.last[index] == Some(value) {
                 continue;
             }
-            self.device.emit(&[RawInputEvent::new(
-                EventType::ABSOLUTE.0,
-                axis.0,
-                value,
-            )])?;
+            self.device
+                .emit(&[RawInputEvent::new(EventType::ABSOLUTE.0, axis.0, value)])?;
             self.last[index] = Some(value);
         }
 
@@ -245,9 +239,9 @@ mod tests {
         // Accel axes use the g resolution; gyro axes use LSB-per-deg/s.
         for (axis, absinfo) in IMU_AXES {
             let expected = match axis {
-                AbsoluteAxisType::ABS_X
-                | AbsoluteAxisType::ABS_Y
-                | AbsoluteAxisType::ABS_Z => ACCEL_LSB_PER_G,
+                AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_Y | AbsoluteAxisType::ABS_Z => {
+                    ACCEL_LSB_PER_G
+                }
                 _ => GYRO_LSB_PER_DPS,
             };
             assert_eq!(absinfo.resolution, expected, "axis 0x{:02X}", axis.0);
@@ -263,14 +257,8 @@ mod tests {
         // Shared with VirtualGamepad::new; must produce exactly ngc/<MAC> with
         // the MAC uppercased (motion_evdev.py:44-45) and stay idempotent for
         // callers that already pass the prefix.
-        assert_eq!(
-            phys_for_tag("aa:bb:cc:dd:ee:01"),
-            "ngc/AA:BB:CC:DD:EE:01"
-        );
-        assert_eq!(
-            phys_for_tag("AA:BB:CC:DD:EE:FF"),
-            "ngc/AA:BB:CC:DD:EE:FF"
-        );
+        assert_eq!(phys_for_tag("aa:bb:cc:dd:ee:01"), "ngc/AA:BB:CC:DD:EE:01");
+        assert_eq!(phys_for_tag("AA:BB:CC:DD:EE:FF"), "ngc/AA:BB:CC:DD:EE:FF");
         assert_eq!(
             phys_for_tag("ngc/AA:BB:CC:DD:EE:FF"),
             "ngc/AA:BB:CC:DD:EE:FF"
@@ -360,8 +348,8 @@ mod tests {
         // checked even when the event node is not yet readable by this user.
         let sysfs = find_sysfs_input(&display_name)
             .unwrap_or_else(|| panic!("{display_name:?} did not appear in sysfs within 1s"));
-        let motion_phys = std::fs::read_to_string(sysfs.join("phys"))
-            .expect("sysfs phys is readable");
+        let motion_phys =
+            std::fs::read_to_string(sysfs.join("phys")).expect("sysfs phys is readable");
         assert_eq!(
             motion_phys.trim(),
             expected_phys,
