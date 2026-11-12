@@ -19,6 +19,19 @@ pub const TRIGGER_MAX: i32 = 255;
 /// shim key off it, so it must not be changed casually.
 const PHYS_PREFIX: &str = "ngc/";
 
+/// Kernel `phys` string for a node tag (typically the controller MAC):
+/// `ngc/<TAG>` with the tag uppercased. A leading `ngc/` prefix is stripped
+/// first and re-applied, so the helper is idempotent.
+///
+/// Legacy `phys_for_mac()` is `f"ngc/{mac.upper()}"`
+/// (`motion_evdev.py:44-45`). Shared by the gamepad and IMU nodes: the evdev
+/// `uniq` shim links two nodes by matching this string, so both must be built
+/// with this helper.
+pub fn phys_for_tag(tag: &str) -> String {
+    let tag = tag.strip_prefix(PHYS_PREFIX).unwrap_or(tag);
+    format!("{PHYS_PREFIX}{}", tag.to_ascii_uppercase())
+}
+
 /// Every button the virtual pad exposes (also used by the selftest plan).
 pub const KEYS: [Key; 15] = [
     // Face buttons (standard evdev diamond positions)
@@ -93,14 +106,12 @@ impl VirtualGamepad {
     /// Create a new virtual gamepad exposed to the Linux kernel via uinput.
     ///
     /// `tag` is the identity string (typically the controller MAC, or
-    /// `switch2-combined`). The node is published with `phys = "ngc/<tag>"`;
-    /// a tag that already starts with `ngc/` is used verbatim.
+    /// `switch2-combined`) and is upper-cased: the node is published with
+    /// `phys = "ngc/<TAG>"`, matching the legacy `phys_for_mac()` contract that
+    /// udev rules and the uniq shim key on. A leading `ngc/` is stripped first,
+    /// so passing a complete phys string is harmless.
     pub fn new(name: &str, product_id: u16, tag: &str) -> io::Result<Self> {
-        let phys = if tag.starts_with(PHYS_PREFIX) {
-            tag.to_string()
-        } else {
-            format!("{PHYS_PREFIX}{tag}")
-        };
+        let phys = phys_for_tag(tag);
 
         // Order matters: event types, then per-key/axis capabilities, then the
         // device identity, then phys, and only then create.
