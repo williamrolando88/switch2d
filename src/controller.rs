@@ -486,17 +486,32 @@ where
         "skipped (live session)".to_string()
     };
 
+    let dial_started = Instant::now();
     let mut last_error = None;
     for round in 0..budget.rounds {
         // Non-forced, rate-limited scan stop immediately before every round
         // (legacy issues it before every address-type attempt; the 0.35 s
         // limiter coalesces the pair into one).
-        if let Err(err) = control.stop_le_scan(false) {
-            debug!("scan stop before round {round} for {mac} failed: {err}");
-        }
+        let scan_stop = match control.stop_le_scan(false) {
+            Ok(()) => "ok".to_string(),
+            Err(err) => {
+                debug!("scan stop before round {round} for {mac} failed: {err}");
+                format!("failed: {err}")
+            }
+        };
 
         report.rounds_attempted = round + 1;
         report.attempts = report.rounds_attempted * 2;
+        debug!(
+            "Dial round {}/{} for {}: elapsed={:?}, discovery_stop={}, device_removal={}, scan_stop={}",
+            round + 1,
+            budget.rounds,
+            mac,
+            dial_started.elapsed(),
+            report.discovery_stop,
+            report.device_removal,
+            scan_stop
+        );
 
         match dial(budget.per_type_timeout) {
             Ok(session) => {

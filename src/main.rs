@@ -319,9 +319,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let next_player = player.unwrap_or_else(|| {
-                (config.controllers.len() as u8 + 1).min(8)
-            });
+            // Re-pairing an existing MAC must not invent a new player: reuse
+            // its slot unless the user explicitly asked for a different one.
+            // Only a MAC that is not in the config gets a fresh slot.
+            let existing = config
+                .controllers
+                .iter()
+                .find(|c| c.mac.eq_ignore_ascii_case(&target_mac));
+            let existing_player = existing.map(|c| c.player);
+            let next_free = (1..=8)
+                .find(|p| !config.controllers.iter().any(|c| c.player == *p))
+                .unwrap_or(8);
+            let next_player = player_for_pair(existing_player, player, next_free);
+            match (existing, player) {
+                (Some(existing), Some(_)) => info!(
+                    "assigning {} to Player {} (explicit; was Player {})",
+                    target_mac, next_player, existing.player
+                ),
+                (Some(_), None) => info!(
+                    "re-pairing {}, keeping Player {}",
+                    target_mac, next_player
+                ),
+                (None, _) => info!("assigning {} to Player {}", target_mac, next_player),
+            }
 
             // HANDOVER Bug 3: `scan_for_joycon()` kills the `bluetoothctl scan
             // on` helper, but that does not stop HCI discovery. An LE scan
@@ -530,6 +550,18 @@ fn log_level_for(verbose: bool, rust_log: Option<&str>) -> Level {
 /// believes an actual filter is in effect.
 fn rust_log_has_filters(rust_log: &str) -> bool {
     rust_log.contains('=') || rust_log.contains(',') || rust_log.contains('[')
+}
+
+/// Resolve the player slot for `pair`.
+///
+/// An explicit `-p/--player` always wins (clamped to 1..=8). Otherwise an
+/// already-bonded MAC keeps its existing player, and only a new MAC takes the
+/// next free slot.
+fn player_for_pair(existing_player: Option<u8>, explicit: Option<u8>, next_free: u8) -> u8 {
+    explicit
+        .or(existing_player)
+        .unwrap_or(next_free)
+        .clamp(1, 8)
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1100,34 @@ fn auto_detect_adapter() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod pair_player_tests {
+    use super::*;
+
+    #[test]
+    fn reuses_existing_player_without_explicit() {
+        assert_eq!(player_for_pair(Some(1), None, 3), 1);
+        assert_eq!(player_for_pair(Some(7), None, 2), 7);
+    }
+
+    #[test]
+    fn explicit_player_wins_over_existing() {
+        assert_eq!(player_for_pair(Some(1), Some(4), 3), 4);
+    }
+
+    #[test]
+    fn new_mac_gets_next_free() {
+        assert_eq!(player_for_pair(None, None, 3), 3);
+    }
+
+    #[test]
+    fn explicit_player_is_clamped() {
+        assert_eq!(player_for_pair(None, Some(0), 3), 1);
+        assert_eq!(player_for_pair(None, Some(9), 3), 8);
+        assert_eq!(player_for_pair(Some(1), Some(0), 3), 1);
+    }
 }
 
 #[cfg(test)]
