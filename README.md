@@ -294,8 +294,10 @@ likely thing to find here, because that path has been rewritten most.
 
 ### Round 2
 
-The current plan is [`docs/TEST_PLAN_ROUND5.md`](docs/TEST_PLAN_ROUND5.md): the daemon
-with both pads, end to end. Earlier rounds: [`ROUND4`](docs/TEST_PLAN_ROUND4.md),
+The current plan is [`docs/TEST_PLAN_ROUND6.md`](docs/TEST_PLAN_ROUND6.md): the whole
+product from a clean slate - purge, re-pair, per-pad validation, daemon with both pads,
+reconnect without SYNC, and recovery after a BlueZ restart. Earlier rounds:
+[`ROUND5`](docs/TEST_PLAN_ROUND5.md), [`ROUND4`](docs/TEST_PLAN_ROUND4.md),
 [`ROUND3`](docs/TEST_PLAN_ROUND3.md), [`ROUND2`](docs/TEST_PLAN_ROUND2.md).
 
 Historical note: [`docs/TEST_PLAN_ROUND3.md`](docs/TEST_PLAN_ROUND3.md): round 2
