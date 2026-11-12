@@ -1,0 +1,462 @@
+//! Live monitor: connect to one controller and print exactly what the decoder
+//! produces (the BLE half of the smoke test).
+//!
+//! The input callback runs on the ATT reader thread, so it only performs a
+//! non-blocking `try_send` into a 64-slot channel (analysis §5.6: printing or
+//! blocking there head-of-line-blocks command responses). Formatting and I/O
+//! happen on the monitor thread.
+
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::controller::{
+    BondPolicy, ConnectOptions, ControllerInputCallback, SwitchController,
+};
+use crate::protocol::calibration::normalize_gc_trigger;
+use crate::protocol::constants::{button_mask, NSO_GAMECUBE_PID};
+use crate::protocol::report::InputReport;
+use crate::status::battery_pct_from_mv;
+
+/// Stick deadzone used by the uinput mapper (`uinput/combined.rs` uses 120 for
+/// every stick). Keep the monitor's calibrated floats consistent with it.
+const STICK_DEADZONE: i32 = 120;
+
+/// Stable, ordered button table for the one-line report. Masks come from
+/// `protocol::constants::button_mask`; the order is defined once here and is
+/// intentionally a slice, not a map.
+const BUTTON_ORDER: &[(u32, &str)] = &[
+    (button_mask::A, "A"),
+    (button_mask::B, "B"),
+    (button_mask::X, "X"),
+    (button_mask::Y, "Y"),
+    (button_mask::UP, "UP"),
+    (button_mask::DOWN, "DOWN"),
+    (button_mask::LEFT, "LEFT"),
+    (button_mask::RIGHT, "RIGHT"),
+    (button_mask::PLUS, "PLUS"),
+    (button_mask::MINUS, "MINUS"),
+    (button_mask::HOME, "HOME"),
+    (button_mask::CAPTURE, "CAPTURE"),
+    (button_mask::L, "L"),
+    (button_mask::R, "R"),
+    (button_mask::ZL, "ZL"),
+    (button_mask::ZR, "ZR"),
+    (button_mask::L_STICK_BTN, "L_STICK"),
+    (button_mask::R_STICK_BTN, "R_STICK"),
+    (button_mask::SL_L, "SL_L"),
+    (button_mask::SR_L, "SR_L"),
+    (button_mask::SL_R, "SL_R"),
+    (button_mask::SR_R, "SR_R"),
+    (button_mask::C_BTN, "C"),
+    (button_mask::GL, "GL"),
+    (button_mask::GR, "GR"),
+];
+
+/// Configuration for [`run_monitor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorConfig {
+    pub mac: String,
+    pub adapter_mac: String,
+    pub player: u8,
+    /// Hard time limit. `0` means "until the link drops".
+    pub seconds: u64,
+}
+
+/// Calibrated input mirroring legacy `SwitchController.calibrated_input()`
+/// (`device.py:436-454`): left/right stick floats in `-1.0..=1.0`, triggers in
+/// `0..=255`.
+///
+/// `controller.rs` does not expose this type/method yet and is off-limits this
+/// round, so the monitor computes it from the controller's public calibration
+/// fields ([`calibrated_input`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalibratedInput {
+    pub left: (f32, f32),
+    pub right: (f32, f32),
+    pub lt: u8,
+    pub rt: u8,
+}
+
+impl Default for CalibratedInput {
+    fn default() -> Self {
+        Self {
+            left: (0.0, 0.0),
+            right: (0.0, 0.0),
+            lt: 0,
+            rt: 0,
+        }
+    }
+}
+
+/// One-second statistics window.
+///
+/// `observe()` records an input timestamp and updates `count`/`max_gap`; the
+/// producer side of the channel adds any dropped frames to `dropped` (or via
+/// [`WindowStats::record_dropped`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowStats {
+    pub count: u64,
+    pub dropped: u64,
+    pub max_gap: Duration,
+    last: Option<Instant>,
+}
+
+impl WindowStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one received report. The gap is measured from the previously
+    /// observed report, so the first observation contributes no gap.
+    pub fn observe(&mut self, now: Instant) {
+        if let Some(previous) = self.last {
+            let gap = now.saturating_duration_since(previous);
+            if gap > self.max_gap {
+                self.max_gap = gap;
+            }
+        }
+        self.last = Some(now);
+        self.count += 1;
+    }
+
+    /// Add dropped-frame count reported by the input callback.
+    pub fn record_dropped(&mut self, dropped: u64) {
+        self.dropped = self.dropped.saturating_add(dropped);
+    }
+}
+
+/// Format one input report (`[#seq] btn=… raw=… cal=… lt=… rt=… bat=…`).
+pub fn format_report(seq: u64, report: &InputReport, cal: &CalibratedInput) -> String {
+    let buttons = pressed_button_names(report.buttons);
+    let battery = match battery_pct_from_mv(report.battery_mv) {
+        Some(pct) => format!("{pct}%"),
+        None => "n/a%".to_string(),
+    };
+
+    // Raw IMU LSB samples -> g / deg/s with the same constants and signs the
+    // DSU path uses (`.old/ngc/dsu.py:45-51`).
+    let (accel, gyro) = crate::dsu::scale_motion(
+        [
+            f32::from(report.accel.0),
+            f32::from(report.accel.1),
+            f32::from(report.accel.2),
+        ],
+        [
+            f32::from(report.gyro.0),
+            f32::from(report.gyro.1),
+            f32::from(report.gyro.2),
+        ],
+    );
+
+    format!(
+        "[#{seq}] btn={buttons} raw=<{lx},{ly}><{rx},{ry}> \
+         cal=<{clx:.2},{cly:.2}><{crx:.2},{cry:.2}> \
+         lt={lt} rt={rt} bat={bat_mv}mV {battery} \
+         acc={ax:.2},{ay:.2},{az:.2}g gyro={gx:.2},{gy:.2},{gz:.2}dps",
+        lx = report.left_stick_raw.0,
+        ly = report.left_stick_raw.1,
+        rx = report.right_stick_raw.0,
+        ry = report.right_stick_raw.1,
+        clx = cal.left.0,
+        cly = cal.left.1,
+        crx = cal.right.0,
+        cry = cal.right.1,
+        lt = cal.lt,
+        rt = cal.rt,
+        bat_mv = report.battery_mv,
+        ax = accel[0],
+        ay = accel[1],
+        az = accel[2],
+        gx = gyro[0],
+        gy = gyro[1],
+        gz = gyro[2],
+    )
+}
+
+/// Format one per-second statistics line.
+pub fn format_stats(stats: &WindowStats) -> String {
+    format!(
+        "[stats] reports={}/s dropped={} max_gap={}",
+        stats.count,
+        stats.dropped,
+        stats.max_gap.as_millis()
+    )
+}
+
+fn pressed_button_names(buttons: u32) -> String {
+    let mut pressed = Vec::new();
+    for &(mask, name) in BUTTON_ORDER {
+        if buttons & mask != 0 {
+            pressed.push(name);
+        }
+    }
+    if pressed.is_empty() {
+        "-".to_string()
+    } else {
+        pressed.join(",")
+    }
+}
+
+/// Compute [`CalibratedInput`] from the controller's public calibration state.
+///
+/// Mirrors legacy `device.py:436-454`:
+/// * sticks use `StickCalibration::apply(raw, 120)` (same deadzone as the
+///   uinput mapper);
+/// * the NSO GameCube pad has analog L/R triggers (neutral + deadzone);
+/// * every other pad exposes ZL/ZR as digital buttons (0 or 255);
+/// * the digital L/R click forces its analog trigger to 255.
+fn calibrated_input(controller: &SwitchController, report: &InputReport) -> CalibratedInput {
+    let left = controller
+        .left_calib
+        .apply(report.left_stick_raw, STICK_DEADZONE);
+    let right = controller
+        .right_calib
+        .apply(report.right_stick_raw, STICK_DEADZONE);
+
+    let has_analog_triggers = controller
+        .info
+        .as_ref()
+        .map(|info| info.product_id == NSO_GAMECUBE_PID)
+        .unwrap_or(false);
+
+    let (mut lt, mut rt) = if has_analog_triggers {
+        (
+            normalize_gc_trigger(report.left_trigger_raw, controller.trigger_neutral.0),
+            normalize_gc_trigger(report.right_trigger_raw, controller.trigger_neutral.1),
+        )
+    } else {
+        (
+            u8::from(report.is_pressed(button_mask::ZL)) * 255,
+            u8::from(report.is_pressed(button_mask::ZR)) * 255,
+        )
+    };
+
+    // Digital L/R click fires at full pull; keep axes in sync with shoulders.
+    if report.is_pressed(button_mask::L) {
+        lt = 255;
+    }
+    if report.is_pressed(button_mask::R) {
+        rt = 255;
+    }
+
+    CalibratedInput { left, right, lt, rt }
+}
+
+fn flush_dropped(dropped: &AtomicU64, stats: &mut WindowStats) {
+    stats.record_dropped(dropped.swap(0, Ordering::Relaxed));
+}
+
+fn print_handshake(cfg: &MonitorConfig, controller: &SwitchController) {
+    let name = controller
+        .info
+        .as_ref()
+        .map(|info| info.name())
+        .unwrap_or("n/a");
+    let product_id = controller
+        .info
+        .as_ref()
+        .map(|info| format!("0x{:04X}", info.product_id))
+        .unwrap_or_else(|| "n/a".to_string());
+    // Neither the negotiated ATT MTU nor the calibration source is exposed by
+    // SwitchController; print n/a instead of adding accessors this round.
+    let bond = if controller.did_bond {
+        "bonded"
+    } else {
+        "not-bonded"
+    };
+    println!(
+        "[monitor] connected mac={} adapter={} player={} name={} pid={} mtu=n/a \
+         cal=n/a bond={} seconds={}",
+        cfg.mac, cfg.adapter_mac, cfg.player, name, product_id, bond, cfg.seconds
+    );
+}
+
+/// Blocking live monitor: connect, print the handshake, then print one line per
+/// input report and a per-second stats line.
+///
+/// Called from `spawn_blocking` by the CLI. A link drop prints
+/// `[monitor] link dropped …` and returns `Ok(())`; only the initial connect
+/// can return `Err`.
+pub fn run_monitor(cfg: MonitorConfig) -> io::Result<()> {
+    let (tx, rx) = mpsc::sync_channel::<InputReport>(64);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped_cb = Arc::clone(&dropped);
+
+    // Reader-thread callback: never blocks, never prints.
+    let callback: ControllerInputCallback = Box::new(move |report: &InputReport| {
+        if tx.try_send(report.clone()).is_err() {
+            dropped_cb.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let controller = SwitchController::connect_with(
+        &cfg.mac,
+        &cfg.adapter_mac,
+        ConnectOptions {
+            player: cfg.player,
+            bond: BondPolicy::Skip,
+        },
+        callback,
+    )?;
+
+    print_handshake(&cfg, &controller);
+
+    let start = Instant::now();
+    let deadline = if cfg.seconds == 0 {
+        None
+    } else {
+        Some(start + Duration::from_secs(cfg.seconds))
+    };
+    let mut stats = WindowStats::new();
+    let mut window_start = start;
+    let mut seq = 0u64;
+    let mut total = 0u64;
+
+    loop {
+        let now = Instant::now();
+        if let Some(deadline) = deadline {
+            if now >= deadline {
+                flush_dropped(&dropped, &mut stats);
+                if stats.count > 0 || stats.dropped > 0 {
+                    println!("{}", format_stats(&stats));
+                }
+                break;
+            }
+        }
+
+        if !controller.is_connected() {
+            println!("[monitor] link dropped after {total} reports");
+            return Ok(());
+        }
+
+        let mut timeout = Duration::from_secs(1);
+        if let Some(deadline) = deadline {
+            timeout = timeout.min(deadline.saturating_duration_since(now));
+        }
+        if timeout.is_zero() {
+            continue;
+        }
+
+        match rx.recv_timeout(timeout) {
+            Ok(report) => {
+                seq += 1;
+                total += 1;
+                let cal = calibrated_input(&controller, &report);
+                println!("{}", format_report(seq, &report, &cal));
+                stats.observe(Instant::now());
+
+                if window_start.elapsed() >= Duration::from_secs(1) {
+                    flush_dropped(&dropped, &mut stats);
+                    println!("{}", format_stats(&stats));
+                    stats = WindowStats::new();
+                    window_start = Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                flush_dropped(&dropped, &mut stats);
+                println!("{}", format_stats(&stats));
+                stats = WindowStats::new();
+                window_start = Instant::now();
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                println!("[monitor] link dropped after {total} reports");
+                return Ok(());
+            }
+        }
+    }
+
+    println!("[monitor] done reports={total}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_report(buttons: u32, battery_mv: u16) -> InputReport {
+        InputReport {
+            timestamp: 0,
+            buttons,
+            left_stick_raw: (2048, 2048),
+            right_stick_raw: (2048, 2048),
+            battery_mv,
+            accel: (0, 0, 0),
+            gyro: (0, 0, 0),
+            left_trigger_raw: 0,
+            right_trigger_raw: 0,
+        }
+    }
+
+    fn zero_cal() -> CalibratedInput {
+        CalibratedInput::default()
+    }
+
+    #[test]
+    fn format_report_lists_pressed_buttons_in_order() {
+        let buttons = button_mask::A
+            | button_mask::X
+            | button_mask::LEFT
+            | button_mask::PLUS
+            | button_mask::HOME
+            | button_mask::ZR;
+        let line = format_report(7, &sample_report(buttons, 3600), &zero_cal());
+        assert!(
+            line.starts_with("[#7] btn=A,X,LEFT,PLUS,HOME,ZR "),
+            "line: {line}"
+        );
+    }
+
+    #[test]
+    fn format_report_uses_dash_when_nothing_is_pressed() {
+        let line = format_report(1, &sample_report(0, 3600), &zero_cal());
+        assert!(line.contains("btn=- "), "line: {line}");
+        assert!(line.starts_with("[#1] btn=- raw=<2048,2048><2048,2048> "));
+    }
+
+    #[test]
+    fn format_report_battery_agrees_with_status_helper() {
+        for mv in [0u16, 2949, 2950, 3600, 4200, 65535] {
+            let line = format_report(1, &sample_report(0, mv), &zero_cal());
+            let expected = match battery_pct_from_mv(mv) {
+                Some(pct) => format!("bat={mv}mV {pct}%"),
+                None => format!("bat={mv}mV n/a%"),
+            };
+            assert!(
+                line.contains(&expected),
+                "mv={mv} expected {expected:?} in {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_stats_reports_rate_and_max_gap() {
+        let stats = WindowStats {
+            count: 42,
+            dropped: 3,
+            max_gap: Duration::from_millis(12),
+            ..WindowStats::default()
+        };
+        assert_eq!(
+            format_stats(&stats),
+            "[stats] reports=42/s dropped=3 max_gap=12"
+        );
+    }
+
+    #[test]
+    fn window_stats_tracks_max_gap_and_drops() {
+        let mut stats = WindowStats::new();
+        let start = Instant::now();
+        stats.observe(start);
+        stats.observe(start + Duration::from_millis(10));
+        stats.observe(start + Duration::from_millis(60));
+        stats.record_dropped(2);
+        stats.record_dropped(1);
+
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.dropped, 3);
+        assert_eq!(stats.max_gap, Duration::from_millis(50));
+    }
+}

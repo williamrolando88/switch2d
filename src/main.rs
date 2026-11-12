@@ -14,6 +14,7 @@ use switch2d::bluetooth::scan::{ScanControl, ShellScanControl};
 use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
 use switch2d::controller::{BondPolicy, ConnectOptions, SwitchController};
 use switch2d::daemon::Daemon;
+use switch2d::monitor::{run_monitor, MonitorConfig};
 use switch2d::protocol::constants::*;
 use switch2d::protocol::vibration::{amplitude, payload, stop_payload, Layout, Sample};
 use switch2d::uinput::gamepad::{
@@ -51,6 +52,16 @@ enum Commands {
 
     /// Show daemon status, active mode, and bonded controllers
     Status,
+
+    /// Print live decoded input from a bonded controller (BLE smoke test)
+    Monitor {
+        /// Bluetooth MAC address (defaults to the first bonded controller)
+        mac: Option<String>,
+
+        /// How long to listen; 0 means until the link drops
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+    },
 
     /// Set default operation mode: 'combined' (unified 1P controller) or 'split' (separate 2P controllers)
     Mode {
@@ -160,6 +171,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let daemon = Daemon::new(config);
             daemon.run().await?;
+        }
+        Commands::Monitor { mac, seconds } => {
+            let from_config = match &mac {
+                Some(wanted) => config
+                    .controllers
+                    .iter()
+                    .find(|c| c.mac.eq_ignore_ascii_case(wanted))
+                    .cloned(),
+                None => config.controllers.first().cloned(),
+            };
+
+            let (target, player) = match (mac, from_config) {
+                (Some(_), Some(entry)) => (entry.mac, entry.player),
+                (Some(wanted), None) => (wanted.trim().to_uppercase(), 1),
+                (None, Some(entry)) => (entry.mac, entry.player),
+                (None, None) => {
+                    println!("No bonded controllers yet - run `switch2d pair` first,");
+                    println!("or pass a MAC: switch2d monitor AA:BB:CC:DD:EE:FF");
+                    return Ok(());
+                }
+            };
+
+            println!("===========================================================");
+            println!("   Live monitor  {}  (Player {})", target, player);
+            println!("   Press buttons; Ctrl-C to stop early.");
+            println!("===========================================================");
+
+            let cfg = MonitorConfig {
+                mac: target,
+                adapter_mac: config.adapter_mac.clone(),
+                player,
+                seconds,
+            };
+            tokio::task::spawn_blocking(move || run_monitor(cfg)).await??;
         }
         Commands::Status => {
             println!("===========================================================");

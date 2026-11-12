@@ -4,6 +4,7 @@ pub mod controller;
 pub mod daemon;
 pub mod dsu;
 pub mod hub;
+pub mod monitor;
 pub mod players;
 pub mod protocol;
 pub mod status;
