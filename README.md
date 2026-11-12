@@ -294,9 +294,10 @@ likely thing to find here, because that path has been rewritten most.
 
 ### Round 2
 
-The current plan is [`docs/TEST_PLAN_ROUND6.md`](docs/TEST_PLAN_ROUND6.md): the whole
-product from a clean slate - purge, re-pair, per-pad validation, daemon with both pads,
-reconnect without SYNC, and recovery after a BlueZ restart. Earlier rounds:
+The current plan is [`docs/TEST_PLAN_ROUND6B.md`](docs/TEST_PLAN_ROUND6B.md): a twelve
+minute re-check of the two defects round 6 exposed (daemon calibration reaching the
+combined node, and re-pairing keeping the player slot). The full procedure from a clean
+slate is [`docs/TEST_PLAN_ROUND6.md`](docs/TEST_PLAN_ROUND6.md). Earlier rounds:
 [`ROUND5`](docs/TEST_PLAN_ROUND5.md), [`ROUND4`](docs/TEST_PLAN_ROUND4.md),
 [`ROUND3`](docs/TEST_PLAN_ROUND3.md), [`ROUND2`](docs/TEST_PLAN_ROUND2.md).
 
