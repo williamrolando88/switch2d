@@ -2,288 +2,323 @@
 
 [![CI](https://github.com/williamrolando88/switch2d/actions/workflows/ci.yml/badge.svg)](https://github.com/williamrolando88/switch2d/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL_3.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 
-**High-performance Linux userspace bridge and virtual gamepad daemon for Nintendo Switch 2 controllers.**
+Use Nintendo Switch 2 controllers on Linux as normal gamepads.
 
-Written in pure Rust, `switch2d` connects official Nintendo Switch 2 controllers over Bluetooth
-Low Energy and exposes them as native Linux `/dev/uinput` gamepads, with userspace Joy-Con
-combining, rumble, motion (DSU/cemuhook) and a gyro evdev node.
+`switch2d` talks to the controller directly over Bluetooth Low Energy and creates a virtual
+gamepad, so games, Steam and emulators see a standard Linux controller. It does not need root
+while running, and it does not use the BlueZ GATT stack, which is what makes the connection
+stable enough for gaming.
 
----
-
-## ✨ Features
-
-- **🎮 Combined Joy-Con mode** — Joy-Con 2 (Left) and (Right) presented as **one** virtual
-  gamepad, including a single player number on both halves.
-- **👥 Split mode** — each Joy-Con as a standalone horizontal controller. Coded; not yet
-  validated on hardware.
-- **🕹️ Full input mapping** — sticks, triggers, D-pad, all face/shoulder/system buttons,
-  including the Switch 2 `C` button.
-- **📳 Rumble** — HD rumble for Joy-Con 2 and Pro Controller 2 (60 Hz stream), preset clips for
-  the GameCube pad, driven from standard Linux force feedback (`EV_FF`).
-- **🎯 Motion** — DSU/cemuhook output for Dolphin/Cemu/Ryujinx, plus a separate gyro evdev node
-  per controller.
-- **🔋 Battery and player LEDs** — read from the pad, published in `switch2d status`, LEDs kept
-  in sync with the effective player number.
-- **⚡ Low latency** — direct `AF_BLUETOOTH` L2CAP sockets with `BT_SECURITY_LOW`, bypassing the
-  BlueZ GATT stack.
-- **🔒 No sudo at runtime** — runs entirely as your desktop user; the only privileged pieces are
-  installed once (see [Install](#-install)).
-- **🪶 Small** — single static binary, no Python or other runtime dependencies.
+- Joy-Con 2 (Left/Right), alone or **combined into one gamepad**
+- Sticks, triggers, D-pad, all buttons including the Switch 2 `C` button
+- Rumble, motion (DSU/cemuhook) and a separate gyro device
+- Battery level and player LEDs
+- Works with combined mode, split mode, Steam and Dolphin
 
 ---
 
-## 🎮 Supported Controllers
+## Requirements
 
-See [docs/SUPPORT.md](docs/SUPPORT.md) for the authoritative, per-feature matrix.
+- Linux with BlueZ (`bluetoothctl`, `btmgmt`, `busctl`) and a Bluetooth adapter that supports LE
+- Rust toolchain (`cargo`) to install — [rustup.rs](https://rustup.rs) if you do not have it
+- `evtest` is optional but very useful for checking input (`sudo dnf install evtest` /
+  `sudo apt install evtest`)
 
-| Controller | Status |
-|---|---|
-| **Joy-Con 2 (Left)** | ✅ validated on hardware |
-| **Joy-Con 2 (Right)** | ✅ validated on hardware |
-| **Pro Controller 2** | 🧪 speculative — same protocol family, never tested on hardware |
-| **NSO GameCube Controller** | 🧪 speculative — analog triggers and preset rumble never exercised |
-
-Only Joy-Con 2 has been verified against real hardware. Do not read "supported" into the
-speculative rows; treat them as code that needs a tester.
+Installation needs `sudo` for system files (a udev rule, a small privacy unit and a sudoers
+rule) — expect to type your password, possibly more than once. The daemon itself always runs as
+your normal user.
 
 ---
 
-## 📋 Requirements
+## Install
 
-- Linux with BlueZ and a Bluetooth adapter supporting LE.
-- `btmgmt` and `busctl` (part of BlueZ).
-- Write access to `/dev/uinput` — provided by the udev rule installed below.
-- Optional but recommended: `evtest` and `jstest` for diagnosing input.
+### 0. Coming from the older Python bridge?
 
----
+If this machine ever ran the previous `nso-gc` bridge, its units can still be enabled and will
+fight this one for the Bluetooth adapter. Disable them first:
 
-## ⚙️ Install
+```bash
+systemctl --user disable --now nso-gc-watchdog.timer
+systemctl --user disable --now nso-gc.service nso-gc-watchdog.service nso-gc-after-gamescope.service
+```
 
-`switch2d` runs as your desktop user. The installer resolves its own directory, so it works
-from any cwd; re-running is safe and skips steps that are already installed.
+`install.sh` and `switch2d doctor` both warn about these, so you can also just run the installer
+and read its warnings. If you never installed the Python bridge, ignore this step.
 
-```fish
+### 1. Install the program
+
+```bash
 git clone https://github.com/williamrolando88/switch2d.git
 cd switch2d
-
-./install.sh              # binary, udev rule, LE-privacy unit, sudoers rule
-./install.sh --service    # also install and enable the login service
+./install.sh
 ```
 
-`./install.sh --uninstall` removes the udev rule, LE-privacy unit/script, sudoers rule and
-user unit. It never touches `~/.config/switch2d/config.json` or controller pairings.
+Add `--service` if you want it to start automatically at login:
 
-### Migrating from the Python bridge
-
-The upstream Python bridge left units behind. Disable all four before starting switch2d, or
-they can restart the old bridge and compete for the Bluetooth adapter:
-
-```fish
-systemctl --user disable --now nso-gc.service nso-gc-watchdog.service
-systemctl --user disable --now nso-gc-watchdog.timer nso-gc-after-gamescope.service
+```bash
+./install.sh --service
 ```
 
-Ignore "not found" for units you never had. `./install.sh` warns if any of them are still
-enabled.
+The installer is safe to re-run and skips anything already in place. It installs:
 
-### Verifying
+| What | Where |
+|---|---|
+| the `switch2d` binary | `~/.cargo/bin/switch2d` |
+| udev rule (gamepad/motion devices and player LEDs) | `/etc/udev/rules.d/70-switch2d.rules` |
+| LE-privacy unit (required for reconnects) | `/etc/systemd/system/switch2d-disable-le-privacy.service` |
+| least-privilege sudo rule for `btmgmt stop-find` | `/etc/sudoers.d/switch2d-btmgmt` |
 
-```fish
-which switch2d
+### 2. Verify the installation
+
+```bash
 switch2d doctor
 ```
 
-A healthy output is eight `PASS` lines. One `WARN` is acceptable for an optional rule (the
-user service if you did not use `--service`, or the udev rule if it is missing); any `FAIL`
-means reconnects or input will not work, and doctor prints the fix. `switch2d` must be on
-`PATH`: `cargo install` puts it in `~/.cargo/bin`, so add that directory if `which switch2d`
-is empty.
+A healthy machine prints one `PASS` line per check and exits 0:
 
-### Manual steps
-
-For distro packagers, or if you prefer not to run a script, do the same steps by hand. Run
-these from the repository root, or use absolute paths:
-
-```fish
-cargo install --path . --locked
-
-sudo install -Dm644 system/70-switch2d.rules /etc/udev/rules.d/70-switch2d.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-
-sudo install -Dm755 system/disable-le-privacy.sh /usr/local/bin/disable-le-privacy.sh
-sudo install -Dm644 system/switch2d-disable-le-privacy.service /etc/systemd/system/switch2d-disable-le-privacy.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now switch2d-disable-le-privacy.service
-
-echo "$USER ALL=(root) NOPASSWD: /usr/bin/btmgmt -i 0 stop-find -l, /usr/bin/btmgmt -i 0 stop-find" \
-    | sudo tee /etc/sudoers.d/switch2d-btmgmt
-sudo chmod 0440 /etc/sudoers.d/switch2d-btmgmt
-sudo visudo -cf /etc/sudoers.d/switch2d-btmgmt
-
-# Optional login service.
-install -Dm644 system/switch2d.service ~/.config/systemd/user/switch2d.service
-systemctl --user daemon-reload
-systemctl --user enable switch2d.service
+```text
+PASS  uinput: /dev/uinput is writable
+PASS  le-privacy unit: switch2d-disable-le-privacy.service: is-enabled=enabled, is-active=active
+PASS  bluetooth adapter: <hostname> (8C:17:..:D6:1E) [MAC partially redacted]
+PASS  discovery: StartDiscovery accepted (adapter is discoverable); Device1 objects: 0, with ManufacturerData: 0
+PASS  sudo btmgmt: sudo -n -l /usr/bin/btmgmt is allowed (no password prompt)
+PASS  legacy bridge units: no legacy nso-gc units enabled or active
+PASS  running instances: no other switch2d process
+PASS  DSU port: 127.0.0.1:26760 is free
+PASS  config: ~/.config/switch2d/config.json parsed; 0 bonded controller(s)
+PASS  udev uaccess rule: /etc/udev/rules.d/70-switch2d.rules
 ```
 
-If an older `switch2d.service` exists, disable it first with
-`systemctl --user disable --now switch2d.service`, then replace the file.
+Anything not `PASS` comes with a `fix:` line — run that, then `switch2d doctor` again. **Do not
+continue while a check says `FAIL`**: a missing `le-privacy unit` in particular makes reconnects
+impossible, and every later symptom would be a symptom of that.
+
+If `switch2d: command not found`, your shell has not seen `~/.cargo/bin` yet. Open a new
+terminal, or add `~/.cargo/bin` to `PATH`.
 
 ---
 
-## 🚀 Usage
+## Pair your controllers
 
-Start with the preflight — it tells you what is wrong and how to fix it, with a stable
-`PASS`/`WARN`/`FAIL` line per check:
+Pairing is needed **once per controller**. After that it reconnects on its own.
 
-```fish
-switch2d doctor        # preflight: says exactly what is wrong and how to fix it
-switch2d pair          # pair, bond and set the player LED (run once per controller)
-switch2d status        # bonded controllers, mode, adapter
-switch2d run           # run the daemon in the foreground
+1. Turn the controller on.
+2. Hold the small round **SYNC** button (between `SL` and `SR` on a Joy-Con) until its LEDs
+   cycle back and forth — while they cycle, the controller is discoverable.
+3. Run:
+
+```bash
+switch2d pair
 ```
 
-`Ctrl+C` stops `switch2d run` cleanly: virtual nodes are removed and pads are released, with no
-background process left behind. (In fish, `Ctrl+C` is the key combination, not a command to type.)
+The scan window is 10 seconds. Expected result:
 
-If you installed the service with `--service`, the service form is also available:
+```text
+Found Switch 2 controller: AA:BB:CC:DD:EE:01
+Connecting to AA:BB:CC:DD:EE:01 (Player 1)...
+✅ Controller Successfully Paired & Bonded!
+Player:  1
+Holding connection for 6 seconds so you can verify the Player 1 LED...
+```
 
-```fish
-systemctl --user start switch2d     # run now, not at login
+The player LED is solid during that hold and goes dark when the command exits. **That is
+normal**: a Joy-Con only lights its LEDs while a host is connected.
+
+Repeat for the second controller. Useful variants:
+
+```bash
+switch2d pair --player 2                 # force the player number
+switch2d pair AA:BB:CC:DD:EE:01          # skip the scan when you know the address
+```
+
+Re-pairing an already bonded controller keeps its player number, so it is safe to run again if
+something feels wrong.
+
+Check the result:
+
+```bash
+switch2d status
+```
+
+---
+
+## Run it
+
+```bash
+switch2d run
+```
+
+It prints what it is doing, connects to the bonded controllers when they wake, and creates the
+gamepad. Press `Ctrl+C` to stop: virtual devices are removed and the controllers are released.
+
+If you installed with `--service`, the same daemon runs in the background:
+
+```bash
+systemctl --user start switch2d
 systemctl --user stop switch2d
 systemctl --user status switch2d
+journalctl --user -u switch2d -f     # live log
 ```
 
-Enabling at login is optional: without it the daemon runs only while started, which is what you
-want if you prefer not to hold virtual pads open all the time.
+**Run only one copy at a time.** `switch2d run` refuses to start if the service is already
+running, and tells you the pid that owns the adapter.
 
-### Pairing
-
-Turn a controller on and hold its **SYNC** button (the small round one between `SL`/`SR` on
-Joy-Con 2) until the LEDs cycle, then:
-
-```fish
-switch2d pair                       # scan and pair
-switch2d pair --player 2            # force a player number
-switch2d pair XX:XX:XX:XX:XX:XX     # skip the scan when you know the MAC (real address!)
-```
-
-The player LED settles solid while the link is held and goes dark when `pair` exits — that is
-normal: a Joy-Con only shows LEDs while a host is connected. `switch2d run` lights it again.
-If the LEDs keep cycling instead of settling, the pad never accepted the connection: check
-`switch2d doctor` for the privacy unit before retrying.
-
-Re-pairing an already bonded controller keeps its player number.
-
-### Modes
-
-```fish
-switch2d mode combined   # one unified gamepad (default)
-switch2d mode split      # one gamepad per Joy-Con
-```
-
-### Diagnostics
-
-```fish
-switch2d monitor --seconds 30     # live decoded input, one line per report; creates no device
-switch2d advert --seconds 15      # what the pads are advertising, including the host they want
-switch2d selftest                 # create a virtual pad and report what the kernel sees
-switch2d selftest --seconds 8 --drive   # sweep sticks/buttons on a virtual pad
-```
-
-`monitor` is the safe way to check a controller: it creates no virtual device, so it cannot
-disturb the desktop or steal focus. Verbose logging is `switch2d -v <command>` (the flag is also
-accepted after the subcommand).
-
-`selftest` without `--drive` is also safe: it creates a pad, prints what the kernel reports,
-and drives nothing. With `--drive` it moves sticks and presses every button, and **anything
-that maps gamepads will claim that node** — Steam Input will move the mouse or open its
-overlay, antimicrox will act on the presses. Close those first, or skip `--drive`.
+Wake a controller with any button. It connects in a few seconds and its player LED lights up.
 
 ---
 
-## 🔒 LE privacy (required for reconnects)
+## Check that it works
 
-A Switch 2 controller stores the **public** Bluetooth address of the host that paired with it.
-When the kernel runs with LE privacy enabled it initiates connections from a rotating resolvable
-private address, which the pad does not recognise, so it silently ignores the connection: the
-pad advertises, the host times out, forever. With privacy off the pad reconnects normally.
+The safe way, which creates no virtual device and cannot disturb your desktop:
 
-The installed unit turns that policy flag off after every `bluetoothd` start:
-
-```fish
-sudo systemctl status switch2d-disable-le-privacy   # should be active (exited)
-sudo btmgmt -i 0 info | grep "current settings"     # "privacy" must not be listed
+```bash
+switch2d monitor --seconds 30
 ```
 
-**Trade-off, stated honestly:** with LE privacy off the kernel uses the adapter's public address
-toward *every* LE device, so LE peers can recognise this machine across sessions instead of
-seeing a rotating address. `ll-privacy` may stay enabled; only the `privacy` policy flag matters
-here. Revert with `sudo systemctl disable --now switch2d-disable-le-privacy.service` and
-`sudo systemctl restart bluetooth`.
+One line per report, for example:
+
+```text
+[#1234] btn=A,PLUS raw=(1024,2048)(2048,900) cal=(0.00,-0.02)(0.71,0.00) lt=0 rt=255 bat=3820mV 78% acc=(0.01,0.99,0.02)g gyro=(1.2,-0.4,0.0)dps
+[stats] reports=89/s dropped=0 max_gap=12
+```
+
+Sticks should read near `0.00` at rest and reach about `±1.00` at full deflection, buttons
+should appear with their names, and battery should be steady.
+
+To see it as a real gamepad while the daemon runs:
+
+```bash
+evtest            # pick "Nintendo Switch 2 Combined Joy-Cons"
+```
 
 ---
 
-## 🩺 Troubleshooting
+## Playing games
 
-Run `switch2d doctor` first — it checks uinput access, the privacy unit, the adapter, a stale
-user unit, the DSU port, the config file and the udev rule, and prints the fix for anything that
-is wrong.
+Games see an ordinary Linux gamepad. Two notes save time:
 
-| Symptom | Likely cause |
+**Steam** — the controller appears as `Nintendo Switch 2 Combined Joy-Cons`. If the game ignores
+it, check Steam's controller settings, and remember that a `switch2d selftest --drive` run while
+Steam is open will be interpreted as real input.
+
+**Dolphin** — motion comes from `switch2d` over DSU:
+
+1. `switch2d run`
+2. Dolphin → Controller → GameCube Pad → Configure
+3. Set **Motion Source** to `DSU Client` (default address `127.0.0.1:26760`)
+4. The motion calibration screen should react when you move the controller
+
+**Rumble** — driven by standard Linux force feedback. To check it independently of any game:
+
+```bash
+evtest /dev/input/eventN     # the combined node; use the force-feedback section
+```
+
+If the pad buzzes there, rumble works and a silent game is the game not sending effects.
+
+Motion, rumble and the gyro device are implemented but only lightly validated on hardware: if
+something feels inverted or silent, that is worth reporting rather than a misconfiguration.
+
+---
+
+## Two controllers as one, or as two
+
+```bash
+switch2d mode combined     # default: one gamepad, both halves, one player number
+switch2d mode split        # two gamepads, one per Joy-Con (2D/horizontal mapping)
+```
+
+Combined mode lights the same player number on both halves, like a Joy-Con grip. Split mode is
+implemented but has not been validated on hardware as thoroughly as combined mode.
+
+---
+
+## Configuration
+
+`~/.config/switch2d/config.json` holds the paired controllers, the mode and a few timings.
+`switch2d` writes it; you rarely need to edit it. Handy commands:
+
+```bash
+switch2d status
+switch2d mode combined
+switch2d remove AA:BB:CC:DD:EE:01     # forget one controller
+switch2d add AA:BB:CC:DD:EE:01 --name "Joy-Con 2 (Left)" --player 1
+```
+
+The daemon also reads `~/.config/switch2d/led-players.json` if it exists (written by some
+player-LED tools) and lets it override the player number used for the LEDs and DSU slot.
+
+---
+
+## Troubleshooting
+
+Start with `switch2d doctor` — it checks every environment piece and prints the fix.
+
+| Symptom | Cause and fix |
 |---|---|
-| `L2CAP connect failed (... os error 38 ...)` while the pad's LEDs cycle | LE privacy is on: see [LE privacy](#-le-privacy-required-for-reconnects) |
-| `EBUSY` / connect times out only when Steam is running | Steam's own LE scan; the daemon already stops discovery before dialling, but a background scan by another app can still compete |
-| Controller pairs, then LEDs go dark | normal — LEDs only light while a host is connected |
-| Daemon log goes silent while the pad sleeps | expected — press a button to wake the pad; silence is not a hang |
-| `switch2d doctor` warns about the udev rule | install `system/70-switch2d.rules` and run `sudo udevadm control --reload-rules && sudo udevadm trigger` |
-| Game sees the controller but rumble does nothing | check `evtest` first; if rumble works there, the game is not sending `EV_FF` |
+| Connect fails with `os error 38` / `Function not implemented`, pad keeps blinking | LE privacy is blocking reconnects. `switch2d doctor` should show the privacy unit as `PASS`; if not, re-run `./install.sh` |
+| Pad pairs, then LEDs go dark | Expected. LEDs only light while a host is connected |
+| `switch2d run` says another instance is running | The user service is up: `systemctl --user stop switch2d`, or stop `run` with `Ctrl+C` |
+| Nothing happens when pressing buttons | Is the daemon running? Is the controller bonded (`switch2d status`)? Was it paired on this machine? |
+| LEDs never settle during `pair` | Hold SYNC until they cycle, keep the controller close to the adapter, and check `sleep 1; switch2d doctor` for the privacy unit |
+| A game does not see the controller | Close Steam first and check `evtest`; the node is named `Nintendo Switch 2 Combined Joy-Cons` |
+| Rumble does nothing | Check `evtest` first. If it buzzes there, the game is not sending force feedback |
+| `doctor` warns about the udev rule | `./install.sh` again (it installs the rule), then unplug/replug the adapter |
+| `doctor` warns about `nso-gc` units | Leftover from the older Python bridge; run the disable command it prints |
+| `doctor` warns about the DSU port | Another program holds `127.0.0.1:26760`; motion is unavailable, controllers still work |
+| Input feels delayed or drops | `journalctl --user -u switch2d -f` while playing; report the `dropped=` and `max_gap=` numbers |
 
-Logs from the user service:
+Logs are the most useful thing in a bug report:
 
-```fish
-journalctl --user -u switch2d -f
+```bash
+journalctl --user -u switch2d --since "10 min ago"
+switch2d -v run          # verbose, in the foreground
 ```
 
 ---
 
-## ⚠️ Known limitations
+## Known limitations
 
-- **Split mode** is coded but has not been validated on real hardware.
-- **Pro Controller 2** and the **NSO GameCube Controller** are speculative: no hardware evidence.
-- **Motion signs** (accelerometer/gyro axes) are unverified on hardware; if a game's motion feels
-  inverted, that is a known open question rather than a configuration error.
-- The daemon dials a pad only when it sees it advertising. Silence in the log while a controller
-  sleeps is correct behaviour, not a hang.
-
----
-
-## 🤝 Contributing
-
-Contributions, bug reports and pull requests are welcome.
-
-- Direct pushes to `main` are protected; changes come via pull requests and CI.
-- Read [HANDOVER.md](HANDOVER.md) before touching connection logic — it records the
-  reverse-engineering traps that produced the current design.
-- `docs/SUPPORT.md` states what is validated versus speculative. A PR that promotes a controller
-  must include hardware evidence; a test enforces that the table and the code agree.
+- **Pro Controller 2** and the **NSO GameCube Controller** are supported in code but have never
+  been tested on hardware. Treat them as unverified.
+- **Split mode** is implemented but less validated than combined mode.
+- Motion axis signs are not verified against every game; if motion is inverted for you, that is
+  a known open question rather than a setup mistake.
+- The daemon dials a controller only after it wakes; while a controller sleeps, silence in the
+  log is correct behaviour.
 
 ---
 
-## 🙏 Credits & Prior Art
+## Uninstall
 
-An independent ground-up Rust reimplementation building on community reverse-engineering:
-
-- **[trevlars/switch2-controllers-linux](https://github.com/trevlars/switch2-controllers-linux):** Pioneering Linux userspace bridge and system integration work.
-- **Nadeflore/switch2-controllers:** GATT service discovery and packet structure definitions.
-- **ndeadly:** Input report specifications and GameCube trigger analysis.
-- **bitaxislabs:** Switch 2 BLE protocol documentation and packet offsets.
+```bash
+./install.sh --uninstall     # removes udev rule, privacy unit, sudoers rule, user unit
+cargo uninstall switch2d     # removes the binary
+rm -rf ~/.config/switch2d    # optional: forget pairings and settings
+```
 
 ---
 
-## 📜 License
+## Contributing
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+Contributions and bug reports are welcome: direct pushes to `main` are protected, so changes go
+through pull requests and CI. [HANDOVER.md](HANDOVER.md) explains the Bluetooth behaviour that
+shaped this design, and [docs/SUPPORT.md](docs/SUPPORT.md) records which controllers and
+features are verified against real hardware.
+
+---
+
+## Credits
+
+An independent Rust implementation built on community reverse-engineering:
+
+- **[trevlars/switch2-controllers-linux](https://github.com/trevlars/switch2-controllers-linux)** — pioneering Linux userspace bridge
+- **Nadeflore/switch2-controllers** — GATT discovery and packet structures
+- **ndeadly** — input report and GameCube trigger work
+- **bitaxislabs** — Switch 2 BLE protocol notes
+
+## License
+
+[GNU General Public License v3.0](LICENSE)

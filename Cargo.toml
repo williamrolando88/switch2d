@@ -2,6 +2,7 @@
 name = "switch2d"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 authors = ["wmorales"]
 description = "High-performance Linux userspace bridge and virtual gamepad daemon for Nintendo Switch 2 controllers"
 license = "GPL-3.0-or-later"
