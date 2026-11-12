@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::bluetooth::att::{AttClient, ResolvedHandles};
 use crate::bluetooth::l2cap::L2capSocket;
+use crate::profiles::{self, ControllerProfile};
 use crate::protocol::calibration::{
     normalize_gc_trigger, StickCalibration, GC_TRIGGER_DEFAULT_NEUTRAL,
 };
@@ -136,8 +137,11 @@ impl Default for CalibratedInput {
 
 /// Whether a product id exposes true analog L/R triggers (legacy
 /// `protocol.py:54`): only the NSO GameCube pad does.
+///
+/// Kept as a public helper for callers/tests; the answer comes from the
+/// controller profile, not a PID comparison.
 pub fn has_analog_triggers(product_id: u16) -> bool {
-    product_id == NSO_GAMECUBE_PID
+    profiles::profile_or_default(product_id).analog_triggers
 }
 
 /// Pure core of [`SwitchController::calibrated_input`].
@@ -220,6 +224,15 @@ where
 
 /// Total time budget for the LE create-connection (both address types).
 const L2CAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Warn exactly once per process that a PID has no dedicated profile.
+fn warn_unknown_pid_once(pid: u16) {
+    use std::sync::atomic::AtomicBool;
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!("controller pid 0x{pid:04X} has no profile; using generic defaults");
+    }
+}
 
 /// Request the legacy 247-byte MTU and insist it can carry a full report.
 fn negotiate_mtu(att: &AttClient, requested: u16) -> io::Result<u16> {
@@ -582,6 +595,8 @@ pub struct SwitchController {
     pub trigger_neutral: (u8, u8),
     /// True only when the bond sequence ran and all four commands were ACKed.
     pub did_bond: bool,
+    /// Model-specific behaviour, resolved once after identification.
+    profile: &'static ControllerProfile,
     att: AttClient,
     handles: ResolvedHandles,
     cmd_resp_state: Arc<(Mutex<Option<Vec<u8>>>, Condvar)>,
@@ -768,6 +783,9 @@ impl SwitchController {
             right_calib: StickCalibration::default(),
             trigger_neutral: (GC_TRIGGER_DEFAULT_NEUTRAL, GC_TRIGGER_DEFAULT_NEUTRAL),
             did_bond: false,
+            // Replaced with the real profile once the PID is known; the generic
+            // one matches the old "info unknown => no analog triggers" path.
+            profile: profiles::profile_or_default(JOYCON2_LEFT_PID),
             att,
             handles,
             cmd_resp_state,
@@ -784,7 +802,15 @@ impl SwitchController {
             controller_info.name(),
             controller_info.serial_number
         );
-        // 5. Re-resolve with the real PID (vibration UUID is PID-specific).
+        // 5. Resolve the controller profile (single lookup for all model
+        // behaviour) and re-resolve the handles with the real PID.
+        controller.profile = match profiles::profile_for(controller_info.product_id) {
+            Some(profile) => profile,
+            None => {
+                warn_unknown_pid_once(controller_info.product_id);
+                profiles::profile_or_default(controller_info.product_id)
+            }
+        };
         controller.handles = AttClient::resolve_handles(&services, controller_info.product_id);
         controller.info = Some(controller_info);
 
@@ -965,19 +991,20 @@ impl SwitchController {
     /// Per-stick failures are logged and fall back to defaults; this never
     /// returns an error so the session survives.
     fn read_calibration(&mut self) {
+        let addresses = self.profile.calibration;
         self.left_calib = self.read_stick_calibration(
-            CALIBRATION_USER_JOYSTICK_1,
-            CALIBRATION_JOYSTICK_1,
+            addresses.user_left,
+            addresses.factory_left,
             "left",
         );
         self.right_calib = self.read_stick_calibration(
-            CALIBRATION_USER_JOYSTICK_2,
-            CALIBRATION_JOYSTICK_2,
+            addresses.user_right,
+            addresses.factory_right,
             "right",
         );
 
-        if self.info.as_ref().map(|info| info.product_id) == Some(NSO_GAMECUBE_PID) {
-            self.trigger_neutral = self.read_gc_trigger_neutral();
+        if let Some(trigger_address) = addresses.gc_triggers {
+            self.trigger_neutral = self.read_gc_trigger_neutral(trigger_address);
         }
     }
 
@@ -1072,8 +1099,8 @@ impl SwitchController {
         calibration
     }
 
-    fn read_gc_trigger_neutral(&self) -> (u8, u8) {
-        match self.read_memory(2, CALIBRATION_GC_TRIGGERS) {
+    fn read_gc_trigger_neutral(&self, address: u32) -> (u8, u8) {
+        match self.read_memory(2, address) {
             Ok(data) if data.len() >= 2 => {
                 (gc_trigger_neutral(data[0]), gc_trigger_neutral(data[1]))
             }
@@ -1092,8 +1119,7 @@ impl SwitchController {
     }
 
     pub fn set_player_leds(&self, player: u8) -> io::Result<()> {
-        let idx = (player as usize).clamp(1, 8);
-        let pattern = LED_PATTERNS[idx];
+        let pattern = (self.profile.led_pattern)(player);
         let payload = [pattern, 0x00, 0x00, 0x00];
         self.write_command(
             COMMAND_LEDS,
@@ -1180,11 +1206,7 @@ impl SwitchController {
     /// Single source of truth for the conversion described in
     /// `device.py:436-454`; see [`calibrate`] for the per-PID trigger rules.
     pub fn calibrated_input(&self, report: &InputReport) -> CalibratedInput {
-        let analog_triggers = self
-            .info
-            .as_ref()
-            .map(|info| has_analog_triggers(info.product_id))
-            .unwrap_or(false);
+        let analog_triggers = self.profile.analog_triggers;
         calibrate(
             &self.left_calib,
             &self.right_calib,
