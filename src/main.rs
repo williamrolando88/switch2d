@@ -18,7 +18,8 @@ use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
 use switch2d::controller::{BondPolicy, ConnectOptions, DialBudget, SwitchController};
 use switch2d::daemon::Daemon;
 use switch2d::monitor::{
-    advert_line_for, format_report, pair_hold_header, run_monitor, MonitorConfig,
+    advert_dedupe_key, advert_line_for, advert_skip_reason, format_report, pair_hold_header,
+    run_monitor, MonitorConfig,
 };
 use switch2d::protocol::constants::*;
 use switch2d::protocol::report::InputReport;
@@ -591,17 +592,32 @@ async fn run_advert(seconds: u64, all: bool) -> Result<(), Box<dyn std::error::E
 
             match source.snapshot() {
                 Ok(items) => {
-                    for item in items.iter().filter(|item| item.is_live()) {
+                    for item in &items {
+                        // `advert` uses data-presence liveness, not the hub's
+                        // RSSI-only rule: BlueZ drops RSSI when its monitor
+                        // window closes but keeps the cached block.
+                        if let Some(reason) = advert_skip_reason(item) {
+                            tracing::debug!(
+                                "advert skip {}: {reason}",
+                                item.address
+                            );
+                            continue;
+                        }
                         if !all && item.advert.is_none() {
+                            tracing::debug!(
+                                "advert skip {}: not a Nintendo advert (use --all)",
+                                item.address
+                            );
                             continue;
                         }
                         let line = advert_line_for(item);
-                        // Print only when this MAC's line changed since the
-                        // last poll (BlueZ caches properties, so an unchanged
-                        // snapshot must stay quiet).
-                        if printed.get(&item.address) != Some(&line) {
+                        // Key includes the address type so a public->random flip
+                        // is printed again. BlueZ caches properties, so an
+                        // unchanged entry stays quiet.
+                        let key = advert_dedupe_key(item);
+                        if printed.get(&key) != Some(&line) {
                             println!("{line}");
-                            printed.insert(item.address.clone(), line);
+                            printed.insert(key, line);
                             printed_total += 1;
                         }
                     }

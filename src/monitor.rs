@@ -72,6 +72,39 @@ pub fn advert_line_for(item: &AdvertSnapshot) -> String {
     line
 }
 
+/// Liveness rule for `switch2d advert` (deliberately **not** the hub's).
+///
+/// BlueZ clears the `RSSI` property when its own advertisement-monitor window
+/// closes, but keeps the cached `ManufacturerData` precisely because it saw it.
+/// For a diagnostic view, data presence is therefore a better "this pad is
+/// here" signal than RSSI. Returns `None` when the entry should be printed, or
+/// a human-readable reason when it should be skipped.
+///
+/// The hub keeps using RSSI-only liveness ([`DeviceAdvert::is_live`]): cached
+/// properties must not re-arm a dial.
+///
+/// [`DeviceAdvert::is_live`]: crate::bluetooth::scan::DeviceAdvert::is_live
+pub fn advert_skip_reason(item: &AdvertSnapshot) -> Option<&'static str> {
+    let has_data = item.manufacturer_data.is_some();
+    let has_rssi = matches!(item.rssi, Some(rssi) if rssi > -127);
+    if has_data || has_rssi || item.connected {
+        None
+    } else {
+        Some("no manufacturer data, no live rssi, not connected")
+    }
+}
+
+/// Dedupe key for `switch2d advert`: MAC plus address type, so a pad that flips
+/// `public` -> `random` is printed again instead of being swallowed as
+/// "unchanged".
+pub fn advert_dedupe_key(item: &AdvertSnapshot) -> String {
+    format!(
+        "{}|{}",
+        item.address,
+        item.address_type.as_deref().unwrap_or("")
+    )
+}
+
 /// Bonded-host field in display order, or a state word.
 fn host_field(host: &crate::protocol::advert::HostBinding) -> String {
     use crate::protocol::advert::HostBinding;
@@ -557,5 +590,71 @@ mod tests {
             header.contains("switch2d monitor"),
             "points at the same view"
         );
+    }
+
+    #[test]
+    fn advert_prints_snapshot_with_md_but_no_rssi() {
+        let mut item = snapshot(
+            crate::protocol::advert::HostBinding::Host([0x1E, 0xD6, 0x41, 0x59, 0x17, 0x8C]),
+            Some("Joy-Con 2 (Left)"),
+        );
+        // BlueZ dropped RSSI when its adv-monitor window closed.
+        item.rssi = None;
+
+        assert_eq!(
+            advert_skip_reason(&item),
+            None,
+            "cached manufacturer data is enough to print"
+        );
+        let line = advert_line_for(&item);
+        assert!(line.contains("rssi=?"), "{line}");
+        assert!(
+            line.contains("md=0000007e0567200000001ed64159178c"),
+            "{line}"
+        );
+        assert!(line.contains("host=8C:17:59:41:D6:1E"), "{line}");
+    }
+
+    #[test]
+    fn advert_skip_reason_explains_empty_entries() {
+        let mut item = snapshot(crate::protocol::advert::HostBinding::Pairing, None);
+
+        // Nothing at all: skipped, with a reason naming all three signals.
+        item.manufacturer_data = None;
+        item.rssi = None;
+        item.connected = false;
+        let reason = advert_skip_reason(&item).expect("no data => skipped");
+        assert!(reason.contains("manufacturer data"), "{reason}");
+        assert!(reason.contains("rssi"), "{reason}");
+        assert!(reason.contains("connected"), "{reason}");
+
+        // The -127 sentinel is not liveness.
+        item.rssi = Some(-127);
+        assert!(advert_skip_reason(&item).is_some());
+
+        // A real RSSI is.
+        item.rssi = Some(-100);
+        assert_eq!(advert_skip_reason(&item), None);
+
+        // So is being connected, even without RSSI or a block.
+        item.rssi = None;
+        item.connected = true;
+        assert_eq!(advert_skip_reason(&item), None);
+    }
+
+    #[test]
+    fn advert_dedupe_key_includes_address_type() {
+        let mut public = snapshot(crate::protocol::advert::HostBinding::Pairing, None);
+        public.address = "BC:89:A6:45:83:CC".to_string();
+        public.address_type = Some("public".to_string());
+
+        let mut random = public.clone();
+        random.address_type = Some("random".to_string());
+
+        assert_ne!(advert_dedupe_key(&public), advert_dedupe_key(&random));
+        assert_eq!(advert_dedupe_key(&public), "BC:89:A6:45:83:CC|public");
+
+        // The printed line changes too, so even line-based dedupe would reprint.
+        assert_ne!(advert_line_for(&public), advert_line_for(&random));
     }
 }
