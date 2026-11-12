@@ -161,24 +161,51 @@ command -v evtest; or sudo dnf install evtest   # or apt/pacman equivalent
 cargo build --release
 ```
 
-### Test A — virtual gamepad, no controller needed
+### Test A — live input from a real controller (start here: creates no device)
 
 ```fish
-cargo run --release -- selftest --seconds 8
+cargo run --release -- monitor --seconds 60
 ```
 
-In a second terminal, run the `evtest` command the tool prints:
+**This is the safe first test.** It creates no virtual device, so it cannot touch the desktop,
+steal focus or move the pointer. It connects to a bonded controller and prints one line per
+report:
+
+```text
+[#1234] btn=A,PLUS raw=(1024,2048)(2048,900) cal=(0.00,-0.02)(0.71,0.00) lt=0 rt=255 bat=3820mV 78% acc=(0.01,0.99,0.02)g gyro=(1.2,-0.4,0.0)dps
+```
+
+and one `[stats] reports=<n>/s dropped=<n> max_gap=<ms>` line per second.
+
+**What actually matters here:**
+
+1. **Sticks at rest** must read near `0.00` and reach roughly `±1.00` at full deflection. If full
+   deflection only reaches ~`0.36`, that is the known inherited calibration defect described
+   below — record the exact numbers, they are the evidence needed to fix it.
+2. **Each button** must light up exactly once, with the correct name. Press one at a time and
+   note any that are missing, doubled or swapped. `L`/`R` are digital, `ZL`/`ZR` analog.
+3. **Accel** at rest should be ~`1.0 g` on one axis; **gyro** near `0` when still and reacting
+   when rotated. Signs are unverified — note which direction gives positive values.
+4. **Battery** within a few tens of mV of reality and not jittering.
+
+### Test B — virtual gamepad, no controller needed
 
 ```fish
-evtest /dev/input/eventN
+cargo run --release -- selftest          # passive: describes the node, drives nothing
 ```
 
-**Expected:** the tool announces the node path, name, `phys=ngc/AA:BB:CC:DD:EE:FF`, input id
-(`bus 0x0005`, `vendor 0x057E`, `product 0x2069`), and every ABS axis with its min/max. `evtest`
-should then stream stick, trigger and button events as they sweep. The node disappears on exit.
+It prints the node path, name, `phys=ngc/AA:BB:CC:DD:EE:FF`, input id and every ABS range —
+all read back from the kernel, not from our own request. With `evtest` running beside it you
+can confirm the node exists. Press Ctrl-C to release it.
 
-**Record:** the printed node path, the input id line, and the ABS ranges verbatim — those are the
-values Steam and udev rules depend on.
+**Only if you need to see motion**, and **only with Steam Input / antimicrox closed**:
+
+```fish
+cargo run --release -- selftest --seconds 8 --drive
+```
+
+That sweeps sticks, triggers and all 15 buttons. It is opt-in for a reason: anything on the
+desktop that maps gamepads will claim the node and start acting on those events.
 
 ### Test B — pair the Joy-Con 2 pair
 
@@ -200,28 +227,7 @@ player 2 in pairing order, not by left/right. Use `--player N` to force it.
 
 **Failure worth reporting:** `EBUSY`, timeouts, `Bonding NOT confirmed!`, or LEDs never settling.
 
-### Test C — live input from a real controller
-
-```fish
-cargo run --release -- monitor --seconds 30
-```
-
-**Expected**, once per report: sequence number, battery in mV and %, pressed button names, both
-raw stick values, both calibrated sticks in −1.0..1.0, trigger values, accelerometer (g) and
-gyroscope (deg/s), and a per-second line with reports/second.
-
-**What actually matters here:**
-
-1. **Sticks at rest** must read near `0.00` / `0.00` and reach roughly `±1.00` at full deflection.
-   If full deflection only reaches ~`0.36`, that is the known inherited calibration defect
-   described below — record the exact numbers, they are the evidence needed to fix it.
-2. **Each button** must light up exactly once, with the correct name. Press one at a time and
-   note any that are missing, doubled, or swapped.
-3. **Accel** at rest should be ~`1.0 g` on one axis; **gyro** should stay near `0` when still and
-   respond when rotated. Signs are unverified — note which way the values move.
-4. **Battery** should be within a few tens of mV of reality and not jitter.
-
-### Test D — the daemon as it runs today
+### Test C — the daemon as it runs today
 
 ```fish
 cargo run --release -- run
@@ -257,7 +263,7 @@ Attach `~/.config/switch2d/config.json` and, for crashes, the full backtrace
 - **Stick range under-scales with real calibration** (~0.36 at full deflection when the pad
   reports a calibration max near 3200). Both the Python original and this port divide by the
   absolute calibration maximum instead of the centre-relative delta. Faithful, but wrong; a fix
-  needs pad measurements, so the numbers from Test C matter 2 are what unblocks it.
+  needs pad measurements, so the numbers from Test A step 1 are what unblocks it.
 - **First connect may take a few seconds** while the handshake, MTU negotiation and calibration
   read complete. Up to ~4 s is normal; a repeat of `EBUSY` is not.
 - **`btmgmt stop-find` requires the sudoers rule** shipped with the project
