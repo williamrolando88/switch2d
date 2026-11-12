@@ -40,12 +40,12 @@ Last updated: after round 4 hardware sessions (build `ce84d69`).
 | Analog triggers | — (Joy-Con 2 has none) | 🧪 (digital ZL/ZR) | 🧪 (analog branch, never run) |
 | Battery mV / % | ✅ stable to ~7 mV | 🧪 | 🧪 |
 | IMU decode (accel/gyro) | ✅ values stream and respond | 🧪 | 🧪 |
-| IMU evdev node | — not wired yet (module exists) | — | — |
-| HD rumble (60 Hz stream) | — coded, not wired to FF | — | — |
-| Preset rumble | — | — | — coded, not wired |
-| DSU motion output | — coded, not wired | — | — |
-| Combined mode | 🔬 no hardware result yet (round 5) | — | — |
-| Split mode | — untested | — | — |
+| IMU evdev node | 🧪 coded (`src/uinput/motion.rs`), not wired into the daemon yet | 🧪 | 🧪 |
+| HD rumble (60 Hz stream) | 🧪 coded, not wired to force-feedback | 🧪 | 🧪 |
+| Preset rumble | — | — | 🧪 coded, not wired |
+| DSU motion output | 🧪 coded, not wired | 🧪 | 🧪 |
+| Combined mode | 🧪 implemented, round 5 hardware validation pending | — | — |
+| Split mode | 🧪 coded, not hardware-validated | — | — |
 
 ## What "speculative" means for you as a user
 
@@ -56,18 +56,21 @@ with "we have no hardware evidence for that path".
 
 ## How the code keeps this honest
 
-Each controller gets a *profile* module (`src/profiles/`) that owns every model-specific
-fact: product id, vibration characteristic UUID, rumble packet layout, trigger style,
-calibration addresses and LED patterns. The generic connection, ATT, report-decoding and
-uinput code does not contain `match pid { … }` branches; it asks the profile.
+Each controller has a profile module under `src/profiles/` that owns every
+model-specific fact: product id, display name, vibration characteristic UUID, rumble
+layout, trigger style, calibration addresses, LED patterns and the `Support` status.
+The generic connection, ATT, report-decoding and uinput code asks the profile instead
+of branching on the PID.
 
-That is deliberate: a contributor with a GameCube pad can work inside
-`src/profiles/gamecube.rs` and its tests, flip its status row here, and cannot regress
-the validated Joy-Con 2 path.
+That is deliberate: a contributor with a new pad can work inside its profile module and
+tests, flip its status there and in this table, and cannot regress the validated
+Joy-Con 2 path. `tests/support_matrix.rs` fails if the profile status and this table
+disagree.
 
 ## Promoting a row from 🧪 to ✅
 
 1. Run the round's plan (at minimum: pair, hold-session decode, wake reconnect).
 2. Add a `TEST_RESULTS_*.md` with raw logs, as in rounds 1–4.
-3. Update this table and the README hardware table in the same commit as the profile's
-   status constant, so documentation and code cannot drift.
+3. Update this table and the README hardware table in the same commit as the controller's
+   status change (the relevant per-model constants/profile), so documentation and code
+   cannot drift. `tests/support_matrix.rs` fails if this table drifts from the code.
