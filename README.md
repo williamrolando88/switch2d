@@ -115,7 +115,7 @@ Joy-Con 2) until the LEDs cycle, then:
 ```fish
 switch2d pair                       # scan and pair
 switch2d pair --player 2            # force a player number
-switch2d pair AA:BB:CC:DD:EE:01     # skip the scan when you know the MAC
+switch2d pair XX:XX:XX:XX:XX:XX     # skip the scan when you know the MAC (real address!)
 ```
 
 The player LED settles solid while the link is held and goes dark when `pair` exits — that is
