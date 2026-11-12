@@ -126,6 +126,146 @@ journalctl --user -u switch2d -f
 
 ---
 
+## 🧪 Hardware Validation Guide
+
+This section is written for whoever is testing a **real controller** (human or assisting agent).
+It describes what a given build can do, the exact commands to run, what correct output looks
+like, and what to write down when it is not.
+
+### Current build status
+
+| Capability | State | Notes |
+|---|---|---|
+| Virtual gamepad node (`/dev/input/eventN`, `phys=ngc/<MAC>`) | **implemented** | buttons, both sticks, triggers, hats |
+| BLE handshake, bonding, player LED | **implemented** | verify with `pair` |
+| Input report decode, battery, stick calibration | **implemented** | verify with `monitor` |
+| Split mode / combined mode | **implemented** | combined = one node, split = one node per Joy-Con |
+| HD rumble packets | coded, **not wired** to force-feedback yet | `EV_FF` in a game does nothing yet |
+| GameCube preset rumble | coded, **not wired** yet | requires a GC pad to test |
+| DSU / cemuhook motion out | coded, **not wired** into the daemon yet | Dolphin will see nothing yet |
+| Separate IMU gyro node | **not implemented** | motion is only decoded and printed by `monitor` |
+
+Do **not** report the last four rows as bugs — they are known, planned work. Everything above
+them is in scope and worth a report if it misbehaves.
+
+### Preconditions
+
+```fish
+# /dev/uinput must be writable by your user (crw-rw----+ ... 10, 223)
+test -w /dev/uinput; and echo "uinput OK"
+
+# evtest is the ground truth for what the kernel receives
+command -v evtest; or sudo dnf install evtest   # or apt/pacman equivalent
+
+# Build the current tree
+cargo build --release
+```
+
+### Test A — virtual gamepad, no controller needed
+
+```fish
+cargo run --release -- selftest --seconds 8
+```
+
+In a second terminal, run the `evtest` command the tool prints:
+
+```fish
+evtest /dev/input/eventN
+```
+
+**Expected:** the tool announces the node path, name, `phys=ngc/AA:BB:CC:DD:EE:FF`, input id
+(`bus 0x0005`, `vendor 0x057E`, `product 0x2069`), and every ABS axis with its min/max. `evtest`
+should then stream stick, trigger and button events as they sweep. The node disappears on exit.
+
+**Record:** the printed node path, the input id line, and the ABS ranges verbatim — those are the
+values Steam and udev rules depend on.
+
+### Test B — pair the Joy-Con 2 pair
+
+Turn both controllers on. On each one, hold the **SYNC** button (the small round one between
+`SL`/`SR` on Joy-Con 2) until its LEDs cycle back and forth.
+
+```fish
+# one controller at a time; the scan window is 10 s
+cargo run --release -- pair
+cargo run --release -- pair
+```
+
+**Expected:** `Found Switch 2 controller: <MAC>`, then `✅ Controller Successfully Paired & Bonded!`,
+and the controller's player LED settles solid on Player 1 for the first and Player 2 for the second.
+`switch2d status` lists both.
+
+**Known-good but surprising:** the first Joy-Con usually ends up on player 1 and the second on
+player 2 in pairing order, not by left/right. Use `--player N` to force it.
+
+**Failure worth reporting:** `EBUSY`, timeouts, `Bonding NOT confirmed!`, or LEDs never settling.
+
+### Test C — live input from a real controller
+
+```fish
+cargo run --release -- monitor --seconds 30
+```
+
+**Expected**, once per report: sequence number, battery in mV and %, pressed button names, both
+raw stick values, both calibrated sticks in −1.0..1.0, trigger values, accelerometer (g) and
+gyroscope (deg/s), and a per-second line with reports/second.
+
+**What actually matters here:**
+
+1. **Sticks at rest** must read near `0.00` / `0.00` and reach roughly `±1.00` at full deflection.
+   If full deflection only reaches ~`0.36`, that is the known inherited calibration defect
+   described below — record the exact numbers, they are the evidence needed to fix it.
+2. **Each button** must light up exactly once, with the correct name. Press one at a time and
+   note any that are missing, doubled, or swapped.
+3. **Accel** at rest should be ~`1.0 g` on one axis; **gyro** should stay near `0` when still and
+   respond when rotated. Signs are unverified — note which way the values move.
+4. **Battery** should be within a few tens of mV of reality and not jitter.
+
+### Test D — the daemon as it runs today
+
+```fish
+cargo run --release -- run
+```
+
+**Expected:** it connects to the bonded controllers, creates the virtual node(s), and input works
+in Steam or in `evtest` while the daemon holds the node.
+
+**Known:** rumble, DSU and the IMU node are not wired yet; combined-mode regressions are the most
+likely thing to find here, because that path has been rewritten most.
+
+### Recording findings
+
+Copy this block for every finding and keep the raw output — paraphrased logs are not usable:
+
+```text
+FINDING
+  severity: blocks-testing | wrong-behaviour | cosmetic
+  build:    <git rev-parse --short HEAD>
+  controller: model + MAC (from `switch2d status`)
+  command:  <exact command line>
+  expected: <what the guide above says should happen>
+  actual:   <paste the full output, not a summary>
+  extra:    lsusb/bluetoothctl info <MAC>, `evtest` output, dmesg | tail -20 if the kernel is involved
+  reproducible: always | once | after N minutes
+```
+
+Attach `~/.config/switch2d/config.json` and, for crashes, the full backtrace
+(`RUST_BACKTRACE=1`). Send findings to the project lead; they are triaged into the task list.
+
+### Known defects that are not new bugs
+
+- **Stick range under-scales with real calibration** (~0.36 at full deflection when the pad
+  reports a calibration max near 3200). Both the Python original and this port divide by the
+  absolute calibration maximum instead of the centre-relative delta. Faithful, but wrong; a fix
+  needs pad measurements, so the numbers from Test C matter 2 are what unblocks it.
+- **First connect may take a few seconds** while the handshake, MTU negotiation and calibration
+  read complete. Up to ~4 s is normal; a repeat of `EBUSY` is not.
+- **`btmgmt stop-find` requires the sudoers rule** shipped with the project
+  (`/etc/sudoers.d/nso-gc-btmgmt`). Without it the daemon warns and continues, which can make a
+  reconnect slower but should not make it fail.
+
+---
+
 ## 🤝 Contributing & Pull Requests
 
 Contributions, bug reports, and pull requests are welcome!
