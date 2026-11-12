@@ -126,8 +126,8 @@ pub enum AdapterProbe {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigProbe {
-    /// No config file at the canonical path; the count came from legacy import.
-    Missing(usize),
+    /// No config file at the canonical path.
+    Missing,
     Loaded(usize),
     Error(String),
 }
@@ -138,7 +138,8 @@ trait SystemProbes {
     fn privacy_unit(&self) -> SystemdUnit;
     fn adapter(&self) -> AdapterProbe;
     fn other_switch2d_pids(&self) -> Result<Vec<u32>, String>;
-    fn legacy_user_unit(&self) -> Result<SystemdUnit, String>;
+    fn user_unit_status(&self) -> Result<SystemdUnit, String>;
+    fn user_unit_text(&self) -> Result<String, String>;
     fn dsu_port_bound(&self) -> Result<bool, String>;
     fn config(&self) -> ConfigProbe;
     fn udev_rule(&self) -> Option<PathBuf>;
@@ -214,13 +215,28 @@ impl SystemProbes for RealProbes {
             .collect())
     }
 
-    fn legacy_user_unit(&self) -> Result<SystemdUnit, String> {
+    fn user_unit_status(&self) -> Result<SystemdUnit, String> {
         let enabled = systemctl_field("is-enabled", "switch2d.service", true)?;
         let active = systemctl_field("is-active", "switch2d.service", true)?;
         Ok(SystemdUnit {
             enabled: parse_enabled(&enabled),
             active: parse_active(&active),
         })
+    }
+
+    fn user_unit_text(&self) -> Result<String, String> {
+        let output = Command::new("systemctl")
+            .args(["--user", "cat", "switch2d.service"])
+            .output()
+            .map_err(|err| format!("systemctl --user cat: {err}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "systemctl --user cat switch2d.service exited with {}: {}",
+                output.status, stderr
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     fn dsu_port_bound(&self) -> Result<bool, String> {
@@ -232,14 +248,12 @@ impl SystemProbes for RealProbes {
     }
 
     fn config(&self) -> ConfigProbe {
-        // The task wants the real loader's view; `load` also handles legacy
-        // migration. Parsing the canonical file separately makes a malformed
-        // JSON file an explicit FAIL instead of a silent default.
-        let loaded = DaemonConfig::load();
-        let count = loaded.controllers.len();
+        // The startup path already called DaemonConfig::load once. Parse the
+        // canonical file directly here so doctor neither logs a second load
+        // nor hides malformed JSON behind the loader's defaults.
         let path = DaemonConfig::config_path();
         if !path.exists() {
-            return ConfigProbe::Missing(count);
+            return ConfigProbe::Missing;
         }
         match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<DaemonConfig>(&text) {
@@ -390,7 +404,7 @@ fn evaluate(probes: &dyn SystemProbes) -> Vec<CheckResult> {
         check_privacy_unit(probes),
         check_adapter(probes),
         check_other_instances(probes),
-        check_legacy_unit(probes),
+        check_user_unit(probes),
         check_dsu_port(probes),
         check_config(probes),
         check_udev_rule(probes),
@@ -468,7 +482,11 @@ fn check_adapter(probes: &dyn SystemProbes) -> CheckResult {
                 };
             };
             let label = adapter.name.clone().unwrap_or_else(|| adapter.path.clone());
-            let detail = format!("{} ({})", label, adapter.address);
+            let detail = format!(
+                "{} ({}) [MAC partially redacted]",
+                label,
+                redact_mac(&adapter.address)
+            );
             if adapter.le == Some(false) {
                 CheckResult {
                     name: "bluetooth adapter",
@@ -526,32 +544,92 @@ fn check_other_instances(probes: &dyn SystemProbes) -> CheckResult {
     }
 }
 
-fn check_legacy_unit(probes: &dyn SystemProbes) -> CheckResult {
-    match probes.legacy_user_unit() {
-        Ok(unit)
-            if unit.enabled == UnitEnabled::Enabled && unit.active == UnitActive::Active =>
-        {
-            CheckResult {
-                name: "legacy user unit",
-                status: Status::Warn,
-                detail: format!("switch2d.service: {}", unit.detail()),
-                remedy: "systemctl --user disable --now switch2d.service (the old unit competes for the adapter)"
+/// Show the OUI and last two octets only, e.g. `8C:17:..:D6:1E`.
+fn redact_mac(mac: &str) -> String {
+    let parts: Vec<&str> = mac.split(':').collect();
+    if parts.len() == 6 {
+        format!("{}:{}:..:{}:{}", parts[0], parts[1], parts[4], parts[5])
+    } else {
+        "<redacted>".to_string()
+    }
+}
+
+/// First command word of the first `ExecStart=` line, with `%h`/`%u` expanded.
+fn exec_start_path(unit_text: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user = std::env::var("USER").unwrap_or_default();
+    for line in unit_text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("ExecStart=") else {
+            continue;
+        };
+        let command = rest.trim().split_whitespace().next()?;
+        let command = command.strip_prefix('-').unwrap_or(command);
+        let expanded = command.replace("%h", &home).replace("%u", &user);
+        return Some(PathBuf::from(expanded));
+    }
+    None
+}
+
+fn check_user_unit(probes: &dyn SystemProbes) -> CheckResult {
+    let status = match probes.user_unit_status() {
+        Ok(status) => status,
+        Err(err) => {
+            return CheckResult {
+                name: "user unit",
+                status: Status::Skip,
+                detail: format!("could not query switch2d.service: {err}"),
+                remedy: "run `systemctl --user status switch2d.service` as the logged-in user"
                     .to_string(),
-            }
+            };
         }
-        Ok(unit) => CheckResult {
-            name: "legacy user unit",
-            status: Status::Pass,
-            detail: format!("switch2d.service: {}", unit.detail()),
-            remedy: String::new(),
-        },
-        Err(err) => CheckResult {
-            name: "legacy user unit",
-            status: Status::Skip,
-            detail: format!("could not query --user systemd: {err}"),
-            remedy: "run `systemctl --user status switch2d.service` as the logged-in user"
-                .to_string(),
-        },
+    };
+    let text = match probes.user_unit_text() {
+        Ok(text) => text,
+        Err(err) => {
+            return CheckResult {
+                name: "user unit",
+                status: Status::Skip,
+                detail: format!("could not read switch2d.service: {err}"),
+                remedy: "run `systemctl --user cat switch2d.service` as the logged-in user"
+                    .to_string(),
+            };
+        }
+    };
+
+    let mut reasons = Vec::new();
+    if status.active == UnitActive::Active {
+        reasons.push("unit is active".to_string());
+    }
+
+    match exec_start_path(&text) {
+        Some(path) if !path.exists() => reasons.push(format!(
+            "ExecStart path {} does not exist (stale install)",
+            path.display()
+        )),
+        Some(path) => {
+            if reasons.is_empty() {
+                return CheckResult {
+                    name: "user unit",
+                    status: Status::Pass,
+                    detail: format!(
+                        "switch2d.service inactive; ExecStart path {} exists",
+                        path.display()
+                    ),
+                    remedy: String::new(),
+                };
+            }
+            reasons.push(format!("ExecStart path {} exists", path.display()));
+        }
+        None => reasons.push("no ExecStart= line".to_string()),
+    }
+
+    CheckResult {
+        name: "user unit",
+        status: Status::Warn,
+        detail: format!("switch2d.service: {}", reasons.join("; ")),
+        remedy: "systemctl --user daemon-reload and update/stop switch2d.service so it points at the installed binary"
+            .to_string(),
     }
 }
 
@@ -588,11 +666,11 @@ fn check_config(probes: &dyn SystemProbes) -> CheckResult {
             detail: format!("{} parsed; {count} bonded controller(s)", path.display()),
             remedy: String::new(),
         },
-        ConfigProbe::Missing(count) => CheckResult {
+        ConfigProbe::Missing => CheckResult {
             name: "config",
             status: Status::Pass,
             detail: format!(
-                "no config at {}; {count} bonded controller(s) loaded from a legacy location",
+                "no config file at {} (0 bonded controllers)",
                 path.display()
             ),
             remedy: String::new(),
@@ -668,6 +746,8 @@ mod tests {
 
     struct FakeProbes {
         privacy: SystemdUnit,
+        user_unit: SystemdUnit,
+        user_unit_text: Result<String, String>,
     }
 
     impl Default for FakeProbes {
@@ -677,6 +757,11 @@ mod tests {
                     enabled: UnitEnabled::Enabled,
                     active: UnitActive::Active,
                 },
+                user_unit: SystemdUnit {
+                    enabled: UnitEnabled::Disabled,
+                    active: UnitActive::Inactive,
+                },
+                user_unit_text: Ok("[Service]\nExecStart=/bin/sh run\n".to_string()),
             }
         }
     }
@@ -703,11 +788,12 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn legacy_user_unit(&self) -> Result<SystemdUnit, String> {
-            Ok(SystemdUnit {
-                enabled: UnitEnabled::Disabled,
-                active: UnitActive::Inactive,
-            })
+        fn user_unit_status(&self) -> Result<SystemdUnit, String> {
+            Ok(self.user_unit.clone())
+        }
+
+        fn user_unit_text(&self) -> Result<String, String> {
+            self.user_unit_text.clone()
         }
 
         fn dsu_port_bound(&self) -> Result<bool, String> {
@@ -715,7 +801,7 @@ mod tests {
         }
 
         fn config(&self) -> ConfigProbe {
-            ConfigProbe::Missing(0)
+            ConfigProbe::Missing
         }
 
         fn udev_rule(&self) -> Option<PathBuf> {
@@ -802,6 +888,7 @@ mod tests {
                 enabled: UnitEnabled::NotFound,
                 active: UnitActive::Unknown("unknown".to_string()),
             },
+            ..FakeProbes::default()
         };
         let checks = evaluate(&probes);
         let privacy = check_named(&checks, "le-privacy unit");
@@ -822,6 +909,54 @@ mod tests {
             .remedy
             .contains("enable --now switch2d-disable-le-privacy.service"));
         assert_eq!(exit_code(&checks), 1);
+    }
+
+    #[test]
+    fn mac_display_is_partially_redacted() {
+        assert_eq!(redact_mac("8C:17:59:41:D6:1E"), "8C:17:..:D6:1E");
+        assert_eq!(redact_mac("not-a-mac"), "<redacted>");
+    }
+
+    #[test]
+    fn active_user_unit_warns() {
+        let probes = FakeProbes {
+            user_unit: SystemdUnit {
+                enabled: UnitEnabled::Enabled,
+                active: UnitActive::Active,
+            },
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let unit = check_named(&checks, "user unit");
+        assert_eq!(unit.status, Status::Warn);
+        assert!(unit.detail.contains("unit is active"), "{}", unit.detail);
+    }
+
+    #[test]
+    fn stale_exec_start_warns() {
+        let probes = FakeProbes {
+            user_unit_text: Ok(
+                "[Service]\nExecStart=/definitely/missing/switch2d run\n".to_string()
+            ),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let unit = check_named(&checks, "user unit");
+        assert_eq!(unit.status, Status::Warn);
+        assert!(
+            unit.detail.contains("does not exist (stale install)"),
+            "{}",
+            unit.detail
+        );
+    }
+
+    #[test]
+    fn correct_user_unit_passes() {
+        let probes = FakeProbes::default();
+        let checks = evaluate(&probes);
+        let unit = check_named(&checks, "user unit");
+        assert_eq!(unit.status, Status::Pass);
+        assert!(unit.detail.contains("ExecStart path /bin/sh exists"));
     }
 
     #[test]
