@@ -1030,3 +1030,108 @@ Other close points for completeness:
 * `_ensure_gamepad` — closes and recreates the pad/IMU pair when the PID changed.
 * `_hd_worker` — stopped by `close()`/`_on_disconnect` via `_hd_run=False` + `_hd_dirty.set()`;
   no join call anywhere (daemon thread, may emit one last packet).
+
+### 8.4 `play_vibration_preset` — exact bytes, and whether it is awaited
+
+`device.py:311`: `write_command(COMMAND_VIBRATION=0x0A, SUBCOMMAND_VIBRATION_PLAY_PRESET=0x02,
+preset_id.to_bytes().ljust(4, b"\x00"))`.
+
+`preset_id.to_bytes()` with no arguments is `int.to_bytes(length=1, byteorder='big')`, then
+right-padded with zeros to **4 bytes**. There are **no** leading pad/echo bytes inside the
+data; the only length field is the protocol header's `len` byte.
+
+| Preset | Data (after the 8-byte header) | Full PDU |
+| --- | --- | --- |
+| `0x03` soft | `03 00 00 00` | `0a 91 01 02 00 04 00 00 03 00 00 00` |
+| `0x02` strong | `02 00 00 00` | `0a 91 01 02 00 04 00 00 02 00 00 00` |
+| `0x01` medium (unused by the GC path) | `01 00 00 00` | `0a 91 01 02 00 04 00 00 01 00 00 00` |
+
+Compare: player LED `09 91 01 07 00 04 00 00 01 00 00 00`; HCI sleep
+`01 91 01 06 00 04 00 00 00 00 00 00`.
+
+**Awaited, at the protocol level.** The write itself is an ATT Write Command (0x52,
+unacknowledged at the ATT layer), but `SwitchController.write_command` then blocks on
+`_cmd_event` for up to **2.0 s** while `_cmd_lock` is held, waiting for the notification on
+the command-response characteristic (`h_cmd_resp`, GC default `0x001A`), and validates
+`resp[0] == 0x0A && resp[1] == 0x01`, returning `resp[8:]`. So each preset costs one
+round-trip and **serialises with every other command** (memory reads, LED writes, bond,
+sleep) on that mutex.
+
+Consequences worth speccing:
+
+* `initialize()` always fires one *soft* preset at every connect
+  (`_retry("vibration test", …GC_VIBRATION_PRESET_SOFT…)`) for **all** PIDs, independent of
+  `config.enable_rumble`.
+* The GC rumble path calls it **without** try/except; a timeout/ATT error propagates out of
+  `set_rumble()` into `bridge._Worker._on_rumble`'s `try/except` (debug log) — i.e. that
+  retrigger is silently dropped, and `_last_rumble_ts` has already been updated.
+* A non-ACKing pad can therefore stall the FF thread for 2 s per retrigger (and the state
+  thread for 2 s per LED write) because they share `_cmd_lock`.
+
+### 8.5 Preset lifetime and GC retrigger semantics
+
+* A preset is **not** sustained by the host and there is **no stop command**: the only
+  vibration subcommand in the protocol module is `PLAY_PRESET 0x02`. The controller plays a
+  finite built-in clip; "holding" rumble is emulated by re-issuing the same preset.
+* **On release the GC path sends nothing.** `set_rumble()` GC branch:
+  update `_last_rumble_mag`, and `if magnitude <= GC_LIGHT_THRESHOLD (0.06): return` — no
+  stop packet, no zero command, no ATT traffic. The last-started clip simply finishes on
+  the pad.
+* **The 0.22 s retrigger is wall-clock gated but event-driven**, not input-frame driven:
+  the interval is only evaluated when `set_rumble()` is entered, which happens only on an
+  `EV_FF` play event from the uinput FF layer (`_on_rumble`). `set_rumble` has exactly one
+  caller (`bridge.py:533`); there is no timer thread and no per-frame hook. So while a
+  client holds rumble without re-issuing `EV_FF`, the pad goes quiet after the clip ends.
+  `_last_rumble_ts` starts at `0.0`, and the rising-edge branch bypasses the interval check.
+* A magnitude **change while held** does not take effect immediately: the non-rising branch
+  only fires once `now - _last_rumble_ts >= 0.22`, so a harder hit mid-hold can be delayed up
+  to 220 ms before the strong preset is selected.
+* Thresholds: `< 0.06` ignored; `>= 0.52` → strong (`0x02`); otherwise soft (`0x03`).
+  Preset `0x01` (medium) is deliberately never selected.
+
+### 8.6 HD rumble worker: stopping, idling, and disconnect
+
+`_hd_loop` (`device.py:359`):
+
+```python
+active = False
+while self._hd_run:
+    strong, weak = self._hd_target
+    if strong <= 0.001 and weak <= 0.001:
+        if active:
+            try: self._write_motor(P.VibrationData())   # stop, ONCE
+            except Exception: pass
+            active = False
+        self._hd_dirty.wait(timeout=1.0); self._hd_dirty.clear(); continue
+    try: self._write_motor(self._hd_waveform(strong, weak))
+    except Exception: pass
+    active = True
+    time.sleep(0.016)
+```
+
+* **Motor clear when FF goes to (0,0) with the pad still connected**: exactly **one** stop
+  packet (`VibrationData()` ⇒ sample `e1 00 10 1e 00`, zero amplitudes, frequencies still
+  `0x0E1/0x1E1`, next `header` byte, block duplicated for Pro — §8.2). It is sent on the
+  first loop pass that observes the zeroed target, at most ~16 ms (+ one write) after the
+  `EV_FF` stop. Failures are swallowed and **not retried** — if that single write is lost,
+  nothing more is sent and the actuator is left to the firmware.
+* **No repeated zero packets.** The zero-target branch is entered *before* the waveform
+  write, so the loop never sends a second stop packet; `active` acts purely as a
+  "did I send anything since the last stop" latch.
+* **The sustain loop never exits on silence.** The thread lives until `_hd_run` is false; the
+  zero branch parks on `_hd_dirty.wait(timeout=1.0)` and clears the flag. Restart latency
+  after a silent period is normally immediate (the `EV_FF` sets the event) with a worst case
+  of ~1 s if a new target lands between the wake and the `clear()` (the clear can eat the
+  set, so the loop re-reads the target only after the next 1 s timeout). Sustain cadence is
+  `time.sleep(0.016)` — nominal ~62 Hz, drift-accumulating, not an absolute schedule.
+* **On disconnect there is no stop packet.** `_on_disconnect` (ATT reader thread) and
+  `close()` both just set `_hd_run = False` + `_hd_dirty.set()`; the worker exits at the next
+  loop head (≤16 ms, or immediately from the idle wait), possibly mid-`_write_motor` on a
+  closing socket, which is swallowed. Nothing is joined. The motor state is left entirely to
+  the firmware / the pad's own sleep path, exactly like a plain link drop.
+* `SwitchGamepad.close()` does push `rumble_cb(0.0, 0.0)`, but every teardown path
+  (`_teardown_session`, `_teardown_partial`, `_ensure_gamepad`) sets `gamepad.rumble_cb =
+  None` **before** calling `close()`, so that push never reaches the controller in practice.
+* `config.enable_rumble == false` ⇒ `rumble_cb` is never installed ⇒ `set_rumble` is never
+  called, the worker (started unconditionally for HD PIDs in `initialize`) sits idle, and no
+  stop packet is ever needed.
