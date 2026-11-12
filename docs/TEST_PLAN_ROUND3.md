@@ -1,136 +1,154 @@
-# Test Round 3 — why does a woken pad refuse the connection?
+# Test Round 3 — pair, validate in a live session, then attack the wake path
 
-Build: `1e50b79`. Everything below is **read-only diagnostics**: no code changes, no
-purging, no re-pairing. Time needed: ~15 minutes per pad.
+Build: **`1e50b79` + the two new commands** (`pair --hold`, `advert`) — I will tell you
+the exact commit to use before you start; do not start on the old binary, `pair --hold`
+is what makes phase B possible.
 
-Round 2 established a hard fact: **pairing works** (pad in SYNC mode, `LE_PUBLIC`),
-**reconnecting a woken pad does not** (16/16 rounds, both pads). That difference is
-the whole question of this round.
+Why this shape: round 2 proved we connect from SYNC mode and never after a wake. So we
+first **earn a session we know works**, measure everything in it, and only then drop the
+link and characterise exactly what happens when the pad tries to come back. That way a
+failure in phase C cannot contaminate the decode results, and a decode bug cannot be
+mistaken for a connect bug.
 
-## The hypothesis we are testing
+---
 
-A Nintendo pad in wake mode does not just "advertise" — its manufacturer block
-carries a **bonded-host field** (6 bytes at offset 10 of the Nintendo block). That
-is the address of the host it expects to reconnect to. If the pad stored the wrong
-host address, it is looking for a machine that will never answer, and our
-create-connection is ignored → exactly the timeouts we see.
+## Background you need for the decision tree
 
-So: **what host address is the pad advertising for, and does it match our adapter
-`8C:17:59:41:D6:1E`?**
+A Nintendo pad's advertisement carries the **host address it wants to reconnect to**
+(6 bytes at offset 10 of the manufacturer block, wire order = display MAC reversed):
 
-## Steps
+| Host field | Meaning |
+|---|---|
+| `00:00:00:00:00:00` | no host stored → pairing mode, connectable by anyone (TTL 45 s) |
+| our adapter MAC | bonded wake → the pad wants **us** (TTL 4 s) |
+| any other address | bonded to a *different* host → it will ignore this machine (TTL 4 s) |
+
+This is the field that decides everything below, and we have never looked at it on real
+hardware.
+
+---
+
+## Phase A — clean slate and pair *while keeping the link*
 
 ```fish
 set LEFT  BC:89:A6:45:83:CC
 set RIGHT BC:89:A6:49:8D:74
 systemctl --user stop switch2d.service
 set LOG ~/switch2d-test/round3-(date +%H%M).log
+
+# purge (same as round 2, so the round is reproducible)
+~/switch2d-test/switch2d remove $LEFT ; ~/switch2d-test/switch2d remove $RIGHT
+bluetoothctl remove $LEFT ; bluetoothctl remove $RIGHT
+rm -f ~/.config/switch2d/led-players.json ~/.config/switch2d/status.json
 ```
 
-### 1. Wake the pad and capture its advertisement
-
-Wake the Left pad (press any button; LEDs start cycling), then within a second:
+Wake the Left pad, hold SYNC until the LEDs cycle, then:
 
 ```fish
-bluetoothctl --timeout 20 scan on >/dev/null 2>&1 &
-sleep 6
-busctl --system call org.bluez / org.freedesktop.DBus.ObjectManager \
-    GetManagedObjects --json=short > /tmp/objs.json
-wait
+~/switch2d-test/switch2d pair --hold 90 2>&1 | tee -a $LOG
 ```
 
-Now extract the pad's advert. The JSON has one entry per device; look for the pad's
-MAC and paste the whole `ManufacturerData` value:
+**While the link is held**, do the full input validation — this is the only session we
+know connects, so use it:
+
+1. Sticks at rest 5 s → note `cal=` (~`0.00` expected).
+2. Both sticks full deflection each way, hold ~1 s each → **record the extremes**.
+3. Every button once, slowly: `A B X Y`, `L` `R`, `ZL` `ZR`, `+` `-`, `HOME`,
+   `CAPTURE`, both stick clicks, `SL`/`SR` if reachable.
+4. Rotate the pad left, then right → note `gyro=` sign per direction.
+5. Note battery mV/% and that it does not jitter.
+6. Keep an eye on the **Player LED** the whole time: it must stay solid for the duration
+   of the hold. If it dies before the timeout, say so — that would mean the link dropped
+   early.
+
+Copy the `calib read stick=…` lines from the log if present.
+
+Ctrl-C or let the 90 s expire.
+
+## Phase B — what did the bond actually store?
+
+Within ~10 seconds of the link dropping (the pad advertises in wake mode right after),
+capture the advertisement:
 
 ```fish
-python3 -c "
-import json
-d=json.load(open('/tmp/objs.json'))['data'][0]
-for path,ifaces in d.items():
-    dev=ifaces.get('org.bluez.Device1')
-    if not dev: continue
-    if 'BC:89:A6:45:83:CC' in path.upper():
-        print('path    ', path)
-        print('address ', dev.get('Address'), dev.get('AddressType'))
-        print('name    ', dev.get('Name'), dev.get('Alias'))
-        print('rssi    ', dev.get('RSSI'))
-        print('md      ', dev.get('ManufacturerData'))
-" 2>&1 | tee -a $LOG
+~/switch2d-test/switch2d advert --seconds 20 2>&1 | tee -a $LOG
 ```
 
-Also record:
+The header line prints our adapter MAC; each advert line prints the pad's `host=` field.
 
-```fish
-bluetoothctl devices 2>&1 | tee -a $LOG     # note (public) vs (random) and the MAC
-```
+**This is the crux of the round.** Compare the host bytes with our adapter:
 
-### 2. What the advert says
-
-The Nintendo block is the entry whose key is `0x7e05` (VID `0x057E` little-endian).
-Paste it whole. We are reading, in order:
-
-| bytes | meaning |
+| `host=` value | Meaning |
 |---|---|
-| 0–1 | VID, `7e 05` |
-| 2–3 | PID (e.g. `69 20` = Pro 2, `73 20` = GC) |
-| 4–9 | controller MAC, wire order |
-| 10–15 | **bonded host MAC, wire order** — the field this round exists for |
-| 16– | state bytes (battery etc.) |
+| `00:00:00:00:00:00` | the bond never landed — our `SET_MAC` is wrong or ignored |
+| `1E:D6:41:59:17:8C` (our adapter, reversed) | the bond landed; the pad wants us |
+| anything else | the pad is bonded to a stale/foreign host |
 
-Decide: does bytes 10–15 equal our adapter in wire order
-(`1E D6 41 59 17 8C`)? Or is it all zeros (nobody bonded), all `FF`, or some other
-address?
+Do this for the Right pad too, after its own pairing.
 
-### 3. Can the kernel itself connect? (independent of our code)
+## Phase C — wake reconnect attempt
+
+Wake the pad again with a button press, then immediately:
 
 ```fish
-sudo -n btmgmt info 2>&1 | tee -a $LOG
+RUST_LOG=debug ~/switch2d-test/switch2d monitor $LEFT --seconds 45 2>&1 | tee -a $LOG
+```
+
+Record: did it connect; if yes, after how many rounds; if no, the final `Error:` line
+verbatim.
+
+## Phase D — only if Phase C fails: is our initiator address even the one the pad wants?
+
+A pad in wake mode may use **directed advertising** to the stored host address. If our
+controller presents a different address than the one we bonded (privacy/RPA, or an LE
+identity address that is not the BR/EDR address), the connection request is silently
+ignored — which looks exactly like a timeout.
+
+```fish
+sudo -n btmgmt info 2>&1 | tee -a $LOG      # note: addr, le address, privacy setting
 sudo -n btmgmt -i 0 connect -t le $LEFT 2>&1 | tee -a $LOG
 ```
 
-and, if the sudoers rule does not cover `connect`, run it with an interactive
-password:
+If `btmgmt info` shows privacy enabled, or an LE address different from
+`8C:17:59:41:D6:1E`, retry Phase C **after**:
 
 ```fish
-sudo btmgmt -i 0 connect -t le $LEFT 2>&1 | tee -a $LOG
+sudo -n btmgmt -i 0 privacy off
 ```
 
-Record the exact result, even `Command not permitted`. If it connects, disconnect
-immediately with `sudo btmgmt -i 0 disconnect $LEFT` — do not leave the link up.
-
-### 4. Our own dial, same session
-
-Wake the pad again (if it slept) and:
+and also try the kernel's own connect immediately after a wake:
 
 ```fish
-RUST_LOG=debug ~/switch2d-test/switch2d monitor $LEFT --seconds 40 2>&1 | tee -a $LOG
+sudo -n btmgmt -i 0 disconnect $LEFT   # only if the previous connect succeeded
 ```
 
-### 5. Repeat 1–4 for the Right pad
+## Phase E — Right pad
+
+Repeat A–D with `$RIGHT` (Player 2, two LEDs).
 
 ---
 
-## How to read the results
+## Decision matrix
 
-| Observation | Conclusion |
-|---|---|
-| Host field = `1E D6 41 59 17 8C` (our adapter), connect still times out | The pad wants us; the failure is in the radio/kernel path. Next step is a `btmon` capture. |
-| Host field = all zeros / all `FF` | The pad never stored a host: our bond sequence did not take effect. Fix the bond payload, not the connect code. |
-| Host field = some other address | The pad bonded to a wrong or stale host address. Compare with what we send in `SET_MAC` and check byte order. |
-| `btmgmt connect` succeeds where `monitor` fails | Decisive: our raw L2CAP path is at fault, not the pad or the adapter. |
-| `btmgmt connect` also fails with `0x3e`/timeout | The pad is not accepting connections in wake mode at all — then we need to know what a Switch does differently (see below). |
-| Pad appears in `bluetoothctl devices` with a different MAC / `(random)` | The pad is using a private address; we must dial the advertised address, not the bonded one. |
+| Phase B host field | Phase C result | Conclusion | Next step |
+|---|---|---|---|
+| zeros | fails | bond never stored | fix `SET_MAC` payload/order; we are bonding to a pad that forgot us |
+| our MAC | connects | success | run the daemon test, then close the round |
+| our MAC | fails | the pad wants us and still refuses | Phase D decides: privacy/initiator address, or a genuine pad-side limitation |
+| other address | fails | stale host burned into the pad | re-bond in SYNC mode (the upstream project's own remedy) |
+| our MAC + Phase D `btmgmt connect` **succeeds** | fails in our socket path | our raw L2CAP connect is at fault, not the pad | fix our connect, not the strategy |
+| our MAC + `btmgmt connect` **fails the same way** | fails | pad refuses any initiator in wake mode | strategy decision: keep-alive, or BlueZ-managed connection |
 
-## Why this is not (yet) a dead end
+## Known good, do not re-test
 
-The Switch does not have a magic channel either: it bonds once, then the pad
-advertises and the console issues a normal BLE create-connection. The Nintendo
-advert block exists precisely so the pad can say *which host* it wants — which means
-the reconnect decision is host-address based, and that is something we can inspect
-and reproduce. The dead-end only becomes real if step 3 shows the pad refuses
-connections from any host while woken *and* refuses to advertise a host field at
-all; in that case the wake path would need to be triggered by something we have not
-identified (for example, the pad may only accept a connection while its LEDs are in
-a specific phase of the wake animation).
+Pairing itself, Player LED patterns (1 LED / 2 LEDs), the 6 s hold behaviour, the
+clean-slate purge, and the CLI error text — all verified in round 2.
 
-Do not change code based on this round. Send the log.
+## Honest context
+
+The upstream project never ran Joy-Con 2 on hardware at all (its README marks both
+Joy-Con 2 columns `?` as "never verified"), and its own README calls wake-connect
+"still needs real-world confirmation" and "flaky in development", shipping a watchdog
+that restarts the service when it sees "adverts seen but no connect". So phase C is
+genuinely exploratory: we may be the first to determine whether this works on this
+hardware, and either answer is a result worth having.
