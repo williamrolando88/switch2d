@@ -61,50 +61,76 @@ speculative rows; treat them as code that needs a tester.
 
 ## ⚙️ Install
 
-`switch2d` runs as your desktop user. Everything below is a one-time setup; after it, nothing
-needs root.
+`switch2d` runs as your desktop user. The installer resolves its own directory, so it works
+from any cwd; re-running is safe and skips steps that are already installed.
 
 ```fish
 git clone https://github.com/williamrolando88/switch2d.git
 cd switch2d
 
-# 1. Build and install into ~/.cargo/bin (must be on PATH).
+./install.sh              # binary, udev rule, LE-privacy unit, sudoers rule
+./install.sh --service    # also install and enable the login service
+```
+
+`./install.sh --uninstall` removes the udev rule, LE-privacy unit/script, sudoers rule and
+user unit. It never touches `~/.config/switch2d/config.json` or controller pairings.
+
+### Migrating from the Python bridge
+
+The upstream Python bridge left units behind. Disable all four before starting switch2d, or
+they can restart the old bridge and compete for the Bluetooth adapter:
+
+```fish
+systemctl --user disable --now nso-gc.service nso-gc-watchdog.service
+systemctl --user disable --now nso-gc-watchdog.timer nso-gc-after-gamescope.service
+```
+
+Ignore "not found" for units you never had. `./install.sh` warns if any of them are still
+enabled.
+
+### Verifying
+
+```fish
+which switch2d
+switch2d doctor
+```
+
+A healthy output is eight `PASS` lines. One `WARN` is acceptable for an optional rule (the
+user service if you did not use `--service`, or the udev rule if it is missing); any `FAIL`
+means reconnects or input will not work, and doctor prints the fix. `switch2d` must be on
+`PATH`: `cargo install` puts it in `~/.cargo/bin`, so add that directory if `which switch2d`
+is empty.
+
+### Manual steps
+
+For distro packagers, or if you prefer not to run a script, do the same steps by hand. Run
+these from the repository root, or use absolute paths:
+
+```fish
 cargo install --path . --locked
 
-# 2. udev rules: uinput/evdev access and player-LED permissions without manual ACLs.
 sudo install -Dm644 system/70-switch2d.rules /etc/udev/rules.d/70-switch2d.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
-# 3. LE privacy unit. Required for reconnects after a controller wakes; see below.
 sudo install -Dm755 system/disable-le-privacy.sh /usr/local/bin/disable-le-privacy.sh
 sudo install -Dm644 system/switch2d-disable-le-privacy.service /etc/systemd/system/switch2d-disable-le-privacy.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now switch2d-disable-le-privacy.service
 
-# 4. Least-privilege sudoers rule, so stopping an HCI scan never prompts for a password.
 echo "$USER ALL=(root) NOPASSWD: /usr/bin/btmgmt -i 0 stop-find -l, /usr/bin/btmgmt -i 0 stop-find" \
     | sudo tee /etc/sudoers.d/switch2d-btmgmt
 sudo chmod 0440 /etc/sudoers.d/switch2d-btmgmt
+sudo visudo -cf /etc/sudoers.d/switch2d-btmgmt
 
-# 5. Optional: run the daemon at login as a user service.
+# Optional login service.
 install -Dm644 system/switch2d.service ~/.config/systemd/user/switch2d.service
 systemctl --user daemon-reload
 systemctl --user enable switch2d.service
 ```
 
-If an older `switch2d.service` exists from a previous install, disable it first with
-`systemctl --user disable --now switch2d.service` and replace the file.
-
-**6. Verify before going further:**
-
-```fish
-switch2d doctor
-```
-
-Do not continue while any line says `FAIL`, and the `udev uaccess rule` line must say `PASS`.
-In particular a `FAIL` on `le-privacy unit` means controller reconnects cannot work yet, and
-every later symptom would be a symptom of that.
+If an older `switch2d.service` exists, disable it first with
+`systemctl --user disable --now switch2d.service`, then replace the file.
 
 ---
 
@@ -119,6 +145,20 @@ switch2d pair          # pair, bond and set the player LED (run once per control
 switch2d status        # bonded controllers, mode, adapter
 switch2d run           # run the daemon in the foreground
 ```
+
+`Ctrl+C` stops `switch2d run` cleanly: virtual nodes are removed and pads are released, with no
+background process left behind. (In fish, `Ctrl+C` is the key combination, not a command to type.)
+
+If you installed the service with `--service`, the service form is also available:
+
+```fish
+systemctl --user start switch2d     # run now, not at login
+systemctl --user stop switch2d
+systemctl --user status switch2d
+```
+
+Enabling at login is optional: without it the daemon runs only while started, which is what you
+want if you prefer not to hold virtual pads open all the time.
 
 ### Pairing
 
@@ -155,7 +195,8 @@ switch2d selftest --seconds 8 --drive   # sweep sticks/buttons on a virtual pad
 ```
 
 `monitor` is the safe way to check a controller: it creates no virtual device, so it cannot
-disturb the desktop or steal focus.
+disturb the desktop or steal focus. Verbose logging is `switch2d -v <command>` (the flag is also
+accepted after the subcommand).
 
 `selftest` without `--drive` is also safe: it creates a pad, prints what the kernel reports,
 and drives nothing. With `--drive` it moves sticks and presses every button, and **anything
@@ -197,6 +238,7 @@ is wrong.
 | `L2CAP connect failed (... os error 38 ...)` while the pad's LEDs cycle | LE privacy is on: see [LE privacy](#-le-privacy-required-for-reconnects) |
 | `EBUSY` / connect times out only when Steam is running | Steam's own LE scan; the daemon already stops discovery before dialling, but a background scan by another app can still compete |
 | Controller pairs, then LEDs go dark | normal — LEDs only light while a host is connected |
+| Daemon log goes silent while the pad sleeps | expected — press a button to wake the pad; silence is not a hang |
 | `switch2d doctor` warns about the udev rule | install `system/70-switch2d.rules` and run `sudo udevadm control --reload-rules && sudo udevadm trigger` |
 | Game sees the controller but rumble does nothing | check `evtest` first; if rumble works there, the game is not sending `EV_FF` |
 
