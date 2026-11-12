@@ -8,7 +8,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::config::{DaemonConfig, DaemonMode};
-use crate::controller::SwitchController;
+use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
 use crate::protocol::constants::*;
 use crate::uinput::{CombinedJoyConManager, VirtualGamepad};
 
@@ -82,10 +82,19 @@ impl Daemon {
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
-                        SwitchController::connect(
+                        SwitchController::connect_with(
                             &mac_str,
                             &adapter_str,
-                            ctrl_cfg.player,
+                            ConnectOptions {
+                                player: ctrl_cfg.player,
+                                // Already-bonded pads only need a wake; unbonded
+                                // ones must store host MAC + LTK on this connect.
+                                bond: if ctrl_cfg.bonded {
+                                    BondPolicy::Skip
+                                } else {
+                                    BondPolicy::IfNeeded
+                                },
+                            },
                             Box::new(move |report| {
                                 if is_l {
                                     mgr_for_cb.update_left(report, &crate::protocol::calibration::StickCalibration::default());
@@ -162,10 +171,17 @@ impl Daemon {
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
-                        SwitchController::connect(
+                        SwitchController::connect_with(
                             &mac_str,
                             &adapter_str,
-                            ctrl_cfg.player,
+                            ConnectOptions {
+                                player: ctrl_cfg.player,
+                                bond: if ctrl_cfg.bonded {
+                                    BondPolicy::Skip
+                                } else {
+                                    BondPolicy::IfNeeded
+                                },
+                            },
                             Box::new(move |report| {
                                 if is_l {
                                     mgr_for_cb.update_horizontal_left(report, &crate::protocol::calibration::StickCalibration::default());

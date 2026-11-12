@@ -77,16 +77,17 @@ impl InputReport {
         (self.buttons & mask) != 0
     }
 
-    /// Approximate battery percentage from mV (assumes Li-ion: ~3500mV empty, 4150mV full).
+    /// Battery percentage from mV, using the legacy contract: empty at
+    /// 2950 mV, full at 4200 mV, truncating integer math, clamped to 0..=100.
+    ///
+    /// Must agree with [`crate::status::battery_pct_from_mv`] for every input
+    /// (`report_battery_matches_status_helper` pins this).
     pub fn battery_percentage(&self) -> u8 {
-        if self.battery_mv < 3500 {
-            0
-        } else if self.battery_mv >= 4150 {
-            100
-        } else {
-            let pct = ((self.battery_mv - 3500) as u32 * 100) / (4150 - 3500);
-            pct.min(100) as u8
+        if self.battery_mv == 0 {
+            return 0;
         }
+        let pct = (i32::from(self.battery_mv) - 2950) * 100 / 1300;
+        pct.clamp(0, 100) as u8
     }
 
     /// D-pad Hat X axis (-1 = left, 1 = right, 0 = neutral)
@@ -108,6 +109,43 @@ impl InputReport {
             (true, false) => -1,
             (false, true) => 1,
             _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report_with_mv(battery_mv: u16) -> InputReport {
+        InputReport {
+            timestamp: 0,
+            buttons: 0,
+            left_stick_raw: (2048, 2048),
+            right_stick_raw: (2048, 2048),
+            battery_mv,
+            accel: (0, 0, 0),
+            gyro: (0, 0, 0),
+            left_trigger_raw: 0,
+            right_trigger_raw: 0,
+        }
+    }
+
+    #[test]
+    fn report_battery_matches_status_helper() {
+        // Table spans the required boundary values plus the clamps. `0` maps to
+        // `None` in the status helper, which callers render as 0%.
+        let table = [
+            0u16, 1, 1000, 2000, 2949, 2950, 2951, 3000, 3200, 3399, 3400, 3599, 3600, 3601, 3800,
+            4000, 4199, 4200, 4201, 5000, 65534, 65535,
+        ];
+
+        for mv in table {
+            assert_eq!(
+                report_with_mv(mv).battery_percentage(),
+                crate::status::battery_pct_from_mv(mv).unwrap_or(0),
+                "battery percentage mismatch at {mv} mV"
+            );
         }
     }
 }

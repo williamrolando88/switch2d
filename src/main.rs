@@ -8,7 +8,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
-use switch2d::controller::SwitchController;
+use switch2d::controller::{BondPolicy, ConnectOptions, SwitchController};
 use switch2d::daemon::Daemon;
 use switch2d::protocol::constants::*;
 
@@ -220,10 +220,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mac_for_task = target_mac.clone();
 
             let res = tokio::task::spawn_blocking(move || {
-                SwitchController::connect(
+                SwitchController::connect_with(
                     &mac_for_task,
                     &adapter_mac,
-                    next_player,
+                    ConnectOptions {
+                        player: next_player,
+                        // An explicit pair always re-bonds.
+                        bond: BondPolicy::Force,
+                    },
                     Box::new(|_| {}),
                 )
             }).await?;
