@@ -54,7 +54,7 @@ use crate::status::{
     battery_pct_from_mv, ControllerStatus, DaemonStatus, ServiceState, StatusPublisher,
 };
 use crate::uinput::ff::FfEvent;
-use crate::uinput::{PadSink, VirtualGamepad, STICK_MAX};
+use crate::uinput::{MotionNode, PadSink, VirtualGamepad, STICK_MAX};
 use crate::worker::{Worker, WorkerConfig};
 
 /// Bounded input-report channel: enough to absorb a scheduling hiccup without
@@ -194,6 +194,7 @@ impl Daemon {
                         Arc::clone(&planner),
                         Arc::clone(&led_plan),
                         Arc::clone(&motion),
+                        RealMotionFactory,
                     ));
                 }
                 None => {
@@ -216,6 +217,7 @@ impl Daemon {
                         Arc::clone(&planner),
                         Arc::clone(&led_plan),
                         Arc::clone(&motion),
+                        RealMotionFactory,
                     ));
                 }
             }
@@ -606,7 +608,7 @@ enum Side {
 /// One worker task: waits for sessions and runs them until the link drops or
 /// the pad goes idle. The uinput node lives in the sink and survives sessions.
 #[allow(clippy::too_many_arguments)]
-async fn run_pad_worker<S>(
+async fn run_pad_worker<S, F>(
     pad: PadSpec,
     mut sink: S,
     mut sessions: tokio_mpsc::Receiver<SwitchController>,
@@ -618,9 +620,17 @@ async fn run_pad_worker<S>(
     planner: Arc<PlayerPlanner>,
     led_plan: Arc<StdMutex<HashMap<String, u8>>>,
     motion: SharedMotion,
+    motion_factory: F,
 ) where
     S: PadSink + FfPad + Clone,
+    F: MotionNodeFactory,
 {
+    // The IMU node has the same lifetime rule as the uinput gamepad: created
+    // once per worker, kept across reconnects, dropped only when the daemon
+    // (or this task) ends. A failure disables motion for this pad for good and
+    // is logged once, never fatal.
+    let mut imu = create_imu_node(&motion_factory, &pad);
+
     while let Some(controller) = sessions.recv().await {
         run_session(
             &pad,
@@ -634,6 +644,7 @@ async fn run_pad_worker<S>(
             &planner,
             &led_plan,
             &motion,
+            &mut imu,
         )
         .await;
     }
@@ -653,6 +664,7 @@ async fn run_session<S>(
     planner: &PlayerPlanner,
     led_plan: &Arc<StdMutex<HashMap<String, u8>>>,
     motion_sink: &SharedMotion,
+    imu: &mut Option<Box<dyn MotionOut>>,
 ) where
     S: PadSink + FfPad + Clone,
 {
@@ -736,8 +748,14 @@ async fn run_session<S>(
                 if rumble_due(&mut next_rumble, now) {
                     pump_rumble(sink, &mut rumble, &mut controller, now, &mut last_ff);
                 }
+                // IMU node first (local consumers), then the DSU frame
+                // (network): both are fire-and-forget and the pad mutex is not
+                // held here. Raw i16 samples only - the node publishes the
+                // scale through its axis resolution.
+                publish_imu(imu.as_deref_mut(), &report);
+
                 // Fire-and-forget: the bridge never blocks or fails the
-                // session, and the pad mutex is not held here.
+                // session.
                 motion.update(&report, &calibrated);
 
                 let sleep_now = worker.should_sleep(now);
@@ -1191,6 +1209,66 @@ fn start_motion() -> SharedMotion {
             warn!("DSU motion unavailable ({err}); continuing without motion");
             Arc::new(NullMotion)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IMU evdev node
+// ---------------------------------------------------------------------------
+
+/// Everything the worker needs from the IMU node (real node, or a test fake).
+///
+/// `update` takes the raw `i16` samples: the node carries the LSB-per-unit
+/// scale in its axis resolution, so nothing is converted here.
+trait MotionOut: Send {
+    fn update(&mut self, accel_raw: (i16, i16, i16), gyro_raw: (i16, i16, i16)) -> io::Result<()>;
+}
+
+impl MotionOut for MotionNode {
+    fn update(&mut self, accel_raw: (i16, i16, i16), gyro_raw: (i16, i16, i16)) -> io::Result<()> {
+        MotionNode::update(self, accel_raw, gyro_raw)
+    }
+}
+
+/// Creates the per-worker IMU node (production: `/dev/uinput`).
+trait MotionNodeFactory: Send {
+    fn create(&self, name: &str, mac: &str, product_id: u16) -> io::Result<Box<dyn MotionOut>>;
+}
+
+/// Production factory: a real companion evdev node.
+struct RealMotionFactory;
+
+impl MotionNodeFactory for RealMotionFactory {
+    fn create(&self, name: &str, mac: &str, product_id: u16) -> io::Result<Box<dyn MotionOut>> {
+        // `MotionNode::new` appends " IMU" to the gamepad name and tags the node
+        // with the controller MAC; the PID is the controller's (bridge.py:556).
+        Ok(Box::new(MotionNode::new(name, mac, product_id)?))
+    }
+}
+
+/// Create the node once per worker; a failure is warned once and disables
+/// motion for that pad without affecting input (same rule as the DSU bridge).
+fn create_imu_node(factory: &dyn MotionNodeFactory, pad: &PadSpec) -> Option<Box<dyn MotionOut>> {
+    match factory.create(&pad.name, &pad.mac, pad.product_id) {
+        Ok(node) => Some(node),
+        Err(err) => {
+            warn!(
+                "{}: IMU node unavailable, continuing without motion: {err}",
+                pad.mac
+            );
+            None
+        }
+    }
+}
+
+/// Publish one raw IMU sample. A failed write is a debug log and is not
+/// retried specially; it must never end the session.
+fn publish_imu<N: MotionOut + ?Sized>(node: Option<&mut N>, report: &InputReport) {
+    let Some(node) = node else {
+        return;
+    };
+    if let Err(err) = node.update(report.accel, report.gyro) {
+        debug!("IMU node update failed (session continues): {err}");
     }
 }
 
@@ -2613,5 +2691,149 @@ mod tests {
         );
         assert_ne!(updates[0].left, 128, "not the raw centre value");
         assert_eq!(updates[0].left, 1);
+    }
+
+    // --- IMU node --------------------------------------------------------
+
+    type ImuSample = ((i16, i16, i16), (i16, i16, i16));
+
+    struct FakeNode {
+        updates: Arc<StdMutex<Vec<ImuSample>>>,
+    }
+
+    impl MotionOut for FakeNode {
+        fn update(
+            &mut self,
+            accel_raw: (i16, i16, i16),
+            gyro_raw: (i16, i16, i16),
+        ) -> io::Result<()> {
+            self.updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((accel_raw, gyro_raw));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeFactory {
+        fail: bool,
+        created: Arc<StdMutex<Vec<(String, String, u16)>>>,
+        updates: Arc<StdMutex<Vec<ImuSample>>>,
+    }
+
+    impl MotionNodeFactory for FakeFactory {
+        fn create(&self, name: &str, mac: &str, product_id: u16) -> io::Result<Box<dyn MotionOut>> {
+            self.created
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((name.to_string(), mac.to_string(), product_id));
+            if self.fail {
+                return Err(io::Error::other("no /dev/uinput permission"));
+            }
+            Ok(Box::new(FakeNode {
+                updates: Arc::clone(&self.updates),
+            }))
+        }
+    }
+
+    #[test]
+    fn motion_node_is_created_once_per_worker_across_reconnects() {
+        let factory = FakeFactory::default();
+        let pad = pad_spec();
+
+        // Worker start: exactly one node.
+        let mut imu = create_imu_node(&factory, &pad);
+        assert!(imu.is_some(), "node created");
+        assert_eq!(
+            *factory
+                .created
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![(
+                "Joy-Con 2 (Left)".to_string(),
+                PAD.to_string(),
+                pad.product_id
+            )],
+            "named from the config entry, tagged with the MAC, entry PID"
+        );
+
+        // Two sessions (reconnect): reports are published, node is not rebuilt.
+        for _ in 0..2 {
+            publish_imu(imu.as_deref_mut(), &report(button_mask::A));
+        }
+        assert_eq!(
+            factory
+                .created
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "created once per worker, never per session"
+        );
+        assert_eq!(
+            factory
+                .updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2,
+            "both sessions reached the same node"
+        );
+    }
+
+    #[test]
+    fn motion_update_is_skipped_when_the_node_is_missing() {
+        let factory = FakeFactory {
+            fail: true,
+            ..FakeFactory::default()
+        };
+        let mut imu = create_imu_node(&factory, &pad_spec());
+
+        // Creation failed -> motion is off, but the session path still runs.
+        assert!(imu.is_none(), "failure disables motion, not the worker");
+        publish_imu(imu.as_deref_mut(), &report(button_mask::A));
+        finish_session_for_test(); // stand-in for "the session completed"
+
+        assert!(factory
+            .updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert_eq!(
+            factory
+                .created
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "creation was attempted exactly once (warn once)"
+        );
+    }
+
+    /// The session-completion path is otherwise covered by the handoff/teardown
+    /// tests; the IMU tests only need to show nothing panics without a node.
+    fn finish_session_for_test() {}
+
+    #[test]
+    fn raw_samples_reach_the_node_unchanged() {
+        let factory = FakeFactory::default();
+        let mut imu = create_imu_node(&factory, &pad_spec()).expect("node");
+
+        let mut report = report(0);
+        report.accel = (123, -456, 789);
+        report.gyro = (i16::MIN, i16::MAX, 7);
+        publish_imu(Some(imu.as_mut()), &report);
+
+        let updates = factory
+            .updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            updates,
+            vec![((123, -456, 789), (i16::MIN, i16::MAX, 7))],
+            "raw i16 samples, no scaling or clamping"
+        );
     }
 }
