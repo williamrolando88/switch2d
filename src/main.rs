@@ -371,7 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  Player:  {}", next_player);
                     println!("===========================================================");
                     println!("The LED on your controller is now set to Player {}.", next_player);
-                    println!("Saved to config. switch2d will now connect to it automatically!");
+                    println!("Holding connection for 6 seconds so you can verify the Player {} LED...", next_player);
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    println!("Saved to config. (Joy-Con LEDs will turn off now until switch2d runs or monitors).");
                 }
                 Err(e) => {
                     println!("❌ Failed to connect to {}: {}", target_mac, e);
@@ -749,31 +751,29 @@ async fn run_selftest(seconds: u64, drive: bool) -> Result<(), Box<dyn std::erro
 }
 
 async fn scan_for_joycon() -> Option<String> {
-    // Start discovery via bluetoothctl in background for 8 seconds
-    let mut child = Command::new("bluetoothctl")
-        .args(&["scan", "on"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+    tokio::task::spawn_blocking(|| {
+        let output = Command::new("bluetoothctl")
+            .args(&["--timeout", "8", "scan", "on"])
+            .output()
+            .ok()?;
 
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    let _ = child.kill();
-    let output = child.wait_with_output().ok()?;
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if line.contains("Device") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            for part in parts {
-                if is_valid_mac(part) && (part.starts_with("BC:") || line.to_lowercase().contains("joy-con")) {
-                    return Some(part.to_uppercase());
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if line.contains("Device") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                for part in parts {
+                    let clean = part.trim();
+                    if is_valid_mac(clean) && (clean.starts_with("BC:") || line.to_lowercase().contains("joy-con")) {
+                        return Some(clean.to_uppercase());
+                    }
                 }
             }
         }
-    }
 
-    None
+        None
+    })
+    .await
+    .ok()?
 }
 
 fn is_valid_mac(s: &str) -> bool {
