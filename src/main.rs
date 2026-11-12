@@ -78,7 +78,7 @@ enum Commands {
 
     /// Pair, bond, and register a Switch 2 controller (sets player LED and saves to config)
     Pair {
-        /// Bluetooth MAC address (e.g. BC:89:A6:45:83:CC). If omitted, scans automatically.
+        /// Bluetooth MAC address (e.g. AA:BB:CC:DD:EE:01). If omitted, scans automatically.
         mac: Option<String>,
 
         /// Optional friendly name (e.g. "Joy-Con 2 (Left)")
@@ -97,7 +97,7 @@ enum Commands {
 
     /// Register / add a Switch 2 controller MAC address directly
     Add {
-        /// Bluetooth MAC address (e.g. BC:89:A6:45:83:CC)
+        /// Bluetooth MAC address (e.g. AA:BB:CC:DD:EE:01)
         mac: String,
 
         /// Optional friendly name (e.g. "Joy-Con 2 (Left)")

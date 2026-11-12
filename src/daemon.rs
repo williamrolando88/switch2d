@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, Sender as StdSender, TryRecvError};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -42,6 +43,7 @@ use crate::bluetooth::scan::{AdvertSource, ScanControl, ShellScanControl};
 use crate::config::{BondedController, DaemonConfig, DaemonMode};
 use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
 use crate::hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
+use crate::players::{path_in, LedPlayers};
 use crate::protocol::constants::{button_mask, PRO_CONTROLLER2_PID};
 use crate::protocol::report::InputReport;
 use crate::protocol::vibration::SUSTAIN_INTERVAL;
@@ -108,10 +110,24 @@ impl Daemon {
         let idle_timeout = Duration::from_secs(self.config.idle_sleep_seconds.max(1));
         let horizontal = self.config.mode == DaemonMode::Split;
 
+        // ADR-4 player identity: the supervisor re-reads `led-players.json` on
+        // every publish (1.5 s tick and session events) and stores the per-pad
+        // plan here; workers follow it on their 500 ms liveness tick, so no
+        // thread ever caches the file across ticks.
+        let planner = Arc::new(PlayerPlanner::new(pads.clone(), self.config.mode));
+        let led_plan: Arc<StdMutex<HashMap<String, u8>>> =
+            Arc::new(StdMutex::new(planner.read_plan()));
+
         // Status plane: the supervisor is the only writer.
         let (sup_tx, sup_rx) = tokio_mpsc::unbounded_channel();
         let publisher = StatusPublisher::new();
-        let supervisor = tokio::spawn(supervisor_loop(sup_rx, publisher, pads.clone()));
+        let supervisor = tokio::spawn(supervisor_loop(
+            sup_rx,
+            publisher,
+            pads.clone(),
+            Arc::clone(&planner),
+            Arc::clone(&led_plan),
+        ));
 
         // Worker -> hub notifications (low rate, std channel: the hub thread is
         // synchronous and polls it once per cycle).
@@ -169,6 +185,8 @@ impl Daemon {
                         hub_tx,
                         sup_tx,
                         idle_timeout,
+                        Arc::clone(&planner),
+                        Arc::clone(&led_plan),
                     ));
                 }
                 None => {
@@ -188,6 +206,8 @@ impl Daemon {
                         hub_tx,
                         sup_tx,
                         idle_timeout,
+                        Arc::clone(&planner),
+                        Arc::clone(&led_plan),
                     ));
                 }
             }
@@ -587,6 +607,8 @@ async fn run_pad_worker<S>(
     hub_tx: StdSender<HubMsg>,
     sup_tx: UnboundedSender<SupervisorMsg>,
     idle_timeout: Duration,
+    planner: Arc<PlayerPlanner>,
+    led_plan: Arc<StdMutex<HashMap<String, u8>>>,
 ) where
     S: PadSink + FfPad + Clone,
 {
@@ -600,6 +622,8 @@ async fn run_pad_worker<S>(
             &hub_tx,
             &sup_tx,
             idle_timeout,
+            &planner,
+            &led_plan,
         )
         .await;
     }
@@ -616,6 +640,8 @@ async fn run_session<S>(
     hub_tx: &StdSender<HubMsg>,
     sup_tx: &UnboundedSender<SupervisorMsg>,
     idle_timeout: Duration,
+    planner: &PlayerPlanner,
+    led_plan: &Arc<StdMutex<HashMap<String, u8>>>,
 ) where
     S: PadSink + FfPad + Clone,
 {
@@ -639,6 +665,14 @@ async fn run_session<S>(
             mac: pad.mac.clone(),
         })
         .ok();
+
+    // ADR-4 player identity. The connect handshake already set the configured
+    // player's LED; from here on the effective number comes from
+    // `led-players.json` (re-read now, at session start). Applied only when it
+    // differs, and only after the handshake is done.
+    let mut led_player = pad.player;
+    let wanted = planner.player_for(&pad.mac);
+    sync_player_led(&mut controller, &pad.mac, wanted, &mut led_player);
 
     // Rumble: profile-routed engine (HD sustainer or GameCube presets), fed by
     // the uinput FF queue drained from the pad sink.
@@ -697,6 +731,9 @@ async fn run_session<S>(
                 pump_rumble(sink, &mut rumble, &mut controller, now, &mut last_ff);
             }
             _ = sleep(SESSION_POLL_INTERVAL) => {
+                // Follow the supervisor's plan (refreshed every 1.5 s): the
+                // override file can change while the daemon runs.
+                apply_planned_led(&mut controller, &pad.mac, led_plan, &mut led_player);
                 if !controller.is_connected() {
                     break;
                 }
@@ -1060,6 +1097,160 @@ fn hat_y(buttons: u32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Player identity (ADR-4)
+// ---------------------------------------------------------------------------
+
+/// Resolves the effective player per pad and, in combined mode, the one number
+/// the pair shares.
+///
+/// `led-players.json` is re-read on every call from the config directory: the
+/// GUI tool rewrites it while the daemon runs, so nothing may be cached here
+/// (architecture ADR-4, legacy `bridge.py:763-780`).
+#[derive(Debug, Clone)]
+struct PlayerPlanner {
+    pads: Vec<PadSpec>,
+    mode: DaemonMode,
+    path: PathBuf,
+}
+
+impl PlayerPlanner {
+    fn new(pads: Vec<PadSpec>, mode: DaemonMode) -> Self {
+        let path = DaemonConfig::config_path()
+            .parent()
+            .map(path_in)
+            .unwrap_or_else(|| path_in(Path::new(".")));
+        Self::with_path(pads, mode, path)
+    }
+
+    /// Explicit path (tests, and a future config-dir override).
+    fn with_path(pads: Vec<PadSpec>, mode: DaemonMode, path: PathBuf) -> Self {
+        Self { pads, mode, path }
+    }
+
+    /// Fresh read of the override file plus the per-pad plan.
+    fn read_plan(&self) -> HashMap<String, u8> {
+        self.plan_with(&LedPlayers::load(&self.path))
+    }
+
+    /// Plan for an already-parsed override map (pure).
+    ///
+    /// Combined mode gives every configured pad the same number: the lowest
+    /// effective player of the pair (one player, one LED pattern). Split mode
+    /// keeps each pad's own effective player.
+    fn plan_with(&self, overrides: &LedPlayers) -> HashMap<String, u8> {
+        match self.mode {
+            DaemonMode::Combined => {
+                let pair = combined_player(
+                    self.pads
+                        .iter()
+                        .map(|pad| overrides.resolve(&pad.mac, pad.player)),
+                );
+                self.pads
+                    .iter()
+                    .map(|pad| (pad.mac.clone(), pair))
+                    .collect()
+            }
+            DaemonMode::Split => self
+                .pads
+                .iter()
+                .map(|pad| (pad.mac.clone(), overrides.resolve(&pad.mac, pad.player)))
+                .collect(),
+        }
+    }
+
+    /// Number for one pad from a fresh read (used at session start).
+    fn player_for(&self, mac: &str) -> u8 {
+        let key = mac.to_ascii_uppercase();
+        if let Some(player) = self.read_plan().get(&key) {
+            return *player;
+        }
+        self.pads
+            .iter()
+            .find(|pad| pad.mac == key)
+            .map(|pad| pad.player)
+            .unwrap_or(1)
+    }
+}
+
+/// Combined-mode player: the minimum effective player of the pair, or `1` when
+/// nothing is configured (legacy pair semantics).
+fn combined_player(effective: impl IntoIterator<Item = u8>) -> u8 {
+    effective.into_iter().min().unwrap_or(1)
+}
+
+/// Applies the numeric player LED pattern (the controller, or a test fake).
+trait LedOutput {
+    fn apply_player_leds(&mut self, player: u8) -> io::Result<()>;
+}
+
+impl LedOutput for SwitchController {
+    fn apply_player_leds(&mut self, player: u8) -> io::Result<()> {
+        self.set_player_leds(player)
+    }
+}
+
+/// Apply the LED pattern only when the number changed.
+///
+/// Mirrors the legacy daemon's `_led_player` check: re-sending an unchanged
+/// pattern makes the controller flash, so the comparison is load-bearing.
+/// A failed write is logged and retried on the next tick; LEDs are cosmetic and
+/// must never end a session.
+fn sync_player_led<L: LedOutput>(out: &mut L, mac: &str, wanted: u8, applied: &mut u8) -> bool {
+    if wanted == *applied {
+        return false;
+    }
+    match out.apply_player_leds(wanted) {
+        Ok(()) => {
+            *applied = wanted;
+            info!("{mac}: player LED set to Player {wanted}");
+            true
+        }
+        Err(err) => {
+            warn!("{mac}: player LED update failed (session continues): {err}");
+            false
+        }
+    }
+}
+
+/// Follow the supervisor's latest plan (written on every publish).
+fn apply_planned_led<L: LedOutput>(
+    out: &mut L,
+    mac: &str,
+    plan: &Arc<StdMutex<HashMap<String, u8>>>,
+    applied: &mut u8,
+) {
+    let wanted = plan
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&mac.to_ascii_uppercase())
+        .copied();
+    if let Some(wanted) = wanted {
+        sync_player_led(out, mac, wanted, applied);
+    }
+}
+
+/// Re-read the override file, store the plan for the workers and mirror the
+/// effective player into the published status document.
+fn refresh_led_plan(
+    planner: &PlayerPlanner,
+    plan: &Arc<StdMutex<HashMap<String, u8>>>,
+    status: &mut DaemonStatus,
+) {
+    let fresh = planner.read_plan();
+    for (mac, player) in &fresh {
+        if let Some(entry) = find_controller(status, mac) {
+            entry.effective_player = if *player == entry.player {
+                None
+            } else {
+                Some(*player)
+            };
+        }
+    }
+    let mut shared = plan.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *shared = fresh;
+}
+
+// ---------------------------------------------------------------------------
 // Supervisor / status plane
 // ---------------------------------------------------------------------------
 
@@ -1084,6 +1275,8 @@ async fn supervisor_loop(
     mut rx: UnboundedReceiver<SupervisorMsg>,
     publisher: StatusPublisher,
     pads: Vec<PadSpec>,
+    planner: Arc<PlayerPlanner>,
+    led_plan: Arc<StdMutex<HashMap<String, u8>>>,
 ) {
     let mut status = DaemonStatus::new();
     status.hub_alive = true;
@@ -1091,6 +1284,7 @@ async fn supervisor_loop(
     for pad in &pads {
         status.upsert_controller(initial_controller_status(pad));
     }
+    refresh_led_plan(&planner, &led_plan, &mut status);
     publish_status(&publisher, &mut status);
 
     loop {
@@ -1102,6 +1296,9 @@ async fn supervisor_loop(
             _ = sleep(STATUS_INTERVAL) => true,
         };
         if publish_now {
+            // Never cached across ticks: the GUI tool rewrites the file while
+            // the daemon runs (ADR-4).
+            refresh_led_plan(&planner, &led_plan, &mut status);
             publish_status(&publisher, &mut status);
         }
     }
@@ -1886,5 +2083,195 @@ mod tests {
         );
         assert_eq!(out.hd.len(), 1, "exactly one stop packet");
         assert_eq!(sample(&out.hd[0]), &Sample::default().to_u40());
+    }
+
+    // --- Player identity (ADR-4) ----------------------------------------
+
+    use crate::players::LED_PLAYERS_FILE;
+
+    struct FakeLeds {
+        applied: Vec<u8>,
+        fail: bool,
+    }
+
+    impl LedOutput for FakeLeds {
+        fn apply_player_leds(&mut self, player: u8) -> io::Result<()> {
+            if self.fail {
+                return Err(io::Error::other("LED write refused"));
+            }
+            self.applied.push(player);
+            Ok(())
+        }
+    }
+
+    fn pads_pair() -> Vec<PadSpec> {
+        vec![
+            PadSpec {
+                mac: PAD.to_string(),
+                player: 1,
+                name: "Joy-Con 2 (Left)".to_string(),
+                bonded: true,
+                product_id: 0x2067,
+                is_left: true,
+            },
+            PadSpec {
+                mac: "AA:BB:CC:DD:EE:02".to_string(),
+                player: 2,
+                name: "Joy-Con 2 (Right)".to_string(),
+                bonded: true,
+                product_id: 0x2066,
+                is_left: false,
+            },
+        ]
+    }
+
+    fn write_led_players(dir: &TempDir, json: &str) -> PathBuf {
+        let path = dir.root.join(LED_PLAYERS_FILE);
+        fs::write(&path, json).expect("write led-players.json");
+        path
+    }
+
+    #[test]
+    fn combined_player_is_the_min_of_effective_players() {
+        assert_eq!(combined_player([1u8, 2]), 1, "1 and 2 -> 1");
+        assert_eq!(combined_player([2u8, 1]), 1);
+        assert_eq!(combined_player([3u8, 1]), 1, "3 and 1 -> 1");
+        assert_eq!(combined_player([4u8, 7]), 4);
+        assert_eq!(combined_player(Vec::<u8>::new()), 1, "empty -> 1");
+        assert_eq!(combined_player([5u8]), 5, "single pad keeps its number");
+    }
+
+    #[test]
+    fn led_override_changes_only_the_number_not_the_mode() {
+        let dir = TempDir::new("led-override");
+        let pad_b = "AA:BB:CC:DD:EE:02";
+        // Override for the left pad only.
+        let path = write_led_players(&dir, &format!(r#"{{"{PAD}": 4}}"#));
+
+        let planner = PlayerPlanner::with_path(pads_pair(), DaemonMode::Split, path.clone());
+        let without = planner.plan_with(&LedPlayers::default());
+        let with = planner.read_plan();
+
+        assert_eq!(
+            planner.mode,
+            DaemonMode::Split,
+            "override never changes the mode"
+        );
+        assert_eq!(
+            without.keys().collect::<std::collections::BTreeSet<_>>(),
+            with.keys().collect::<std::collections::BTreeSet<_>>(),
+            "the override does not add or drop pads"
+        );
+        assert_eq!(with.get(PAD), Some(&4), "override wins for that pad");
+        assert_eq!(with.get(pad_b), Some(&2), "the other pad is untouched");
+
+        // Combined mode still reports ONE number for the pair, and it follows
+        // the override (min of 4 and 2 -> 2).
+        let combined = PlayerPlanner::with_path(pads_pair(), DaemonMode::Combined, path);
+        let plan = combined.read_plan();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.get(PAD), Some(&2));
+        assert_eq!(plan.get(pad_b), Some(&2));
+    }
+
+    #[test]
+    fn led_is_reapplied_only_when_the_number_changes() {
+        let mut leds = FakeLeds {
+            applied: Vec::new(),
+            fail: false,
+        };
+        let mut applied = 1u8;
+
+        assert!(
+            !sync_player_led(&mut leds, PAD, 1, &mut applied),
+            "same number"
+        );
+        assert!(
+            leds.applied.is_empty(),
+            "no command for an unchanged pattern"
+        );
+
+        assert!(sync_player_led(&mut leds, PAD, 2, &mut applied), "changed");
+        assert_eq!(leds.applied, vec![2]);
+        assert_eq!(applied, 2);
+
+        assert!(
+            !sync_player_led(&mut leds, PAD, 2, &mut applied),
+            "same again"
+        );
+        assert_eq!(leds.applied, vec![2], "no second command for 2");
+
+        assert!(sync_player_led(&mut leds, PAD, 1, &mut applied));
+        assert_eq!(leds.applied, vec![2, 1]);
+
+        // A failed write is not recorded as applied, so the next tick retries.
+        let mut failing = FakeLeds {
+            applied: Vec::new(),
+            fail: true,
+        };
+        let mut applied = 1u8;
+        assert!(!sync_player_led(&mut failing, PAD, 3, &mut applied));
+        assert_eq!(applied, 1, "failure keeps the old number for a retry");
+    }
+
+    #[test]
+    fn split_mode_keeps_per_pad_players() {
+        let dir = TempDir::new("split-players");
+        let path = write_led_players(&dir, &format!(r#"{{"{PAD}": 3}}"#));
+        let planner = PlayerPlanner::with_path(pads_pair(), DaemonMode::Split, path);
+
+        let plan = planner.read_plan();
+        assert_eq!(plan.get(PAD), Some(&3), "own effective player");
+        assert_eq!(
+            plan.get("AA:BB:CC:DD:EE:02"),
+            Some(&2),
+            "the second pad keeps its configured player"
+        );
+
+        // No override file content: configured players are used unchanged.
+        let empty_dir = TempDir::new("split-players-empty");
+        let empty_path = empty_dir.root.join(LED_PLAYERS_FILE);
+        let planner = PlayerPlanner::with_path(pads_pair(), DaemonMode::Split, empty_path);
+        let plan = planner.read_plan();
+        assert_eq!(plan.get(PAD), Some(&1));
+        assert_eq!(plan.get("AA:BB:CC:DD:EE:02"), Some(&2));
+    }
+
+    #[test]
+    fn session_start_and_tick_read_the_override_file() {
+        // The plan the workers follow is the supervisor's fresh read, and the
+        // session-start lookup re-reads the file itself (never a cached copy).
+        let dir = TempDir::new("led-live");
+        let path = write_led_players(&dir, &format!(r#"{{"{PAD}": 6}}"#));
+        let planner = PlayerPlanner::with_path(pads_pair(), DaemonMode::Split, path.clone());
+        assert_eq!(planner.player_for(PAD), 6);
+
+        // Rewrite while "running": the next lookup sees the new value.
+        fs::write(&path, format!(r#"{{"{PAD}": 7}}"#)).expect("rewrite led-players.json");
+        assert_eq!(planner.player_for(PAD), 7, "no caching across reads");
+
+        // The shared plan mirrors the same values.
+        let plan = Arc::new(StdMutex::new(HashMap::new()));
+        let mut status = DaemonStatus::new();
+        status.upsert_controller(initial_controller_status(&pads_pair()[0]));
+        refresh_led_plan(&planner, &plan, &mut status);
+        assert_eq!(
+            plan.lock().unwrap().get(PAD).copied(),
+            Some(7),
+            "workers follow the supervisor's fresh plan"
+        );
+        assert_eq!(
+            status.controllers[0].effective_player,
+            Some(7),
+            "status mirrors the effective player"
+        );
+
+        // Unreadable/missing file falls back to the configured player.
+        let missing = PlayerPlanner::with_path(
+            pads_pair(),
+            DaemonMode::Split,
+            dir.root.join("does-not-exist.json"),
+        );
+        assert_eq!(missing.player_for(PAD), 1);
     }
 }
