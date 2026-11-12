@@ -124,6 +124,41 @@ pub enum AdapterProbe {
     Error(String),
 }
 
+/// Counts from the current BlueZ object cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryCounts {
+    pub devices: usize,
+    pub with_manufacturer: usize,
+}
+
+impl DiscoveryCounts {
+    fn detail(self) -> String {
+        format!(
+            "Device1 objects: {}, with ManufacturerData: {}",
+            self.devices, self.with_manufacturer
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryProbe {
+    Accepted(DiscoveryCounts),
+    /// StartDiscovery returned InProgress: something else already owns discovery.
+    InProgress(DiscoveryCounts),
+    Failed {
+        counts: DiscoveryCounts,
+        error: String,
+    },
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SudoBtmgmtProbe {
+    Allowed,
+    Denied(String),
+    Error(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigProbe {
     /// No config file at the canonical path.
@@ -137,6 +172,9 @@ trait SystemProbes {
     fn uinput(&self) -> Result<(), String>;
     fn privacy_unit(&self) -> SystemdUnit;
     fn adapter(&self) -> AdapterProbe;
+    fn discovery(&self) -> DiscoveryProbe;
+    fn sudo_btmgmt(&self) -> SudoBtmgmtProbe;
+    fn legacy_bridge_units(&self) -> Result<Vec<(&'static str, SystemdUnit)>, String>;
     fn other_switch2d_pids(&self) -> Result<Vec<u32>, String>;
     fn user_unit_status(&self) -> Result<SystemdUnit, String>;
     fn user_unit_text(&self) -> Result<String, String>;
@@ -162,35 +200,100 @@ impl SystemProbes for RealProbes {
     }
 
     fn adapter(&self) -> AdapterProbe {
-        let output = match Command::new("busctl")
-            .args([
-                "--system",
-                "call",
-                "org.bluez",
-                "/",
-                "org.freedesktop.DBus.ObjectManager",
-                "GetManagedObjects",
-                "--json=short",
-            ])
+        match query_bluez_objects() {
+            Ok(json) => match parse_adapters(&json) {
+                Ok(adapters) if adapters.is_empty() => AdapterProbe::None,
+                Ok(adapters) => AdapterProbe::Found(adapters),
+                Err(err) => AdapterProbe::Error(err),
+            },
+            Err(err) => AdapterProbe::Error(err),
+        }
+    }
+
+    fn discovery(&self) -> DiscoveryProbe {
+        let json = match query_bluez_objects() {
+            Ok(json) => json,
+            Err(err) => return DiscoveryProbe::Error(err),
+        };
+        let counts = parse_device_cache_counts(&json).unwrap_or_default();
+        let adapter = match parse_adapters(&json) {
+            Ok(adapters) => match adapters.into_iter().next() {
+                Some(adapter) => adapter,
+                None => {
+                    return DiscoveryProbe::Failed {
+                        counts,
+                        error: "BlueZ reported no org.bluez.Adapter1".to_string(),
+                    }
+                }
+            },
+            Err(err) => return DiscoveryProbe::Error(err),
+        };
+
+        let result = busctl_call(&[
+            "--system",
+            "call",
+            "org.bluez",
+            &adapter.path,
+            "org.bluez.Adapter1",
+            "StartDiscovery",
+        ]);
+
+        match result {
+            Ok(_) => {
+                // We started it, so leave the adapter as we found it.
+                let _ = busctl_call(&[
+                    "--system",
+                    "call",
+                    "org.bluez",
+                    &adapter.path,
+                    "org.bluez.Adapter1",
+                    "StopDiscovery",
+                ]);
+                DiscoveryProbe::Accepted(counts)
+            }
+            Err(err)
+                if err.to_ascii_lowercase().contains("inprogress")
+                    || err.to_ascii_lowercase().contains("in progress") =>
+            {
+                // Someone else owns discovery; do not stop theirs.
+                DiscoveryProbe::InProgress(counts)
+            }
+            Err(error) => DiscoveryProbe::Failed { counts, error },
+        }
+    }
+
+    fn sudo_btmgmt(&self) -> SudoBtmgmtProbe {
+        let output = match Command::new("sudo")
+            .args(["-n", "-l", "/usr/bin/btmgmt"])
             .output()
         {
             Ok(output) => output,
-            Err(err) => return AdapterProbe::Error(format!("busctl: {err}")),
+            Err(err) => return SudoBtmgmtProbe::Error(format!("sudo: {err}")),
         };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return AdapterProbe::Error(format!(
-                "busctl exited with {}: {}",
-                output.status, stderr
-            ));
+        if output.status.success() {
+            return SudoBtmgmtProbe::Allowed;
         }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let reason = if !stderr.is_empty() { stderr } else { stdout };
+        SudoBtmgmtProbe::Denied(if reason.is_empty() {
+            format!("sudo -n -l /usr/bin/btmgmt exited with {}", output.status)
+        } else {
+            reason
+        })
+    }
 
-        match parse_adapters(&String::from_utf8_lossy(&output.stdout)) {
-            Ok(adapters) if adapters.is_empty() => AdapterProbe::None,
-            Ok(adapters) => AdapterProbe::Found(adapters),
-            Err(err) => AdapterProbe::Error(err),
-        }
+    fn legacy_bridge_units(&self) -> Result<Vec<(&'static str, SystemdUnit)>, String> {
+        const UNITS: [&str; 4] = [
+            "nso-gc.service",
+            "nso-gc-watchdog.service",
+            "nso-gc-watchdog.timer",
+            "nso-gc-after-gamescope.service",
+        ];
+        Ok(UNITS
+            .iter()
+            .map(|unit| (*unit, query_systemd_unit(unit, true)))
+            .collect())
     }
 
     fn other_switch2d_pids(&self) -> Result<Vec<u32>, String> {
@@ -280,6 +383,66 @@ const UACCESS_RULE_PATHS: &[&str] = &[
     "/usr/lib/udev/rules.d/70-ngc-imu-uaccess.rules",
     "/lib/udev/rules.d/70-ngc-imu-uaccess.rules",
 ];
+
+fn query_bluez_objects() -> Result<String, String> {
+    let output = Command::new("busctl")
+        .args([
+            "--system",
+            "call",
+            "org.bluez",
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "GetManagedObjects",
+            "--json=short",
+        ])
+        .output()
+        .map_err(|err| format!("busctl: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("busctl exited with {}: {}", output.status, stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn busctl_call(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("busctl")
+        .args(args)
+        .output()
+        .map_err(|err| format!("busctl: {err}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let reason = if !stderr.is_empty() { stderr } else { stdout };
+    Err(if reason.is_empty() {
+        format!("busctl exited with {}", output.status)
+    } else {
+        reason
+    })
+}
+
+fn parse_device_cache_counts(json: &str) -> Result<DiscoveryCounts, String> {
+    let root: Value =
+        serde_json::from_str(json).map_err(|err| format!("invalid BlueZ JSON: {err}"))?;
+    let objects = root
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| "BlueZ payload has no object map at data[0]".to_string())?;
+
+    let mut counts = DiscoveryCounts::default();
+    for object in objects.values() {
+        if let Some(device) = object.get("org.bluez.Device1") {
+            counts.devices += 1;
+            if device.get("ManufacturerData").is_some() {
+                counts.with_manufacturer += 1;
+            }
+        }
+    }
+    Ok(counts)
+}
 
 /// `pgrep -af switch2d` also matches shell commands/cwds containing the name;
 /// keep only processes whose executable basename is exactly `switch2d`.
@@ -403,6 +566,9 @@ fn evaluate(probes: &dyn SystemProbes) -> Vec<CheckResult> {
         check_uinput(probes),
         check_privacy_unit(probes),
         check_adapter(probes),
+        check_discovery(probes),
+        check_sudo_btmgmt(probes),
+        check_legacy_bridge_units(probes),
         check_other_instances(probes),
         check_user_unit(probes),
         check_dsu_port(probes),
@@ -516,6 +682,124 @@ fn check_adapter(probes: &dyn SystemProbes) -> CheckResult {
             detail: format!("could not query BlueZ: {err}"),
             remedy: "install/start BlueZ (busctl) and re-run `switch2d doctor`".to_string(),
         },
+    }
+}
+
+fn check_discovery(probes: &dyn SystemProbes) -> CheckResult {
+    match probes.discovery() {
+        DiscoveryProbe::Accepted(counts) => CheckResult {
+            name: "discovery",
+            status: Status::Pass,
+            detail: format!(
+                "StartDiscovery accepted (adapter is discoverable); {}",
+                counts.detail()
+            ),
+            remedy: String::new(),
+        },
+        DiscoveryProbe::InProgress(counts) => CheckResult {
+            name: "discovery",
+            status: Status::Pass,
+            detail: format!(
+                "StartDiscovery already in progress (InProgress); {}",
+                counts.detail()
+            ),
+            remedy: String::new(),
+        },
+        DiscoveryProbe::Failed { counts, error } => CheckResult {
+            name: "discovery",
+            status: Status::Warn,
+            detail: format!(
+                "StartDiscovery failed: {error} ({}); the daemon can still work via its timed fallback, but advert-based wake will not",
+                counts.detail()
+            ),
+            remedy: "restart BlueZ (`sudo systemctl restart bluetooth`) and re-run `switch2d doctor`; if it still fails, check `busctl --system call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects --json=short`"
+                .to_string(),
+        },
+        DiscoveryProbe::Error(err) => CheckResult {
+            name: "discovery",
+            status: Status::Warn,
+            detail: format!("could not query BlueZ discovery state: {err}"),
+            remedy: "install/start BlueZ and re-run `switch2d doctor`".to_string(),
+        },
+    }
+}
+
+fn check_sudo_btmgmt(probes: &dyn SystemProbes) -> CheckResult {
+    match probes.sudo_btmgmt() {
+        SudoBtmgmtProbe::Allowed => CheckResult {
+            name: "sudo btmgmt",
+            status: Status::Pass,
+            detail: "sudo -n -l /usr/bin/btmgmt is allowed (no password prompt)".to_string(),
+            remedy: String::new(),
+        },
+        SudoBtmgmtProbe::Denied(reason) => CheckResult {
+            name: "sudo btmgmt",
+            status: Status::Fail,
+            detail: format!("passwordless sudo for /usr/bin/btmgmt is missing: {reason}"),
+            remedy: "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/btmgmt -i 0 stop-find -l, /usr/bin/btmgmt -i 0 stop-find\" | sudo tee /etc/sudoers.d/switch2d-btmgmt; sudo chmod 0440 /etc/sudoers.d/switch2d-btmgmt"
+                .to_string(),
+        },
+        SudoBtmgmtProbe::Error(err) => CheckResult {
+            name: "sudo btmgmt",
+            status: Status::Fail,
+            detail: format!("could not probe sudo rule: {err}"),
+            remedy: "install sudo and add the /etc/sudoers.d/switch2d-btmgmt rule (`$USER ALL=(root) NOPASSWD: /usr/bin/btmgmt -i 0 stop-find -l, /usr/bin/btmgmt -i 0 stop-find`)"
+                .to_string(),
+        },
+    }
+}
+
+fn check_legacy_bridge_units(probes: &dyn SystemProbes) -> CheckResult {
+    let units = match probes.legacy_bridge_units() {
+        Ok(units) => units,
+        Err(err) => {
+            return CheckResult {
+                name: "legacy bridge units",
+                status: Status::Skip,
+                detail: format!("could not query --user systemd: {err}"),
+                remedy: "run `systemctl --user list-unit-files 'nso-gc*'` as the logged-in user"
+                    .to_string(),
+            };
+        }
+    };
+
+    let mut offending = Vec::new();
+    let mut unknown = false;
+    for (name, unit) in &units {
+        if matches!(unit.enabled, UnitEnabled::Unknown(_))
+            || matches!(unit.active, UnitActive::Unknown(_))
+        {
+            unknown = true;
+        }
+        if unit.enabled == UnitEnabled::Enabled || unit.active == UnitActive::Active {
+            offending.push(*name);
+        }
+    }
+
+    if !offending.is_empty() {
+        return CheckResult {
+            name: "legacy bridge units",
+            status: Status::Warn,
+            detail: format!("enabled or active: {}", offending.join(", ")),
+            remedy: format!("systemctl --user disable --now {}", offending.join(" ")),
+        };
+    }
+
+    if unknown {
+        return CheckResult {
+            name: "legacy bridge units",
+            status: Status::Skip,
+            detail: "could not determine all nso-gc unit states".to_string(),
+            remedy: "run `systemctl --user list-unit-files 'nso-gc*'` as the logged-in user"
+                .to_string(),
+        };
+    }
+
+    CheckResult {
+        name: "legacy bridge units",
+        status: Status::Pass,
+        detail: "no nso-gc unit is enabled or active".to_string(),
+        remedy: String::new(),
     }
 }
 
@@ -748,6 +1032,9 @@ mod tests {
         privacy: SystemdUnit,
         user_unit: SystemdUnit,
         user_unit_text: Result<String, String>,
+        discovery: DiscoveryProbe,
+        sudo_btmgmt: SudoBtmgmtProbe,
+        legacy_bridge_units: Result<Vec<(&'static str, SystemdUnit)>, String>,
     }
 
     impl Default for FakeProbes {
@@ -762,6 +1049,12 @@ mod tests {
                     active: UnitActive::Inactive,
                 },
                 user_unit_text: Ok("[Service]\nExecStart=/bin/sh run\n".to_string()),
+                discovery: DiscoveryProbe::Accepted(DiscoveryCounts {
+                    devices: 2,
+                    with_manufacturer: 1,
+                }),
+                sudo_btmgmt: SudoBtmgmtProbe::Allowed,
+                legacy_bridge_units: Ok(Vec::new()),
             }
         }
     }
@@ -782,6 +1075,18 @@ mod tests {
                 name: Some("test adapter".to_string()),
                 le: Some(true),
             }])
+        }
+
+        fn discovery(&self) -> DiscoveryProbe {
+            self.discovery.clone()
+        }
+
+        fn sudo_btmgmt(&self) -> SudoBtmgmtProbe {
+            self.sudo_btmgmt.clone()
+        }
+
+        fn legacy_bridge_units(&self) -> Result<Vec<(&'static str, SystemdUnit)>, String> {
+            self.legacy_bridge_units.clone()
         }
 
         fn other_switch2d_pids(&self) -> Result<Vec<u32>, String> {
@@ -957,6 +1262,61 @@ mod tests {
         let unit = check_named(&checks, "user unit");
         assert_eq!(unit.status, Status::Pass);
         assert!(unit.detail.contains("ExecStart path /bin/sh exists"));
+    }
+
+    #[test]
+    fn discovery_in_progress_maps_to_pass() {
+        let probes = FakeProbes {
+            discovery: DiscoveryProbe::InProgress(DiscoveryCounts {
+                devices: 3,
+                with_manufacturer: 2,
+            }),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let discovery = check_named(&checks, "discovery");
+        assert_eq!(discovery.status, Status::Pass);
+        assert!(
+            discovery.detail.contains("InProgress"),
+            "{}",
+            discovery.detail
+        );
+        assert!(
+            discovery
+                .detail
+                .contains("Device1 objects: 3, with ManufacturerData: 2"),
+            "{}",
+            discovery.detail
+        );
+    }
+
+    #[test]
+    fn active_legacy_watchdog_warns_with_disable_command() {
+        let probes = FakeProbes {
+            legacy_bridge_units: Ok(vec![(
+                "nso-gc-watchdog.timer",
+                SystemdUnit {
+                    enabled: UnitEnabled::Enabled,
+                    active: UnitActive::Active,
+                },
+            )]),
+            ..FakeProbes::default()
+        };
+        let checks = evaluate(&probes);
+        let legacy = check_named(&checks, "legacy bridge units");
+        assert_eq!(legacy.status, Status::Warn);
+        assert!(
+            legacy.detail.contains("nso-gc-watchdog.timer"),
+            "{}",
+            legacy.detail
+        );
+        assert!(
+            legacy
+                .remedy
+                .contains("systemctl --user disable --now nso-gc-watchdog.timer"),
+            "{}",
+            legacy.remedy
+        );
     }
 
     #[test]
