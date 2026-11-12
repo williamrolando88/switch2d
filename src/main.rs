@@ -2,8 +2,11 @@
 //! for Nintendo Switch 2 controllers (Joy-Con 2, Pro Controller 2, NSO GameCube).
 
 use clap::{Parser, Subcommand};
+use evdev::{AbsoluteAxisType, Key};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -12,6 +15,10 @@ use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
 use switch2d::controller::{BondPolicy, ConnectOptions, SwitchController};
 use switch2d::daemon::Daemon;
 use switch2d::protocol::constants::*;
+use switch2d::protocol::vibration::{amplitude, payload, stop_payload, Layout, Sample};
+use switch2d::uinput::gamepad::{
+    find_node, VirtualGamepad, KEYS, STICK_MAX, STICK_MIN, TRIGGER_MAX, TRIGGER_MIN,
+};
 
 #[derive(Parser)]
 #[command(name = "switch2d")]
@@ -84,6 +91,14 @@ enum Commands {
         /// MAC address to remove
         mac: String,
     },
+
+    /// Hardware smoke test: create a virtual pad, print what the kernel sees,
+    /// and drive a visible button/stick sweep. No controller or Bluetooth needed.
+    Selftest {
+        /// How long to drive the visible sweep, in seconds
+        #[arg(long, default_value_t = 6)]
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -122,8 +137,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let command = cli.command.unwrap_or(Commands::Status);
+
+    // The selftest exercises only the uinput half of the daemon: it must not
+    // touch Bluetooth at all, so skip adapter autodetection (a
+    // `bluetoothctl list` shell-out) for it.
     // Auto-detect adapter if empty
-    if config.adapter_mac.is_empty() {
+    if config.adapter_mac.is_empty() && !matches!(command, Commands::Selftest { .. }) {
         if let Some(detected) = auto_detect_adapter() {
             info!("Auto-detected Bluetooth adapter: {}", detected);
             config.adapter_mac = detected;
@@ -131,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    match cli.command.unwrap_or(Commands::Status) {
+    match command {
         Commands::Run => {
             println!("===========================================================");
             println!("   Nintendo Switch 2 Linux Gamepad Daemon (Rust)");
@@ -338,6 +358,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.save()?;
             println!("Registered controller {} ({}) as Player {}.", final_name, clean_mac, player);
         }
+        Commands::Selftest { seconds } => {
+            run_selftest(seconds).await?;
+        }
         Commands::Remove { mac } => {
             let clean_mac = mac.trim().to_uppercase();
             let initial_len = config.controllers.len();
@@ -351,6 +374,306 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `switch2d selftest` — uinput hardware smoke test (no Bluetooth, no pad)
+// ---------------------------------------------------------------------------
+
+const SELFTEST_NAME: &str = "switch2d selftest";
+const SELFTEST_PRODUCT_ID: u16 = PRO_CONTROLLER2_PID;
+const SELFTEST_TAG: &str = "AA:BB:CC:DD:EE:FF";
+const SELFTEST_STEP_INTERVAL: Duration = Duration::from_millis(80);
+
+/// One visible step of the selftest sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Both sticks (and both stick axes) to `(x, y)`.
+    Sticks { x: i32, y: i32, label: &'static str },
+    /// Both triggers to a raw 0..=255 value.
+    Triggers { value: u8, label: &'static str },
+    /// One button pressed or released.
+    Button { key: Key, pressed: bool },
+    /// Every axis to 0 and every button released.
+    Neutral,
+}
+
+/// The complete sweep: four stick corners, centre, trigger 0 -> 255 -> 0, then
+/// every button pressed and released once. One pass is ~3 s at 80 ms per step.
+fn sweep_plan() -> Vec<Step> {
+    let mut plan = vec![
+        Step::Sticks {
+            x: STICK_MIN,
+            y: STICK_MIN,
+            label: "both sticks top-left",
+        },
+        Step::Sticks {
+            x: STICK_MAX,
+            y: STICK_MIN,
+            label: "both sticks top-right",
+        },
+        Step::Sticks {
+            x: STICK_MAX,
+            y: STICK_MAX,
+            label: "both sticks bottom-right",
+        },
+        Step::Sticks {
+            x: STICK_MIN,
+            y: STICK_MAX,
+            label: "both sticks bottom-left",
+        },
+        Step::Sticks {
+            x: 0,
+            y: 0,
+            label: "both sticks centred",
+        },
+        Step::Triggers {
+            value: TRIGGER_MIN as u8,
+            label: "both triggers released (0)",
+        },
+        Step::Triggers {
+            value: TRIGGER_MAX as u8,
+            label: "both triggers fully pressed (255)",
+        },
+        Step::Triggers {
+            value: TRIGGER_MIN as u8,
+            label: "both triggers released (0)",
+        },
+    ];
+
+    for key in KEYS {
+        plan.push(Step::Button { key, pressed: true });
+        plan.push(Step::Button {
+            key,
+            pressed: false,
+        });
+    }
+
+    plan.push(Step::Neutral);
+    plan
+}
+
+fn describe(step: Step) -> String {
+    match step {
+        Step::Sticks { x, y, label } => format!("{label} (X/Y/RX/RY = {x}, {y})"),
+        Step::Triggers { value, label } => format!("{label} (Z/RZ = {value})"),
+        Step::Button { key, pressed } => {
+            format!("{key:?} {}", if pressed { "pressed" } else { "released" })
+        }
+        Step::Neutral => "all axes neutral, every button released".to_string(),
+    }
+}
+
+fn apply_step(gamepad: &VirtualGamepad, step: Step) {
+    match step {
+        Step::Sticks { x, y, .. } => {
+            gamepad.set_abs(AbsoluteAxisType::ABS_X, x);
+            gamepad.set_abs(AbsoluteAxisType::ABS_Y, y);
+            gamepad.set_abs(AbsoluteAxisType::ABS_RX, x);
+            gamepad.set_abs(AbsoluteAxisType::ABS_RY, y);
+        }
+        Step::Triggers { value, .. } => {
+            gamepad.set_abs(AbsoluteAxisType::ABS_Z, i32::from(value));
+            gamepad.set_abs(AbsoluteAxisType::ABS_RZ, i32::from(value));
+        }
+        Step::Button { key, pressed } => {
+            gamepad.set_key(key, pressed);
+        }
+        Step::Neutral => {
+            for axis in [
+                AbsoluteAxisType::ABS_X,
+                AbsoluteAxisType::ABS_Y,
+                AbsoluteAxisType::ABS_RX,
+                AbsoluteAxisType::ABS_RY,
+                AbsoluteAxisType::ABS_Z,
+                AbsoluteAxisType::ABS_RZ,
+                AbsoluteAxisType::ABS_HAT0X,
+                AbsoluteAxisType::ABS_HAT0Y,
+            ] {
+                gamepad.set_abs(axis, 0);
+            }
+            for key in KEYS {
+                gamepad.set_key(key, false);
+            }
+        }
+    }
+    gamepad.sync();
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn run_selftest(seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== switch2d selftest (uinput only, no Bluetooth) ===");
+
+    let gamepad = match VirtualGamepad::new(SELFTEST_NAME, SELFTEST_PRODUCT_ID, SELFTEST_TAG) {
+        Ok(pad) => pad,
+        Err(err) => {
+            println!(
+                "selftest: cannot create a virtual pad: {err}. /dev/uinput must exist and be \
+                 writable (input group / udev rule). This is an environment problem, not a bug; \
+                 skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let Some((path, device)) = find_node(SELFTEST_NAME) else {
+        println!(
+            "selftest: the pad registered with the kernel but no /dev/input/event* node appeared \
+             within 1 s; skipping (environment problem)."
+        );
+        return Ok(());
+    };
+
+    // Everything below is what the KERNEL reports, not what we asked for.
+    println!("node:     {}", path.display());
+    println!("name:     {}", device.name().unwrap_or("<none>"));
+    println!("phys:     {}", device.physical_path().unwrap_or("<none>"));
+    println!("uniq:     {}", device.unique_name().unwrap_or("<none>"));
+    let id = device.input_id();
+    println!(
+        "input id: bus {:#06x} vendor {:#06x} product {:#06x} version {:#06x}",
+        id.bus_type().0,
+        id.vendor(),
+        id.product(),
+        id.version()
+    );
+
+    let abs_state = device.get_abs_state().ok();
+    match (device.supported_absolute_axes(), abs_state) {
+        (Some(axes), Some(state)) => {
+            println!("abs axes ({}):", axes.iter().count());
+            for axis in axes.iter() {
+                let info = &state[axis.0 as usize];
+                println!(
+                    "  {axis:?} (0x{:02x}): min {} max {} fuzz {} flat {} value {}",
+                    axis.0, info.minimum, info.maximum, info.fuzz, info.flat, info.value
+                );
+            }
+        }
+        _ => println!("abs axes: none"),
+    }
+
+    let keys = device.supported_keys();
+    println!("keys:     {}", keys.map_or(0, |keys| keys.iter().count()));
+    for key in [Key::BTN_SOUTH, Key::BTN_NORTH, Key::BTN_C, Key::BTN_TL2] {
+        let present = keys.is_some_and(|keys| keys.contains(key));
+        println!("  {key:?}: {}", if present { "present" } else { "MISSING" });
+    }
+
+    println!();
+    println!("Watch it in another terminal:");
+    println!("  evtest {}", path.display());
+    println!();
+
+    println!("HD rumble payloads the encoder emits (Pro Controller 2 = 33 B dual block):");
+    let sample = Sample::with_amplitudes(amplitude(0.5, 0.0), 0);
+    println!(
+        "  target 0.5: {}",
+        hex(&payload(Layout::DualBlock, 0x50, &sample))
+    );
+    println!(
+        "  stop:       {}",
+        hex(&stop_payload(Layout::DualBlock, 0x50))
+    );
+    println!("HD rumble payloads for a single-block pad (Joy-Con / GameCube = 17 B):");
+    println!(
+        "  target 0.5: {}",
+        hex(&payload(Layout::SingleBlock, 0x50, &sample))
+    );
+    println!(
+        "  stop:       {}",
+        hex(&stop_payload(Layout::SingleBlock, 0x50))
+    );
+    println!();
+
+    let plan = sweep_plan();
+    println!(
+        "Driving {} steps per pass every {} ms for {} s...",
+        plan.len(),
+        SELFTEST_STEP_INTERVAL.as_millis(),
+        seconds
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let worker = tokio::task::spawn_blocking(move || {
+        let sweep_for = Duration::from_secs(seconds);
+        let start = Instant::now();
+        let mut passes = 0usize;
+
+        // Always do at least one full pass, even with `--seconds 0`.
+        while passes == 0 || start.elapsed() < sweep_for {
+            for step in &plan {
+                if passes > 0 && start.elapsed() >= sweep_for {
+                    break;
+                }
+                if worker_cancel.load(Ordering::Relaxed) {
+                    apply_step(&gamepad, Step::Neutral);
+                    println!("selftest: interrupted; virtual pad released.");
+                    return;
+                }
+
+                apply_step(&gamepad, *step);
+                println!(
+                    "[{:5.2}s] {}",
+                    start.elapsed().as_secs_f32(),
+                    describe(*step)
+                );
+                std::thread::sleep(SELFTEST_STEP_INTERVAL);
+            }
+            passes += 1;
+        }
+
+        apply_step(&gamepad, Step::Neutral);
+        println!("Sweep finished after {passes} pass(es). Virtual pad released.");
+    });
+
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            _ = interrupt.as_mut() => {
+                // The blocking worker notices within one 80 ms step, then drops
+                // the pad; `RawUinput::drop` destroys the node.
+                cancel.store(true, Ordering::Relaxed);
+                println!("selftest: Ctrl-C received, releasing the virtual pad...");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if worker.is_finished() {
+                    break;
+                }
+            }
+        }
+    }
+    worker.await?;
+
+    // The pad is dropped here (RawUinput::drop destroys it): confirm the node
+    // really disappears instead of asserting it.
+    let mut gone = false;
+    for _ in 0..20 {
+        if !path.exists() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "Done. {} {}",
+        path.display(),
+        if gone {
+            "is gone."
+        } else {
+            "is still present (it will vanish when the process exits)."
+        }
+    );
     Ok(())
 }
 
@@ -403,4 +726,86 @@ fn auto_detect_adapter() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod selftest_tests {
+    use super::*;
+
+    #[test]
+    fn selftest_sweep_sequence_covers_all_buttons_and_axis_extremes() {
+        let plan = sweep_plan();
+
+        // Every exported button is pressed exactly once and released exactly
+        // once, and the plan contains no other button steps.
+        for key in KEYS {
+            let presses = plan
+                .iter()
+                .filter(|step| matches!(step, Step::Button { key: k, pressed: true } if *k == key))
+                .count();
+            let releases = plan
+                .iter()
+                .filter(|step| matches!(step, Step::Button { key: k, pressed: false } if *k == key))
+                .count();
+            assert_eq!(presses, 1, "{key:?} must be pressed exactly once");
+            assert_eq!(releases, 1, "{key:?} must be released exactly once");
+        }
+        let button_steps = plan
+            .iter()
+            .filter(|step| matches!(step, Step::Button { .. }))
+            .count();
+        assert_eq!(button_steps, KEYS.len() * 2);
+
+        // Both sticks hit every corner and the centre.
+        for (x, y) in [
+            (STICK_MIN, STICK_MIN),
+            (STICK_MAX, STICK_MIN),
+            (STICK_MAX, STICK_MAX),
+            (STICK_MIN, STICK_MAX),
+            (0, 0),
+        ] {
+            assert!(
+                plan.iter().any(
+                    |step| matches!(step, Step::Sticks { x: sx, y: sy, .. } if *sx == x && *sy == y)
+                ),
+                "missing stick position ({x}, {y})"
+            );
+        }
+
+        let xs: Vec<i32> = plan
+            .iter()
+            .filter_map(|step| match step {
+                Step::Sticks { x, .. } => Some(*x),
+                _ => None,
+            })
+            .collect();
+        let ys: Vec<i32> = plan
+            .iter()
+            .filter_map(|step| match step {
+                Step::Sticks { y, .. } => Some(*y),
+                _ => None,
+            })
+            .collect();
+        assert!(xs.contains(&STICK_MIN) && xs.contains(&STICK_MAX));
+        assert!(ys.contains(&STICK_MIN) && ys.contains(&STICK_MAX));
+
+        // Triggers sweep 0 -> 255 -> 0.
+        let triggers: Vec<u8> = plan
+            .iter()
+            .filter_map(|step| match step {
+                Step::Triggers { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert!(triggers.contains(&(TRIGGER_MIN as u8)));
+        assert!(triggers.contains(&(TRIGGER_MAX as u8)));
+        assert_eq!(
+            triggers,
+            vec![0, 255, 0],
+            "trigger sweep must be 0 -> 255 -> 0"
+        );
+
+        // The sweep ends neutral so nothing is left held.
+        assert_eq!(plan.last(), Some(&Step::Neutral));
+    }
 }

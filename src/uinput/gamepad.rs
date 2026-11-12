@@ -19,7 +19,8 @@ pub const TRIGGER_MAX: i32 = 255;
 /// shim key off it, so it must not be changed casually.
 const PHYS_PREFIX: &str = "ngc/";
 
-const KEYS: [Key; 15] = [
+/// Every button the virtual pad exposes (also used by the selftest plan).
+pub const KEYS: [Key; 15] = [
     // Face buttons (standard evdev diamond positions)
     Key::BTN_SOUTH,
     Key::BTN_EAST,
@@ -148,6 +149,24 @@ impl VirtualGamepad {
     }
 }
 
+/// Locate a device's evdev node by name, polling up to 1 s.
+///
+/// uinput registration is synchronous in sysfs, but `/dev/input/eventN` appears
+/// via devtmpfs a moment later, so callers must poll briefly. Shared by the
+/// tests below and `switch2d selftest`.
+///
+/// (Kernel-visible naming: this is the helper the selftest uses to print the
+/// node path and capabilities the kernel reports, not the values we requested.)
+pub fn find_node(name: &str) -> Option<(std::path::PathBuf, evdev::Device)> {
+    for _ in 0..40 {
+        if let Some(found) = evdev::enumerate().find(|(_, device)| device.name() == Some(name)) {
+            return Some(found);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    None
+}
+
 /// Record `value` for `code` and report whether it changed.
 fn store_if_changed(state: &Mutex<HashMap<u16, i32>>, code: u16, value: i32) -> bool {
     let mut state = state
@@ -181,18 +200,10 @@ mod tests {
         }
     }
 
-    /// uinput registration is synchronous in sysfs but the `/dev/input/eventN`
-    /// node appears via devtmpfs a moment later, so poll briefly.
     fn find_device(name: &str) -> evdev::Device {
-        for _ in 0..40 {
-            if let Some((_, device)) =
-                evdev::enumerate().find(|(_, device)| device.name() == Some(name))
-            {
-                return device;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        panic!("device {name:?} did not appear in evdev within 1s");
+        find_node(name)
+            .unwrap_or_else(|| panic!("device {name:?} did not appear in evdev within 1s"))
+            .1
     }
 
     #[test]
