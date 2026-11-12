@@ -4,7 +4,7 @@
 //! the dual-block rumble layout and the Pro vibration UUID in the protocol
 //! constants, but no Pro Controller 2 has been through a hardware round yet.
 
-use super::{led_pattern_for, ControllerProfile, Support};
+use super::{led_pattern_for, ControllerProfile, Sticks, Support};
 use crate::protocol::constants::{PRO_CONTROLLER2_PID, VIBRATION_PRO_CONTROLLER_UUID};
 use crate::protocol::vibration::Layout;
 
@@ -12,6 +12,7 @@ pub static PROFILE: ControllerProfile = ControllerProfile {
     pid: PRO_CONTROLLER2_PID,
     name: "Pro Controller 2",
     support: Support::Speculative,
+    sticks: Sticks::Both,
     vibration_uuid: VIBRATION_PRO_CONTROLLER_UUID,
     rumble_layout: Layout::DualBlock,
     analog_triggers: false,

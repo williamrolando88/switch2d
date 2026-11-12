@@ -47,12 +47,29 @@ pub const STANDARD_CALIBRATION: CalibrationAddresses = CalibrationAddresses {
     gc_triggers: None,
 };
 
+/// Which calibration block(s) a model actually populates.
+///
+/// A single-stick Joy-Con 2 stores its stick calibration in the LEFT block even
+/// when the physical stick reports on the right axis; `controller.rs` uses this
+/// to avoid handing the right stick the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sticks {
+    /// Only the left calibration block is populated.
+    Left,
+    /// Only the right calibration block is populated.
+    Right,
+    /// Both blocks are populated independently (Pro Controller 2, GameCube).
+    Both,
+}
+
 /// Everything `controller.rs` needs to know about one controller model.
 #[derive(Debug, Clone, Copy)]
 pub struct ControllerProfile {
     pub pid: u16,
     pub name: &'static str,
     pub support: Support,
+    /// Which calibration block(s) this model populates.
+    pub sticks: Sticks,
     /// Vibration characteristic UUID (PID-specific on Joy-Con 2).
     pub vibration_uuid: &'static str,
     /// Single block (Joy-Con / GameCube) or dual block (Pro Controller 2).
@@ -110,6 +127,26 @@ mod tests {
     use crate::protocol::constants::{
         JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID, NSO_GAMECUBE_PID, PRO_CONTROLLER2_PID,
     };
+
+    #[test]
+    fn stick_layout_matches_the_model() {
+        assert_eq!(
+            profile_for(JOYCON2_LEFT_PID).expect("left").sticks,
+            Sticks::Left
+        );
+        assert_eq!(
+            profile_for(JOYCON2_RIGHT_PID).expect("right").sticks,
+            Sticks::Right
+        );
+        assert_eq!(
+            profile_for(PRO_CONTROLLER2_PID).expect("pro").sticks,
+            Sticks::Both
+        );
+        assert_eq!(
+            profile_for(NSO_GAMECUBE_PID).expect("gc").sticks,
+            Sticks::Both
+        );
+    }
 
     #[test]
     fn registry_covers_every_known_pid() {

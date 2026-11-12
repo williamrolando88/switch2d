@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::bluetooth::att::{AttClient, ResolvedHandles};
 use crate::bluetooth::l2cap::L2capSocket;
-use crate::profiles::{self, ControllerProfile};
+use crate::profiles::{self, ControllerProfile, Sticks};
 use crate::protocol::calibration::{
     normalize_gc_trigger, StickCalibration, GC_TRIGGER_DEFAULT_NEUTRAL,
 };
@@ -93,6 +93,63 @@ pub fn choose_calibration(
         return (calibration, CalibrationSource::Factory);
     }
     (StickCalibration::default(), CalibrationSource::Default)
+}
+
+/// Which calibration block was used for each physical stick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickCalibrationChoice {
+    pub left: StickCalibration,
+    pub right: StickCalibration,
+    /// True when a single-stick pad fell back to the left block for its right
+    /// stick because the right block was unwritten.
+    pub right_from_left: bool,
+}
+
+/// Choose the calibration for each physical stick from the two blocks the pad
+/// returned (`None` = neither the user nor factory area parsed).
+///
+/// A single-stick Joy-Con 2 stores its stick calibration in the LEFT block on
+/// both halves, even when the physical stick reports on the right axis. The
+/// profile's [`Sticks`] layout decides whether that cross-over is allowed, so
+/// dual-stick pads (Pro Controller 2, GameCube) never inherit the other stick's
+/// values.
+pub fn choose_stick_calibrations(
+    sticks: Sticks,
+    left: Option<Vec<u8>>,
+    right: Option<Vec<u8>>,
+) -> StickCalibrationChoice {
+    let left_cal = left.as_deref().and_then(StickCalibration::from_bytes);
+    let right_cal = right.as_deref().and_then(StickCalibration::from_bytes);
+
+    match sticks {
+        Sticks::Both => StickCalibrationChoice {
+            left: left_cal.unwrap_or_default(),
+            right: right_cal.unwrap_or_default(),
+            right_from_left: false,
+        },
+        Sticks::Left => StickCalibrationChoice {
+            left: left_cal.unwrap_or_default(),
+            right: StickCalibration::default(),
+            right_from_left: false,
+        },
+        Sticks::Right => match (right_cal, left_cal) {
+            (Some(right), _) => StickCalibrationChoice {
+                left: StickCalibration::default(),
+                right,
+                right_from_left: false,
+            },
+            (None, Some(left)) => StickCalibrationChoice {
+                left: StickCalibration::default(),
+                right: left,
+                right_from_left: true,
+            },
+            (None, None) => StickCalibrationChoice {
+                left: StickCalibration::default(),
+                right: StickCalibration::default(),
+                right_from_left: false,
+            },
+        },
+    }
 }
 
 /// GC trigger neutral byte, rejecting the `0x00`/`0xFF` sentinels.
@@ -992,28 +1049,44 @@ impl SwitchController {
     /// returns an error so the session survives.
     fn read_calibration(&mut self) {
         let addresses = self.profile.calibration;
-        self.left_calib = self.read_stick_calibration(
+        // Always read both areas: the profile decides which block feeds which
+        // physical stick afterwards.
+        let left_block = self.read_stick_calibration(
             addresses.user_left,
             addresses.factory_left,
             "left",
         );
-        self.right_calib = self.read_stick_calibration(
+        let right_block = self.read_stick_calibration(
             addresses.user_right,
             addresses.factory_right,
             "right",
         );
+
+        let choice = choose_stick_calibrations(self.profile.sticks, left_block, right_block);
+        if choice.right_from_left {
+            info!(
+                "single-stick pad: using the left calibration block for the right stick (0x{:08X})",
+                addresses.user_left
+            );
+        }
+        self.left_calib = choice.left;
+        self.right_calib = choice.right;
 
         if let Some(trigger_address) = addresses.gc_triggers {
             self.trigger_neutral = self.read_gc_trigger_neutral(trigger_address);
         }
     }
 
+    /// Read one stick's user/factory areas and return the selected raw block.
+    ///
+    /// `None` means neither area parsed (the default-calibration WARN carries
+    /// the evidence).
     fn read_stick_calibration(
         &self,
         user_address: u32,
         factory_address: u32,
         stick: &str,
-    ) -> StickCalibration {
+    ) -> Option<Vec<u8>> {
         let user_result = self.read_memory(CALIBRATION_LEN, user_address);
         crate::protocol::calibration::log_calibration_read(
             stick,
@@ -1080,8 +1153,16 @@ impl SwitchController {
             None => None,
         };
 
-        let (calibration, source) = choose_calibration(user.as_deref(), factory.as_deref());
+        let (_, source) = choose_calibration(user.as_deref(), factory.as_deref());
         match source {
+            CalibrationSource::User => {
+                debug!("{stick} stick calibration source: {source:?}");
+                user
+            }
+            CalibrationSource::Factory => {
+                debug!("{stick} stick calibration source: {source:?}");
+                factory
+            }
             CalibrationSource::Default => {
                 warn!(
                     "{}",
@@ -1093,10 +1174,9 @@ impl SwitchController {
                         factory_result.as_ref()
                     )
                 );
+                None
             }
-            _ => debug!("{stick} stick calibration source: {source:?}"),
         }
-        calibration
     }
 
     fn read_gc_trigger_neutral(&self, address: u32) -> (u8, u8) {
@@ -1358,6 +1438,12 @@ mod tests {
     ];
     const UNWRITTEN: [u8; 11] = [0xFF; 11];
 
+    /// Realistic single-stick block: centre 2048, max/min delta 1254. This is
+    /// the shape that makes a Joy-Con report ±1.00 with its own calibration.
+    const REAL_STICK_CALIBRATION: [u8; 11] = [
+        0x00, 0x08, 0x80, 0xE6, 0x64, 0x4E, 0xE6, 0x64, 0x4E, 0x00, 0x00,
+    ];
+
     #[test]
     fn choose_calibration_matrix() {
         let expected_user = StickCalibration::from_bytes(&VALID_CALIBRATION).expect("valid user");
@@ -1391,6 +1477,83 @@ mod tests {
             choose_calibration(Some(&VALID_CALIBRATION[..8]), Some(&FACTORY_CALIBRATION)),
             (expected_factory, CalibrationSource::Factory)
         );
+    }
+
+    #[test]
+    fn single_stick_right_falls_back_to_left_block() {
+        let left = REAL_STICK_CALIBRATION.to_vec();
+        let expected_left = StickCalibration::from_bytes(&left).expect("left parses");
+
+        let choice = choose_stick_calibrations(
+            Sticks::Right,
+            Some(left),
+            Some(vec![0xFF; 11]),
+        );
+
+        assert_eq!(choice.left, StickCalibration::default());
+        assert_eq!(choice.right, expected_left, "right stick uses the left block");
+        assert!(choice.right_from_left);
+
+        // The reported 0.74 cap is the built-in default:
+        // (3302 - 2048) / 1700 = 0.7376. With the parsed left block the same
+        // raw sample reaches ±1.00.
+        let raw = (3302, 2048);
+        let (default_x, _) = StickCalibration::default().apply(raw, 0);
+        let (fixed_x, _) = choice.right.apply(raw, 0);
+        assert!((default_x - 0.7376).abs() < 1e-3, "default x = {default_x}");
+        assert!((fixed_x - 1.0).abs() < 1e-6, "fixed x = {fixed_x}");
+    }
+
+    #[test]
+    fn single_stick_right_prefers_its_own_block_when_valid() {
+        let left = VALID_CALIBRATION.to_vec();
+        let right = FACTORY_CALIBRATION.to_vec();
+        let expected_left = StickCalibration::from_bytes(&left).expect("left parses");
+        let expected_right = StickCalibration::from_bytes(&right).expect("right parses");
+        assert_ne!(expected_left, expected_right);
+
+        let choice =
+            choose_stick_calibrations(Sticks::Right, Some(left), Some(right));
+
+        assert_eq!(choice.left, StickCalibration::default());
+        assert_eq!(choice.right, expected_right);
+        assert_ne!(choice.right, expected_left);
+        assert!(!choice.right_from_left);
+    }
+
+    #[test]
+    fn both_stick_profiles_never_cross_over() {
+        let left = VALID_CALIBRATION.to_vec();
+        let expected_left = StickCalibration::from_bytes(&left).expect("left parses");
+
+        // Pro Controller 2 / GameCube: a bad right block must stay default,
+        // never inherit the left block.
+        let choice = choose_stick_calibrations(
+            Sticks::Both,
+            Some(left),
+            Some(vec![0xFF; 11]),
+        );
+
+        assert_eq!(choice.left, expected_left);
+        assert_eq!(choice.right, StickCalibration::default());
+        assert!(!choice.right_from_left);
+    }
+
+    #[test]
+    fn single_stick_left_does_not_use_right_block() {
+        let right = FACTORY_CALIBRATION.to_vec();
+        let expected_right = StickCalibration::from_bytes(&right).expect("right parses");
+
+        let choice = choose_stick_calibrations(
+            Sticks::Left,
+            Some(vec![0xFF; 11]),
+            Some(right),
+        );
+
+        assert_eq!(choice.left, StickCalibration::default());
+        assert_eq!(choice.right, StickCalibration::default());
+        assert_ne!(choice.right, expected_right, "left pad must not read the right block");
+        assert!(!choice.right_from_left);
     }
 
     #[test]
