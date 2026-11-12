@@ -5,7 +5,7 @@ reproduced) from **speculative** behaviour (implemented from the protocol refere
 from the upstream Python project, never observed here). Nothing in the speculative rows
 should be quoted as working.
 
-Last updated: after round 6 hardware sessions (build `ab31ac3`).
+Last updated: after round 6B hardware sessions (build `b380fad`).
 
 Round 6 validated the full path end to end: clean-slate pairing, both pads, combined
 input without starvation, wake reconnect without SYNC, and automatic recovery after a
@@ -48,7 +48,7 @@ input without starvation, wake reconnect without SYNC, and automatic recovery af
 | HD rumble (60 Hz stream) | 🧪 coded, not wired to force-feedback | 🧪 | 🧪 |
 | Preset rumble | — | — | 🧪 coded, not wired |
 | DSU motion output | 🧪 coded, not wired | 🧪 | 🧪 |
-| Combined mode | ✅ both pads, one node, no starvation (round 6); daemon calibration fix `5e8c4a9` awaiting a hardware re-check | — | — |
+| Combined mode | ✅ both pads, one node, no starvation, full ±32767 on all four axes (rounds 6 and 6B) | — | — |
 | Player LED in combined mode | ⚠️ cosmetic gap: each pad lights its own configured player (1 LED / 2 LEDs) instead of both showing the pair's number, as real hardware does. Scheduled with the 09B daemon rewrite, where the combined player becomes a first-class field. | — | — |
 | Split mode | 🧪 coded, not hardware-validated | — | — |
 
