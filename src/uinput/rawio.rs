@@ -28,11 +28,20 @@ const IOC_NRSHIFT: u32 = 0;
 const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + IOC_NRBITS;
 const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + IOC_TYPEBITS;
 const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
+const IOC_READ: u32 = 2;
 const IOC_WRITE: u32 = 1;
 
 /// `_IOW`-style request number. `UINPUT_IOCTL_BASE` is `0x55`.
 const fn iow(nr: u32, size: usize) -> libc::c_ulong {
     ((IOC_WRITE << IOC_DIRSHIFT)
+        | ((size as u32) << IOC_SIZESHIFT)
+        | ((0x55u32) << IOC_TYPESHIFT)
+        | (nr << IOC_NRSHIFT)) as libc::c_ulong
+}
+
+/// `_IOWR`-style request number (kernel both reads and writes the struct).
+const fn iowr(nr: u32, size: usize) -> libc::c_ulong {
+    (((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT)
         | ((size as u32) << IOC_SIZESHIFT)
         | ((0x55u32) << IOC_TYPESHIFT)
         | (nr << IOC_NRSHIFT)) as libc::c_ulong
@@ -53,6 +62,13 @@ pub const UI_SET_ABSBIT: libc::c_ulong = iow(103, size_of::<libc::c_int>());
 pub const UI_SET_FFBIT: libc::c_ulong = iow(107, size_of::<libc::c_int>());
 pub const UI_SET_PHYS: libc::c_ulong = iow(108, size_of::<*const u8>());
 pub const UI_SET_PROPBIT: libc::c_ulong = iow(110, size_of::<libc::c_int>());
+
+// The BEGIN variants are `_IOWR` in <linux/uinput.h> (the kernel fills the
+// struct in), the END variants are `_IOW` (the kernel reads it back).
+pub const UI_BEGIN_FF_UPLOAD: libc::c_ulong = iowr(200, size_of::<UinputFfUpload>());
+pub const UI_END_FF_UPLOAD: libc::c_ulong = iow(201, size_of::<UinputFfUpload>());
+pub const UI_BEGIN_FF_ERASE: libc::c_ulong = iowr(202, size_of::<UinputFfErase>());
+pub const UI_END_FF_ERASE: libc::c_ulong = iow(203, size_of::<UinputFfErase>());
 
 // ---------------------------------------------------------------------------
 // Kernel ABI structs
@@ -153,6 +169,98 @@ pub struct UinputAbsSetup {
     pub absinfo: AbsInfo,
 }
 
+/// `struct ff_trigger`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FfTrigger {
+    pub button: u16,
+    pub interval: u16,
+}
+
+/// `struct ff_replay`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FfReplay {
+    pub length: u16,
+    pub delay: u16,
+}
+
+/// `struct ff_effect` from `<linux/input.h>`.
+///
+/// Size is 48 with an 8-byte-aligned 32-byte union on 64-bit Linux. `u` is
+/// modelled as `[u32; 8]`, which keeps the union at offset 16 and the struct at
+/// 48 bytes; the rumble magnitudes are the first two native-endian `u16`s of
+/// that storage (offsets 16 and 18 — see `effect_sizes_and_magnitude_offsets`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfEffect {
+    pub type_: u16,
+    pub id: i16,
+    pub direction: u16,
+    pub trigger: FfTrigger,
+    pub replay: FfReplay,
+    pub u: [u32; 8],
+}
+
+impl Default for FfEffect {
+    fn default() -> Self {
+        Self {
+            type_: 0,
+            id: 0,
+            direction: 0,
+            trigger: FfTrigger::default(),
+            replay: FfReplay::default(),
+            u: [0u32; 8],
+        }
+    }
+}
+
+impl FfEffect {
+    /// Build an `FF_RUMBLE` effect (used by the decode layer and its tests).
+    pub fn rumble(id: i16, strong: u16, weak: u16) -> Self {
+        let mut effect = Self {
+            type_: 0x50,
+            id,
+            ..Self::default()
+        };
+        effect.u[0] = u32::from_ne_bytes([
+            strong as u8,
+            (strong >> 8) as u8,
+            weak as u8,
+            (weak >> 8) as u8,
+        ]);
+        effect
+    }
+
+    /// `(strong_magnitude, weak_magnitude)` from the union's first four bytes.
+    pub fn rumble_magnitudes(&self) -> (u16, u16) {
+        let word = self.u[0].to_ne_bytes();
+        (
+            u16::from_ne_bytes([word[0], word[1]]),
+            u16::from_ne_bytes([word[2], word[3]]),
+        )
+    }
+}
+
+/// `struct uinput_ff_upload` (newer kernels carry the previous effect too).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UinputFfUpload {
+    pub request_id: u32,
+    pub retval: i32,
+    pub effect: FfEffect,
+    pub old: FfEffect,
+}
+
+/// `struct uinput_ff_erase` (`effect_id` is a `__u32` in the kernel ABI).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UinputFfErase {
+    pub request_id: u32,
+    pub retval: i32,
+    pub effect_id: u32,
+}
+
 // ---------------------------------------------------------------------------
 // ioctl wrappers
 // ---------------------------------------------------------------------------
@@ -180,6 +288,18 @@ fn ioctl_ptr<T>(fd: &OwnedFd, request: libc::c_ulong, value: *const T) -> io::Re
     }
 }
 
+fn ioctl_ptr_mut<T>(fd: &OwnedFd, request: libc::c_ulong, value: *mut T) -> io::Result<()> {
+    // SAFETY: the caller passes a pointer to a live `repr(C)` value matching the
+    // size encoded in `request`; the kernel may read and write it for the
+    // duration of the call.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request, value) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn ioctl_none(fd: &OwnedFd, request: libc::c_ulong) -> io::Result<()> {
     // SAFETY: `fd` is an open uinput descriptor; `_IO` requests take no
     // argument and the kernel ignores whatever vararg slot is unused.
@@ -195,6 +315,33 @@ fn ioctl_none(fd: &OwnedFd, request: libc::c_ulong) -> io::Result<()> {
 // Device
 // ---------------------------------------------------------------------------
 
+/// Put the uinput fd in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`).
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `fd` is a valid open descriptor; F_GETFL/F_SETFL only inspect or
+    // update its status flags.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!("fcntl(F_GETFL) on uinput fd failed: {err}"),
+        ));
+    }
+
+    // SAFETY: same descriptor; the flag value came from F_GETFL and we only add
+    // O_NONBLOCK.
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!("fcntl(F_SETFL, O_NONBLOCK) on uinput fd failed: {err}"),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Owned `/dev/uinput` handle.
 ///
 /// Dropping it destroys the virtual device (best effort).
@@ -205,6 +352,10 @@ pub struct RawUinput {
 
 impl RawUinput {
     /// Open `/dev/uinput` (falling back to `/dev/input/uinput`).
+    ///
+    /// The descriptor is **non-blocking**: force-feedback upload/erase events
+    /// are read from the same fd and callers poll or retry, never block inside
+    /// an input loop.
     pub fn open() -> io::Result<Self> {
         let mut last_error = None;
         for path in ["/dev/uinput", "/dev/input/uinput"] {
@@ -218,7 +369,9 @@ impl RawUinput {
                     // `File -> OwnedFd` keeps the fd unique for the lifetime of
                     // the handle, so the ioctl/write paths can never use a
                     // stale descriptor.
-                    return Ok(Self { fd: file.into() });
+                    let fd: OwnedFd = file.into();
+                    set_nonblocking(&fd)?;
+                    return Ok(Self { fd });
                 }
                 Err(err) => last_error = Some(err),
             }
@@ -341,6 +494,66 @@ impl RawUinput {
         Ok(())
     }
 
+    /// Read one batch of input events (FF upload/erase requests arrive here).
+    ///
+    /// Performs a single `read(2)`: `EAGAIN`/`EWOULDBLOCK` (the fd is
+    /// non-blocking) and an empty result map to `Ok(0)`; `EINTR` retries.
+    /// Callers poll.
+    pub fn read_events(&self, buf: &mut [RawInputEvent]) -> io::Result<usize> {
+        let capacity = size_of::<RawInputEvent>() * buf.len();
+        if capacity == 0 {
+            return Ok(0);
+        }
+
+        loop {
+            // SAFETY: `buf` is a writable slice of `RawInputEvent` and
+            // `capacity` bounds the bytes the kernel may write; the fd is a
+            // valid open uinput descriptor.
+            let rc = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    capacity,
+                )
+            };
+
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                return match err.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => Ok(0),
+                    _ => Err(err),
+                };
+            }
+            if rc == 0 {
+                return Ok(0);
+            }
+
+            let count = rc as usize / size_of::<RawInputEvent>();
+            return Ok(count);
+        }
+    }
+
+    /// Tell the kernel we are handling an FF upload (`UI_BEGIN_FF_UPLOAD`).
+    pub fn begin_ff_upload(&self, request: &mut UinputFfUpload) -> io::Result<()> {
+        ioctl_ptr_mut(&self.fd, UI_BEGIN_FF_UPLOAD, request)
+    }
+
+    /// Complete an FF upload, returning `retval` to the kernel.
+    pub fn end_ff_upload(&self, request: &UinputFfUpload) -> io::Result<()> {
+        ioctl_ptr(&self.fd, UI_END_FF_UPLOAD, request)
+    }
+
+    /// Tell the kernel we are handling an FF erase (`UI_BEGIN_FF_ERASE`).
+    pub fn begin_ff_erase(&self, request: &mut UinputFfErase) -> io::Result<()> {
+        ioctl_ptr_mut(&self.fd, UI_BEGIN_FF_ERASE, request)
+    }
+
+    /// Complete an FF erase, returning `retval` to the kernel.
+    pub fn end_ff_erase(&self, request: &UinputFfErase) -> io::Result<()> {
+        ioctl_ptr(&self.fd, UI_END_FF_ERASE, request)
+    }
+
     /// Tear the device down. Safe to call more than once.
     pub fn destroy(&self) -> io::Result<()> {
         ioctl_none(&self.fd, UI_DEV_DESTROY)
@@ -399,5 +612,43 @@ mod tests {
         assert_eq!(size_of::<AbsInfo>(), 6 * size_of::<i32>());
         assert_eq!(size_of::<InputId>(), 4 * size_of::<u16>());
         assert_eq!(std::mem::offset_of!(UinputAbsSetup, absinfo), 4);
+    }
+
+    #[test]
+    fn effect_sizes_and_magnitude_offsets() {
+        // Verified against <linux/input.h>/<linux/uinput.h> with a C probe:
+        //   ff_effect 48 bytes, union at 16 (strong 16, weak 18)
+        //   uinput_ff_upload 104 (request/retval + effect + old)
+        //   uinput_ff_erase 12 (effect_id is __u32)
+        assert_eq!(size_of::<FfTrigger>(), 4);
+        assert_eq!(size_of::<FfReplay>(), 4);
+        assert_eq!(size_of::<FfEffect>(), 48);
+        assert_eq!(std::mem::offset_of!(FfEffect, type_), 0);
+        assert_eq!(std::mem::offset_of!(FfEffect, id), 2);
+        assert_eq!(std::mem::offset_of!(FfEffect, direction), 4);
+        assert_eq!(std::mem::offset_of!(FfEffect, trigger), 6);
+        assert_eq!(std::mem::offset_of!(FfEffect, replay), 10);
+        assert_eq!(std::mem::offset_of!(FfEffect, u), 16);
+        assert_eq!(
+            size_of::<FfEffect>() - std::mem::offset_of!(FfEffect, u),
+            32
+        );
+        assert_eq!(size_of::<UinputFfUpload>(), 104);
+        assert_eq!(std::mem::offset_of!(UinputFfUpload, effect), 8);
+        assert_eq!(std::mem::offset_of!(UinputFfUpload, old), 56);
+        assert_eq!(size_of::<UinputFfErase>(), 12);
+
+        // Rumble magnitudes are the first two u16s of the union.
+        let effect = FfEffect::rumble(7, 0x1234, 0xABCD);
+        assert_eq!(effect.rumble_magnitudes(), (0x1234, 0xABCD));
+        let union_bytes = &effect.u[0].to_ne_bytes()[..4];
+        assert_eq!(u16::from_ne_bytes([union_bytes[0], union_bytes[1]]), 0x1234);
+        assert_eq!(u16::from_ne_bytes([union_bytes[2], union_bytes[3]]), 0xABCD);
+
+        // BEGIN requests are _IOWR (0xC0...), END requests are _IOW (0x40...).
+        assert_eq!(UI_BEGIN_FF_UPLOAD, 0xc068_55c8);
+        assert_eq!(UI_END_FF_UPLOAD, 0x4068_55c9);
+        assert_eq!(UI_BEGIN_FF_ERASE, 0xc00c_55ca);
+        assert_eq!(UI_END_FF_ERASE, 0x400c_55cb);
     }
 }

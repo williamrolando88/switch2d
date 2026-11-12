@@ -1,4 +1,5 @@
 pub mod combined;
+pub mod ff;
 pub mod gamepad;
 pub mod rawio;
 
