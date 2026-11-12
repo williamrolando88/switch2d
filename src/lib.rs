@@ -2,6 +2,7 @@ pub mod bluetooth;
 pub mod config;
 pub mod controller;
 pub mod daemon;
+pub mod doctor;
 pub mod dsu;
 pub mod dsu_bridge;
 pub mod hub;

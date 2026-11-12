@@ -60,6 +60,9 @@ enum Commands {
     /// Show daemon status, active mode, and bonded controllers
     Status,
 
+    /// Read-only preflight for uinput, Bluetooth, LE privacy, units, DSU and config
+    Doctor,
+
     /// Print live decoded input from a bonded controller (BLE smoke test)
     Monitor {
         /// Bluetooth MAC address (defaults to the first bonded controller)
@@ -192,7 +195,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // touch Bluetooth at all, so skip adapter autodetection (a
     // `bluetoothctl list` shell-out) for it.
     // Auto-detect adapter if empty
-    if config.adapter_mac.is_empty() && !matches!(command, Commands::Selftest { .. }) {
+    if config.adapter_mac.is_empty()
+        && !matches!(command, Commands::Selftest { .. } | Commands::Doctor)
+    {
         if let Some(detected) = auto_detect_adapter() {
             info!("Auto-detected Bluetooth adapter: {}", detected);
             config.adapter_mac = detected;
@@ -201,6 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match command {
+        Commands::Doctor => {
+            std::process::exit(switch2d::doctor::run());
+        }
         Commands::Run => {
             println!("===========================================================");
             println!("   Nintendo Switch 2 Linux Gamepad Daemon (Rust)");
