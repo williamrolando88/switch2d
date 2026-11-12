@@ -296,10 +296,11 @@ likely thing to find here, because that path has been rewritten most.
 
 ### Round 2
 
-The current plan is [`docs/TEST_PLAN_ROUND6B.md`](docs/TEST_PLAN_ROUND6B.md): a twelve
-minute re-check of the two defects round 6 exposed (daemon calibration reaching the
-combined node, and re-pairing keeping the player slot). The full procedure from a clean
-slate is [`docs/TEST_PLAN_ROUND6.md`](docs/TEST_PLAN_ROUND6.md). Earlier rounds:
+The current plan is [`docs/TEST_PLAN_ROUND7.md`](docs/TEST_PLAN_ROUND7.md): install the
+program the way a user would, verify with `switch2d doctor`, then play a real game -
+including the first hardware check of rumble, DSU motion in Dolphin, and idle sleep.
+Earlier rounds: [`ROUND6B`](docs/TEST_PLAN_ROUND6B.md),
+[`ROUND6`](docs/TEST_PLAN_ROUND6.md), [`ROUND5`](docs/TEST_PLAN_ROUND5.md),
 [`ROUND5`](docs/TEST_PLAN_ROUND5.md), [`ROUND4`](docs/TEST_PLAN_ROUND4.md),
 [`ROUND3`](docs/TEST_PLAN_ROUND3.md), [`ROUND2`](docs/TEST_PLAN_ROUND2.md).
 
