@@ -171,10 +171,14 @@ Wake a controller with any button. It connects in a few seconds and its player L
 
 ## Check that it works
 
-The safe way, which creates no virtual device and cannot disturb your desktop:
+The safe way is `monitor`: it creates no virtual device and cannot disturb your desktop.
+
+`monitor` connects to **one** controller at a time: by default the first bonded controller in
+your config. Pass a MAC to check a specific controller.
 
 ```bash
-switch2d monitor --seconds 30
+switch2d monitor --seconds 30                     # first bonded controller
+switch2d monitor AA:BB:CC:DD:EE:02 --seconds 30   # a specific one
 ```
 
 One line per report, for example:
@@ -220,6 +224,14 @@ If the pad buzzes there, rumble works and a silent game is the game not sending 
 
 Motion, rumble and the gyro device are implemented but only lightly validated on hardware: if
 something feels inverted or silent, that is worth reporting rather than a misconfiguration.
+
+### Face buttons
+
+Switch controllers print letters in the Nintendo diamond, while most PC games assume the Xbox
+diamond. By default `switch2d` reports physical positions, so pressing the right-hand `A` sends
+the game its right-hand button. If a game or Steam prompt expects Xbox letters — `A` at the
+bottom — set `"face_button_layout": "labels"` in `~/.config/switch2d/config.json` and restart
+the daemon (`systemctl --user restart switch2d`).
 
 ---
 
@@ -298,6 +310,9 @@ switch2d -v run          # verbose, in the foreground
 cargo uninstall switch2d     # removes the binary
 rm -rf ~/.config/switch2d    # optional: forget pairings and settings
 ```
+
+That sequence is the complete removal: no switch2d files, units, rules or pairings are left.
+Run all three before reporting an install problem.
 
 ---
 
