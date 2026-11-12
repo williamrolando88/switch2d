@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::l2cap::L2capSocket;
 
@@ -855,8 +855,10 @@ impl AttClient {
                 handles.vibration
             );
         } else {
-            warn!(
-                "GATT resolution used NSO GameCube fallback handles: {}",
+            // The caller decides whether this pass is provisional or final;
+            // only a final fallback deserves WARN (controller.rs).
+            debug!(
+                "GATT fallback handles: {}",
                 fallbacks.join(", ")
             );
         }

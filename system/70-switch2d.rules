@@ -1,0 +1,9 @@
+# switch2d creates virtual evdev nodes with PHYS="ngc/<controller MAC>".
+# Fedora's uaccess rules only tag joysticks, so give both the gamepad and the
+# accelerometer node the desktop session's ACL.
+SUBSYSTEM=="input", ENV{PHYS}=="ngc/*", ENV{ID_INPUT_JOYSTICK}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", ENV{PHYS}=="ngc/*", ENV{ID_INPUT_ACCELEROMETER}=="1", TAG+="uaccess"
+
+# Make controller player LEDs writable by the desktop user.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*:player-*", RUN+="/bin/chmod a+w /sys/class/leds/%k/brightness"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*:rgb:indicator", RUN+="/bin/chmod a+w /sys/class/leds/%k/brightness /sys/class/leds/%k/multi_intensity"

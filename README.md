@@ -98,37 +98,39 @@ switch2d mode split
 
 ---
 
-## ⚙️ Systemd Background Service
+## ⚙️ Install
 
-To run `switch2d` automatically in the background on system login:
+`switch2d` runs as your desktop user; the only privileged pieces are the LE-privacy unit
+and the udev rules.
 
-```bash
-# Install user service
-mkdir -p ~/.config/systemd/user
-cat << 'EOF' > ~/.config/systemd/user/switch2d.service
-[Unit]
-Description=Nintendo Switch 2 Controller Daemon (switch2d)
-After=bluetooth.target
-Wants=bluetooth.target
+```fish
+# 1. Build and install into ~/.cargo/bin (this directory must be on PATH).
+cargo install --path . --locked
 
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/switch2d run
-Restart=always
-RestartSec=3
-StartLimitIntervalSec=0
+# 2. Install the LE-privacy unit (commands in LE Privacy below).
+#    Required for Joy-Con reconnects.
 
-[Install]
-WantedBy=default.target
-EOF
+# 3. udev rules: uinput/evdev uaccess and LED permissions without manual ACLs.
+sudo install -Dm644 system/70-switch2d.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 
-# Enable and start
+# 4. Install the user unit and enable it at login.
+install -Dm644 system/switch2d.service ~/.config/systemd/user/switch2d.service
 systemctl --user daemon-reload
-systemctl --user enable --now switch2d.service
+systemctl --user enable switch2d.service
 
-# View live logs
-journalctl --user -u switch2d -f
+# 5. Verify the host, then run in the foreground.
+switch2d doctor
+switch2d run
 ```
+
+`switch2d` must be on `PATH`: the unit starts `%h/.cargo/bin/switch2d run`.
+If an older `switch2d.service` exists, disable it first with
+`systemctl --user disable --now switch2d.service`, then replace the file.
+Step 2 is the [LE Privacy](#-le-privacy-required-for-controller-reconnects) unit,
+required for controller reconnects. See [docs/SUPPORT.md](docs/SUPPORT.md) for
+what is validated.
 
 ---
 

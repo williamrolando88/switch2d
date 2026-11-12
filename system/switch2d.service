@@ -1,0 +1,24 @@
+# User unit, not a system unit: switch2d runs as the desktop user so it uses
+# the udev uaccess ACLs on /dev/uinput instead of requiring root.
+# Install to ~/.config/systemd/user/switch2d.service.
+[Unit]
+Description=Nintendo Switch 2 Controller Bridge (switch2d)
+Documentation=https://github.com/williamrolando88/switch2d
+After=bluetooth.target
+Wants=bluetooth.target
+# Stop with the login session. default.target (rather than
+# graphical-session.target) also covers headless and SSH logins, where the
+# bridge is still useful.
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/switch2d run
+# Restart=always would spin forever when the binary is missing or not on PATH;
+# on-failure restarts real crashes only. The daemon itself never exits when
+# idle, so idle behaviour needs no restart policy.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

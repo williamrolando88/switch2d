@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::bluetooth::att::{AttClient, ResolvedHandles};
+use crate::bluetooth::att::{AttClient, HandleProvenance, ResolvedHandles};
 use crate::bluetooth::l2cap::L2capSocket;
 use crate::profiles::{self, ControllerProfile, Sticks};
 use crate::protocol::calibration::{
@@ -192,6 +192,9 @@ pub fn gc_trigger_neutral(raw: u8) -> u8 {
 /// daemon all agree on the neutral region.
 pub const STICK_DEADZONE: i32 = 120;
 
+/// Largest possible 12-bit stick deflection; deadzones above this are clamped.
+const MAX_STICK_DEADZONE: i32 = 4095;
+
 /// Calibrated input mirroring legacy `SwitchController.calibrated_input()`
 /// (`device.py:436-454`): left/right stick floats in `-1.0..=1.0`, triggers in
 /// `0..=255`.
@@ -230,7 +233,8 @@ pub fn has_analog_triggers(product_id: u16) -> bool {
 /// Pure core of [`SwitchController::calibrated_input`].
 ///
 /// Mirrors legacy `device.py:436-454`:
-/// * sticks use [`StickCalibration::apply`] with [`STICK_DEADZONE`];
+/// * sticks use [`StickCalibration::apply`] with the caller's `deadzone`
+///   (clamped to `0..=4095`; `0` disables the deadzone);
 /// * pads with analog triggers (NSO GameCube) normalize raw L/R against their
 ///   neutral value via [`normalize_gc_trigger`];
 /// * all other pads map the digital ZL/ZR bits to 0 or 255;
@@ -242,9 +246,11 @@ pub fn calibrate(
     trigger_neutral: (u8, u8),
     has_analog_triggers: bool,
     report: &InputReport,
+    deadzone: i32,
 ) -> CalibratedInput {
-    let left = left_calib.apply(report.left_stick_raw, STICK_DEADZONE);
-    let right = right_calib.apply(report.right_stick_raw, STICK_DEADZONE);
+    let deadzone = deadzone.clamp(0, MAX_STICK_DEADZONE);
+    let left = left_calib.apply(report.left_stick_raw, deadzone);
+    let right = right_calib.apply(report.right_stick_raw, deadzone);
 
     let (mut lt, mut rt) = if has_analog_triggers {
         (
@@ -684,6 +690,84 @@ pub fn le_privacy_warning(mac: &str, state: UnitState) -> String {
     }
 }
 
+/// Which GATT resolution pass is logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GattResolutionStage {
+    /// Before identification, using the provisional Left pid.
+    Provisional,
+    /// After the controller info read, using the real pid.
+    Final,
+}
+
+/// Log level for a GATT resolution pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GattResolutionLog {
+    Debug,
+    Info,
+    Warn,
+}
+
+/// Decide how a resolution pass reports itself.
+///
+/// Provisional misses are expected (the pid is not known yet), so they stay at
+/// DEBUG. Final resolution is reported at INFO when complete and WARN only if
+/// it still had to fall back.
+fn gatt_resolution_log(stage: GattResolutionStage, used_fallback: bool) -> GattResolutionLog {
+    match (stage, used_fallback) {
+        (GattResolutionStage::Provisional, _) => GattResolutionLog::Debug,
+        (GattResolutionStage::Final, false) => GattResolutionLog::Info,
+        (GattResolutionStage::Final, true) => GattResolutionLog::Warn,
+    }
+}
+
+fn any_handle_fallback(provenance: &HandleProvenance) -> bool {
+    !(provenance.input_report
+        && provenance.input_report_cccd
+        && provenance.command_write
+        && provenance.command_response
+        && provenance.command_response_cccd
+        && provenance.vibration)
+}
+
+fn gatt_fallback_summary(
+    handles: &ResolvedHandles,
+    provenance: &HandleProvenance,
+) -> String {
+    let mut fallbacks = Vec::new();
+    if !provenance.input_report {
+        fallbacks.push(format!("input_report=0x{:04X}", handles.input_report));
+    }
+    if !provenance.input_report_cccd {
+        fallbacks.push(format!(
+            "input_report_cccd=0x{:04X}",
+            handles.input_report_cccd
+        ));
+    }
+    if !provenance.command_write {
+        fallbacks.push(format!("command_write=0x{:04X}", handles.command_write));
+    }
+    if !provenance.command_response {
+        fallbacks.push(format!(
+            "command_response=0x{:04X}",
+            handles.command_response
+        ));
+    }
+    if !provenance.command_response_cccd {
+        fallbacks.push(format!(
+            "command_response_cccd=0x{:04X}",
+            handles.command_response_cccd
+        ));
+    }
+    if !provenance.vibration {
+        fallbacks.push(format!("vibration=0x{:04X}", handles.vibration));
+    }
+    if fallbacks.is_empty() {
+        "none".to_string()
+    } else {
+        fallbacks.join(", ")
+    }
+}
+
 pub struct SwitchController {
     pub mac: String,
     pub adapter_mac: String,
@@ -837,7 +921,22 @@ impl SwitchController {
             }
         };
 
-        let handles = AttClient::resolve_handles(&services, JOYCON2_LEFT_PID);
+        // Provisional resolution runs before identification with the Left pid.
+        // A Right pad naturally misses its vibration UUID here; these misses
+        // are expected and must not look like a defect. The post-info pass
+        // below is authoritative.
+        let (handles, provisional_provenance) =
+            AttClient::resolve_handles_ex(&services, JOYCON2_LEFT_PID);
+        match gatt_resolution_log(
+            GattResolutionStage::Provisional,
+            any_handle_fallback(&provisional_provenance),
+        ) {
+            GattResolutionLog::Debug => debug!(
+                "Provisional GATT resolution (pid not yet known; misses are expected): {}",
+                gatt_fallback_summary(&handles, &provisional_provenance)
+            ),
+            _ => unreachable!("provisional GATT resolution is always reported at debug"),
+        }
 
         let cmd_resp_state = Arc::new((Mutex::new(None), Condvar::new()));
         let cmd_resp_for_ntf = cmd_resp_state.clone();
@@ -909,7 +1008,29 @@ impl SwitchController {
                 profiles::profile_or_default(controller_info.product_id)
             }
         };
-        controller.handles = AttClient::resolve_handles(&services, controller_info.product_id);
+        let (final_handles, final_provenance) =
+            AttClient::resolve_handles_ex(&services, controller_info.product_id);
+        controller.handles = final_handles;
+        let final_message = format!(
+            "vibration handle 0x{:04X} (uuid {}, pid 0x{:04X})",
+            controller.handles.vibration,
+            vibration_uuid_for(controller_info.product_id),
+            controller_info.product_id
+        );
+        match gatt_resolution_log(
+            GattResolutionStage::Final,
+            any_handle_fallback(&final_provenance),
+        ) {
+            GattResolutionLog::Warn => warn!(
+                "{}; final GATT resolution still used fallbacks: {}",
+                final_message,
+                gatt_fallback_summary(&controller.handles, &final_provenance)
+            ),
+            GattResolutionLog::Info => info!("{}", final_message),
+            GattResolutionLog::Debug => {
+                unreachable!("final GATT resolution is never reported at debug")
+            }
+        }
         controller.info = Some(controller_info);
 
         // 6. Calibration. Deliberate deviation from legacy, which raises and
@@ -1337,14 +1458,28 @@ impl SwitchController {
     ///
     /// Single source of truth for the conversion described in
     /// `device.py:436-454`; see [`calibrate`] for the per-PID trigger rules.
+    /// Uses the fixed [`STICK_DEADZONE`] policy value.
     pub fn calibrated_input(&self, report: &InputReport) -> CalibratedInput {
-        let analog_triggers = self.profile.analog_triggers;
+        self.calibrated_input_with_deadzone(report, STICK_DEADZONE)
+    }
+
+    /// Convert an input report with an explicit stick deadzone.
+    ///
+    /// `deadzone` is clamped to `0..=4095`; `0` disables the deadzone. The
+    /// conversion itself is still [`calibrate`], so there is only one maths
+    /// path.
+    pub fn calibrated_input_with_deadzone(
+        &self,
+        report: &InputReport,
+        deadzone: i32,
+    ) -> CalibratedInput {
         calibrate(
             &self.left_calib,
             &self.right_calib,
             self.trigger_neutral,
-            analog_triggers,
+            self.profile.analog_triggers,
             report,
+            deadzone,
         )
     }
 
@@ -1684,13 +1819,13 @@ mod tests {
     fn calibrated_sticks_scale_to_unit_range() {
         let calib = StickCalibration::default();
         let centre = sample_report(0, (2048, 2048), (2048, 2048), 0, 0);
-        let out = calibrate(&calib, &calib, (30, 30), false, &centre);
+        let out = calibrate(&calib, &calib, (30, 30), false, &centre, STICK_DEADZONE);
         assert_eq!(out.left, (0.0, 0.0));
         assert_eq!(out.right, (0.0, 0.0));
 
         // Default calibration: center 2048, max/min delta 1700.
         let extremes = sample_report(0, (3748, 348), (348, 3748), 0, 0);
-        let out = calibrate(&calib, &calib, (30, 30), false, &extremes);
+        let out = calibrate(&calib, &calib, (30, 30), false, &extremes, STICK_DEADZONE);
         assert!((out.left.0 - 1.0).abs() < 1e-6, "left x: {}", out.left.0);
         assert!((out.left.1 + 1.0).abs() < 1e-6, "left y: {}", out.left.1);
         assert!((out.right.0 + 1.0).abs() < 1e-6, "right x: {}", out.right.0);
@@ -1702,9 +1837,95 @@ mod tests {
         let calib = StickCalibration::default();
         // +120 and -120 are still inside STICK_DEADZONE (strict comparisons).
         let inside = sample_report(0, (2168, 1928), (2148, 1948), 0, 0);
-        let out = calibrate(&calib, &calib, (30, 30), false, &inside);
+        let out = calibrate(&calib, &calib, (30, 30), false, &inside, STICK_DEADZONE);
         assert_eq!(out.left, (0.0, 0.0));
         assert_eq!(out.right, (0.0, 0.0));
+    }
+
+    /// Minimal controller for entry-point equivalence tests. The ATT reader is
+    /// idle; `None` means this environment cannot create a Bluetooth socket.
+    fn test_controller() -> Option<SwitchController> {
+        let socket = L2capSocket::create().ok()?;
+        Some(SwitchController {
+            mac: "AA:BB:CC:DD:EE:01".to_string(),
+            adapter_mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            info: None,
+            left_calib: StickCalibration::default(),
+            right_calib: StickCalibration::default(),
+            trigger_neutral: (30, 30),
+            did_bond: false,
+            profile: profiles::profile_or_default(JOYCON2_LEFT_PID),
+            att: AttClient::new(socket),
+            handles: ResolvedHandles::default(),
+            cmd_resp_state: Arc::new((Mutex::new(None), Condvar::new())),
+            is_ready: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[test]
+    fn custom_deadzone_widens_the_flattened_region() {
+        let calib = StickCalibration::default();
+        // 130 LSB outside centre: inside a 200 deadzone, outside a 100 one.
+        let report = sample_report(0, (2178, 2048), (2048, 2048), 0, 0);
+
+        let wide = calibrate(&calib, &calib, (30, 30), false, &report, 200);
+        assert_eq!(wide.left, (0.0, 0.0));
+
+        let narrow = calibrate(&calib, &calib, (30, 30), false, &report, 100);
+        assert!(narrow.left.0 > 0.0, "left x: {}", narrow.left.0);
+    }
+
+    #[test]
+    fn zero_deadzone_never_flattens_the_centre() {
+        let calib = StickCalibration::default();
+        let centre = sample_report(0, (2048, 2048), (2048, 2048), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), false, &centre, 0);
+        assert_eq!(out.left, (0.0, 0.0));
+        assert_eq!(out.right, (0.0, 0.0));
+
+        let one_lsb = sample_report(0, (2049, 2049), (2049, 2049), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), false, &one_lsb, 0);
+        assert!(out.left.0 > 0.0 && out.left.1 > 0.0);
+        assert!(out.right.0 > 0.0 && out.right.1 > 0.0);
+    }
+
+    #[test]
+    fn deadzone_is_clamped_to_the_axis_range() {
+        let calib = StickCalibration::default();
+        let centred = sample_report(0, (2048, 2048), (2048, 2048), 0, 0);
+        let oversize = calibrate(&calib, &calib, (30, 30), false, &centred, 4095);
+        assert_eq!(oversize.left, (0.0, 0.0));
+
+        let one_lsb = sample_report(0, (2049, 2049), (2049, 2049), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), false, &one_lsb, -5);
+        assert!(out.left.0 > 0.0, "negative deadzone clamps to 0");
+    }
+
+    #[test]
+    fn calibrated_input_matches_with_deadzone_default() {
+        let Some(controller) = test_controller() else {
+            return;
+        };
+        let report = sample_report(0, (2178, 1928), (3748, 348), 0, 0);
+        assert_eq!(
+            controller.calibrated_input(&report),
+            controller.calibrated_input_with_deadzone(&report, STICK_DEADZONE)
+        );
+        controller.att.close();
+    }
+
+    #[test]
+    fn gatt_resolution_log_level_tracks_stage_and_fallback() {
+        use GattResolutionLog::{Debug, Info, Warn};
+        use GattResolutionStage::{Final, Provisional};
+
+        // Pre-identification misses are normal: never above DEBUG.
+        assert_eq!(gatt_resolution_log(Provisional, true), Debug);
+        assert_eq!(gatt_resolution_log(Provisional, false), Debug);
+
+        // Final resolution: INFO when complete, WARN only on fallback.
+        assert_eq!(gatt_resolution_log(Final, false), Info);
+        assert_eq!(gatt_resolution_log(Final, true), Warn);
     }
 
     #[test]
@@ -1713,12 +1934,12 @@ mod tests {
         // Analog branch would normalize raw 0 against neutral 30 to 0; the L/R
         // click must force the axis to full scale (device.py:443-447).
         let left = sample_report(button_mask::L | button_mask::ZL, (2048, 2048), (2048, 2048), 0, 0);
-        let out = calibrate(&calib, &calib, (30, 30), true, &left);
+        let out = calibrate(&calib, &calib, (30, 30), true, &left, STICK_DEADZONE);
         assert_eq!(out.lt, 255);
         assert_eq!(out.rt, 0);
 
         let right = sample_report(button_mask::R | button_mask::ZR, (2048, 2048), (2048, 2048), 0, 0);
-        let out = calibrate(&calib, &calib, (30, 30), true, &right);
+        let out = calibrate(&calib, &calib, (30, 30), true, &right, STICK_DEADZONE);
         assert_eq!(out.lt, 0);
         assert_eq!(out.rt, 255);
     }
@@ -1745,6 +1966,7 @@ mod tests {
             (30, 30),
             has_analog_triggers(NSO_GAMECUBE_PID),
             &report,
+            STICK_DEADZONE,
         );
         assert_eq!(out.lt, 255);
         assert_eq!(out.rt, 0);
@@ -1758,11 +1980,11 @@ mod tests {
 
         // Raw trigger bytes are ignored on non-analog pads.
         let pressed = sample_report(button_mask::ZL | button_mask::ZR, (2048, 2048), (2048, 2048), 7, 9);
-        let out = calibrate(&calib, &calib, (30, 30), has_analog_triggers(pid), &pressed);
+        let out = calibrate(&calib, &calib, (30, 30), has_analog_triggers(pid), &pressed, STICK_DEADZONE);
         assert_eq!((out.lt, out.rt), (255, 255));
 
         let released = sample_report(0, (2048, 2048), (2048, 2048), 255, 255);
-        let out = calibrate(&calib, &calib, (30, 30), has_analog_triggers(pid), &released);
+        let out = calibrate(&calib, &calib, (30, 30), has_analog_triggers(pid), &released, STICK_DEADZONE);
         assert_eq!((out.lt, out.rt), (0, 0));
     }
 
