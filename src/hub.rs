@@ -29,6 +29,18 @@
 //! calls [`Hub::register_known`] when a pad becomes expected again, which
 //! re-arms it as expected-and-disconnected.
 //!
+//! # Timed fallback (advert-source reliability)
+//!
+//! Adverts stay authoritative, but the BlueZ backend is not always useful: an
+//! install-report machine kept `Device1` objects with `rssi = None` and no
+//! manufacturer data, which made an advert-only hub mute and pads never
+//! reconnected. With [`HubConfig::fallback_after`] set, a known-but-disconnected
+//! pad that has had no acceptable advert for that long is appended to the
+//! dial batch anyway (advert-driven candidates keep priority). A failed attempt
+//! suppresses that pad for [`HubConfig::fallback_retry`]. `fallback_after: None`
+//! (the default, and what the 06B/06C tests pin) keeps the exact advert-only
+//! semantics.
+//!
 //! # Connect serialization
 //!
 //! [`Hub::dial_pending`] is the only code path that calls [`Dialer::dial`] and it
@@ -37,15 +49,15 @@
 //! fails with `EBUSY` (os error 16). This lock plus the single-dialer design is
 //! why the hub replaces the old per-controller worker loops.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::bluetooth::scan::{AdvertSource, PendingConnect, ScanControl, SeenAdverts};
-use crate::protocol::advert::AcceptPolicy;
+use crate::bluetooth::scan::{AdvertMode, AdvertSource, PendingConnect, ScanControl, SeenAdverts};
+use crate::protocol::advert::{AcceptPolicy, WAKE_TTL};
 
 /// Performs the actual LE connection for one MAC.
 pub trait Dialer {
@@ -63,6 +75,15 @@ pub struct HubConfig {
     pub dial_pause: Duration,
     /// Idle cycles before the seen table is cleared / discovery re-armed.
     pub idle_restart_cycles: u32,
+    /// Timed-fallback window: dial a known-but-disconnected pad even without an
+    /// acceptable advert once nothing was recorded for it for this long.
+    ///
+    /// `None` disables the behaviour entirely (advert-only semantics, exactly
+    /// what the 06B/06C tests pin with the default).
+    pub fallback_after: Option<Duration>,
+    /// After a dial attempt, that MAC is not a fallback candidate again until
+    /// this long has passed (keeps a blind pad from being dialled every cycle).
+    pub fallback_retry: Duration,
 }
 
 impl Default for HubConfig {
@@ -72,6 +93,10 @@ impl Default for HubConfig {
             all_connected_sleep: Duration::from_millis(1500),
             dial_pause: Duration::from_millis(80),
             idle_restart_cycles: 80,
+            // Off by default: the advert-driven semantics are the contract the
+            // hub tests pin. The daemon opts in explicitly.
+            fallback_after: None,
+            fallback_retry: Duration::from_secs(3),
         }
     }
 }
@@ -113,6 +138,12 @@ where
     idle_cycles: u32,
     warned_missing_adapter: bool,
     connect_lock: Mutex<()>,
+    /// Last acceptable advert recorded per MAC (fallback clock).
+    recorded_at: HashMap<String, Instant>,
+    /// Last dial attempt per MAC (fallback retry window).
+    attempted_at: HashMap<String, Instant>,
+    /// Known MACs already reported as seen-without-advert (INFO once each).
+    warned_blind: HashSet<String>,
 }
 
 impl<S, C, D> Hub<S, C, D>
@@ -135,6 +166,9 @@ where
             idle_cycles: 0,
             warned_missing_adapter: false,
             connect_lock: Mutex::new(()),
+            recorded_at: HashMap::new(),
+            attempted_at: HashMap::new(),
+            warned_blind: HashSet::new(),
         }
     }
 
@@ -145,6 +179,11 @@ where
     pub fn register_known(&mut self, mac: &str) {
         let mac = mac.to_ascii_uppercase();
         self.connected.remove(&mac);
+        // A (re)armed pad starts a fresh fallback window: the clock is seeded
+        // with "now" on the next poll and any earlier retry suppression is
+        // dropped, because this is a new session cycle.
+        self.recorded_at.remove(&mac);
+        self.attempted_at.remove(&mac);
         self.known.insert(mac);
     }
 
@@ -201,6 +240,14 @@ where
             self.discovery_started = true;
         }
 
+        // 2b. Seed the timed-fallback clock for pads we have not seen yet: the
+        // window starts at the first poll after (re)registration, not at boot.
+        if self.config.fallback_after.is_some() {
+            for mac in &self.known {
+                self.recorded_at.entry(mac.clone()).or_insert(now);
+            }
+        }
+
         // 3. One snapshot, record every live acceptable advert.
         let devices = self.source.devices()?;
         if self.adapter_mac.is_empty() && !self.warned_missing_adapter {
@@ -219,22 +266,43 @@ where
             AcceptPolicy::Wake
         };
 
+        let mut skipped_liveness = 0usize;
+        let mut skipped_no_advert = 0usize;
+        let mut recorded = 0usize;
+
         for device in &devices {
+            let mac = device.address.to_ascii_uppercase();
+
             if !device.is_live() {
+                skipped_liveness += 1;
+                // A known pad that the backend reports without RSSI (and often
+                // without a manufacturer block) is why the hub can look idle
+                // while a pad is right there. Say so once per MAC at INFO.
+                if self.known.contains(&mac) && self.note_blind_once(&mac) {
+                    info!(
+                        "{mac}: seen without RSSI/manufacturer data; \
+                         adverts for this pad are unusable"
+                    );
+                }
                 continue;
             }
 
-            let mac = device.address.to_ascii_uppercase();
             // An absent block has no PID/host to vet, so it is wake-compatible
             // only for a known bonded MAC (see advert::accepts).
             if device.advert.is_none() && !self.known.contains(&mac) {
+                skipped_no_advert += 1;
                 continue;
             }
 
             // Recording never touches connection state: a pad that is still
             // advertising may already be linked (BlueZ caches adverts).
-            self.seen
-                .record(device.advert.as_ref(), &mac, &self.adapter_mac, policy, now);
+            if self
+                .seen
+                .record(device.advert.as_ref(), &mac, &self.adapter_mac, policy, now)
+            {
+                recorded += 1;
+                self.recorded_at.insert(mac, now);
+            }
         }
 
         // 4. Connection state comes from this snapshot.
@@ -244,9 +312,26 @@ where
             .map(|device| device.address.to_ascii_uppercase())
             .collect();
 
-        let pending = self
+        let mut pending = self
             .seen
             .select_pending(now, &mut |mac| connected.contains(mac));
+        // Timed fallback: append known-but-invisible pads after the
+        // advert-driven ones (adverts keep priority, the batch is still dialled
+        // serially).
+        let fallback = self.fallback_candidates(now, &connected, &pending);
+        let fallback_count = fallback.len();
+        pending.extend(fallback);
+
+        debug!(
+            devices = devices.len(),
+            skipped_liveness,
+            skipped_no_advert,
+            recorded,
+            pending = pending.len(),
+            fallback = fallback_count,
+            candidates = ?pending.iter().map(|entry| &entry.mac).collect::<Vec<_>>(),
+            "hub poll"
+        );
 
         // 5. Idle bookkeeping.
         if pending.is_empty() {
@@ -266,11 +351,75 @@ where
         Ok(HubOutcome::Pending(pending))
     }
 
+    /// Whether this is the first time `mac` is seen without a live advert.
+    ///
+    /// Returns `true` the first time only, so `poll_once` can log the
+    /// blind-source reason at INFO once per MAC instead of every cycle.
+    fn note_blind_once(&mut self, mac: &str) -> bool {
+        self.warned_blind.insert(mac.to_ascii_uppercase())
+    }
+
+    /// Known, disconnected pads that have had no acceptable advert for
+    /// [`HubConfig::fallback_after`] and were not dialled within
+    /// [`HubConfig::fallback_retry`].
+    ///
+    /// Pure with respect to the clock: `now` decides both windows. Disabled
+    /// when `fallback_after` is `None`.
+    fn fallback_candidates(
+        &self,
+        now: Instant,
+        connected: &HashSet<String>,
+        already_pending: &[PendingConnect],
+    ) -> Vec<PendingConnect> {
+        let Some(after) = self.config.fallback_after else {
+            return Vec::new();
+        };
+
+        let mut candidates: Vec<String> = self
+            .known
+            .iter()
+            .filter(|mac| !connected.contains(*mac))
+            .filter(|mac| !already_pending.iter().any(|entry| entry.mac == **mac))
+            .filter(|mac| {
+                self.recorded_at
+                    .get(*mac)
+                    .map(|recorded| now.saturating_duration_since(*recorded) >= after)
+                    .unwrap_or(true)
+            })
+            .filter(|mac| {
+                self.attempted_at
+                    .get(*mac)
+                    .map(|attempted| {
+                        now.saturating_duration_since(*attempted) >= self.config.fallback_retry
+                    })
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+
+        // Deterministic order (the advert-driven part is already sorted).
+        candidates.sort();
+        candidates
+            .into_iter()
+            .map(|mac| PendingConnect {
+                mac,
+                mode: AdvertMode::Wake,
+                seen_at: now,
+                ttl: WAKE_TTL,
+            })
+            .collect()
+    }
+
     /// Analyse 9.1 steps 6-7: prepare, remove stale BlueZ objects, dial.
     ///
     /// The caller sleeps [`HubConfig::dial_pause`] before invoking this. Dialing
     /// is strictly serial and a failure never aborts the batch.
     pub fn dial_pending(&mut self, pending: &[PendingConnect]) -> Vec<DialResult> {
+        self.dial_pending_at(pending, Instant::now())
+    }
+
+    /// [`Self::dial_pending`] with an explicit clock (fallback retry windows).
+    pub fn dial_pending_at(&mut self, pending: &[PendingConnect], now: Instant) -> Vec<DialResult> {
         if pending.is_empty() {
             return Vec::new();
         }
@@ -294,6 +443,9 @@ where
 
         let mut results = Vec::with_capacity(pending.len());
         for entry in pending {
+            // Remember the attempt so the fallback retry window applies even
+            // when the pad never advertises.
+            self.attempted_at.insert(entry.mac.clone(), now);
             match self.dialer.dial(&entry.mac) {
                 Ok(()) => {
                     debug!("Dialed {}", entry.mac);
@@ -1028,5 +1180,140 @@ mod tests {
             }
             other => panic!("expected Pending for {PAD_B}, got {other:?}"),
         }
+    }
+
+    fn blind_pad(mac: &str) -> DeviceAdvert {
+        // BlueZ reports the Device1 object (optionally Connected) but without
+        // the live-advert fields: no RSSI, no ManufacturerData.
+        device(mac, false, None, None)
+    }
+
+    fn fallback_config(after: Option<Duration>, retry: Duration) -> HubConfig {
+        HubConfig {
+            fallback_after: after,
+            fallback_retry: retry,
+            ..HubConfig::default()
+        }
+    }
+
+    fn pending_macs(outcome: HubOutcome) -> Vec<String> {
+        match outcome {
+            HubOutcome::Pending(pending) => pending.iter().map(|entry| entry.mac.clone()).collect(),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_dials_a_known_pad_that_never_advertises() {
+        let base = Instant::now();
+        let (mut hub, calls, _) = make_hub(
+            fallback_config(Some(Duration::from_secs(4)), Duration::from_secs(3)),
+            vec![
+                vec![blind_pad(PAD_A)],
+                vec![blind_pad(PAD_A)],
+                vec![blind_pad(PAD_A)],
+                vec![blind_pad(PAD_A)],
+            ],
+            &[],
+        );
+        register_default_pads(&mut hub);
+        hub.unregister_known(PAD_B);
+        calls.entries();
+
+        // A blind pad is not a candidate inside the fallback window.
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::Idle);
+        assert_eq!(
+            hub.poll_once(base + Duration::from_millis(3999))
+                .expect("poll"),
+            HubOutcome::Idle
+        );
+
+        let macs = pending_macs(hub.poll_once(base + Duration::from_secs(4)).expect("poll"));
+        assert_eq!(macs, vec![PAD_A.to_string()]);
+
+        let batch = [pending(PAD_A, base + Duration::from_secs(4))];
+        let results = hub.dial_pending_at(&batch, base + Duration::from_secs(4));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].outcome.is_ok());
+        assert_eq!(calls.count("dial:AA:BB:CC:DD:EE:01"), 1);
+    }
+
+    #[test]
+    fn fallback_is_suppressed_for_the_retry_window() {
+        let base = Instant::now();
+        let (mut hub, calls, _) = make_hub(
+            fallback_config(Some(Duration::from_secs(4)), Duration::from_secs(3)),
+            (0..6).map(|_| vec![blind_pad(PAD_A)]).collect(),
+            &[PAD_A],
+        );
+        register_default_pads(&mut hub);
+        hub.unregister_known(PAD_B);
+
+        // First poll seeds the fallback clock; nothing is due yet.
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::Idle);
+
+        let window = base + Duration::from_secs(4);
+        let macs = pending_macs(hub.poll_once(window).expect("poll"));
+        assert_eq!(macs, vec![PAD_A.to_string()]);
+
+        // The dial fails; the attempt is remembered.
+        let batch = [pending(PAD_A, window)];
+        let results = hub.dial_pending_at(&batch, window);
+        assert!(results[0].outcome.is_err());
+        assert_eq!(calls.count("dial:AA:BB:CC:DD:EE:01"), 1);
+        assert!(!hub.is_connected(PAD_A));
+
+        // Inside the retry window the pad is not offered again.
+        assert_eq!(
+            hub.poll_once(window + Duration::from_secs(1))
+                .expect("poll"),
+            HubOutcome::Idle
+        );
+        assert_eq!(
+            hub.poll_once(window + Duration::from_millis(2999))
+                .expect("poll"),
+            HubOutcome::Idle
+        );
+
+        // Retry window elapsed -> candidate again.
+        assert_eq!(
+            pending_macs(
+                hub.poll_once(window + Duration::from_secs(3))
+                    .expect("poll")
+            ),
+            vec![PAD_A.to_string()]
+        );
+    }
+
+    #[test]
+    fn fallback_off_keeps_advert_only_semantics() {
+        let base = Instant::now();
+        let (mut hub, calls, _) = make_hub(
+            HubConfig::default(),
+            (0..3).map(|_| vec![blind_pad(PAD_A)]).collect(),
+            &[],
+        );
+        hub.register_known(PAD_A);
+        hub.set_adapter_mac(ADAPTER);
+
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::Idle);
+        assert_eq!(
+            hub.poll_once(base + Duration::from_secs(100))
+                .expect("poll"),
+            HubOutcome::Idle,
+            "fallback_after: None must never dial on a timer"
+        );
+        assert_eq!(calls.count("dial:AA:BB:CC:DD:EE:01"), 0);
+    }
+
+    #[test]
+    fn hub_logs_a_blind_source_once() {
+        let (mut hub, _, _) = make_hub(HubConfig::default(), Vec::new(), &[]);
+        hub.register_known(PAD_A);
+
+        assert!(hub.note_blind_once(PAD_A), "first sighting is logged");
+        assert!(!hub.note_blind_once(PAD_A), "later sightings are silent");
+        assert!(!hub.note_blind_once(&PAD_A.to_ascii_lowercase()));
+        assert!(hub.note_blind_once(PAD_B), "per MAC, not global");
     }
 }

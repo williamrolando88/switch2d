@@ -25,7 +25,8 @@
 //!   is not wired yet) and keeps the uinput node; the next session reuses it.
 
 use std::collections::HashMap;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,7 +38,7 @@ use evdev::{AbsoluteAxisType, Key};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::bluetooth::bluez::BluezAdvertSource;
 use crate::bluetooth::scan::{AdvertSource, ScanControl, ShellScanControl};
@@ -87,6 +88,20 @@ impl Daemon {
     /// Run the daemon: spawn the supervisor, one worker per configured pad and
     /// the hub thread, then park (the daemon only stops when the process does).
     pub async fn run(&self) -> std::io::Result<()> {
+        // Single instance guard (install-report finding 1): two daemons would
+        // fight over the adapter and the uinput nodes. The guard is held for
+        // the whole process lifetime.
+        let _instance = match acquire_instance_lock(&instance_lock_path()) {
+            Ok(guard) => guard,
+            Err(err) => {
+                error!("{err}");
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "another switch2d is already running",
+                ));
+            }
+        };
+
         let adapter_mac = self.config.adapter_mac.clone();
         if adapter_mac.is_empty() {
             return Err(std::io::Error::new(
@@ -231,7 +246,15 @@ impl Daemon {
             BluezAdvertSource::new(),
             ShellScanControl::from_env(),
             dialer,
-            HubConfig::default(),
+            HubConfig {
+                // The install report showed BlueZ advertising Device1 objects
+                // with no RSSI and no manufacturer data on some machines, which
+                // made the advert-only hub mute. Keep adverts authoritative but
+                // fall back to a timed dial when a known pad is invisible.
+                fallback_after: Some(Duration::from_secs(4)),
+                fallback_retry: Duration::from_secs(3),
+                ..HubConfig::default()
+            },
         );
         hub.set_adapter_mac(&adapter_mac);
         for pad in &pads {
@@ -1302,6 +1325,109 @@ impl<'a> MotionSession<'a> {
 fn finish_session<F: FnOnce()>(motion: &MotionSession<'_>, after_motion_end: F) {
     motion.sink.session_ended(motion.slot);
     after_motion_end();
+}
+
+// ---------------------------------------------------------------------------
+// Single instance guard
+// ---------------------------------------------------------------------------
+
+/// Exclusive lock file held for the process lifetime.
+///
+/// The file is removed on drop, but only because the guard owns the lock:
+/// `flock` is released implicitly when the descriptor closes.
+#[derive(Debug)]
+struct InstanceLock {
+    path: PathBuf,
+    // Kept open for the lifetime of the guard; closing it releases the lock.
+    _file: File,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // We still hold the lock here, so removing the path cannot steal a lock
+        // from another process (that process would have failed to acquire).
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `$XDG_RUNTIME_DIR/switch2d.lock`, falling back to `~/.run/switch2d.lock`.
+fn instance_lock_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir.join("switch2d.lock");
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".run/switch2d.lock")
+}
+
+/// Take an exclusive non-blocking `flock` on `path` and write our pid into it.
+///
+/// On Linux `flock` locks belong to the open file description, so a second
+/// `open`+`flock` in the *same* process also conflicts - which is what makes
+/// this testable without spawning a helper.
+fn acquire_instance_lock(path: &Path) -> io::Result<InstanceLock> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+
+    // std's exclusive advisory lock, so this needs no libc and no unsafe:
+    // the unsafe in this project lives only in the uinput/L2CAP modules.
+    if let Err(err) = file.try_lock() {
+        let already_held = match &err {
+            fs::TryLockError::WouldBlock => true,
+            fs::TryLockError::Error(io_err) => io_err.kind() == io::ErrorKind::WouldBlock,
+        };
+        if already_held {
+            let pid = read_lock_pid(&file);
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                match pid {
+                    Some(pid) => {
+                        format!("another switch2d is already running (pid {pid}); stopping")
+                    }
+                    None => "another switch2d is already running; stopping".to_string(),
+                },
+            ));
+        }
+        return Err(match err {
+            fs::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "lock is held")
+            }
+            fs::TryLockError::Error(io_err) => io_err,
+        });
+    }
+
+    // Record the owner pid so a conflicting instance can name it in the log.
+    file.set_len(0)?;
+    let mut writer = &file;
+    writeln!(writer, "{}", std::process::id())?;
+    writer.flush()?;
+
+    Ok(InstanceLock {
+        path: path.to_path_buf(),
+        _file: file,
+    })
+}
+
+fn read_lock_pid(file: &File) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let mut text = String::new();
+    reader.read_to_string(&mut text).ok()?;
+    text.trim().parse::<u32>().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2835,5 +2961,43 @@ mod tests {
             vec![((123, -456, 789), (i16::MIN, i16::MAX, 7))],
             "raw i16 samples, no scaling or clamping"
         );
+    }
+
+    // --- Single instance guard -------------------------------------------
+
+    #[test]
+    fn lock_excludes_second_instance() {
+        let dir = TempDir::new("instance-lock");
+        let path = dir.root.join("switch2d.lock");
+
+        let first = acquire_instance_lock(&path).expect("first acquire");
+        assert!(path.is_file(), "the lock file exists while held");
+        let written = fs::read_to_string(&path).expect("pid written");
+        assert_eq!(
+            written.trim(),
+            std::process::id().to_string(),
+            "the owner's pid is recorded for the conflict message"
+        );
+
+        // flock is per open file description on Linux, so a second open in the
+        // same process conflicts exactly like another daemon would.
+        let err = acquire_instance_lock(&path).expect_err("second acquire must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            err.to_string()
+                .contains("another switch2d is already running (pid"),
+            "conflict message: {err}"
+        );
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "names the owner pid: {err}"
+        );
+
+        // Releasing the guard releases the lock and removes the file.
+        drop(first);
+        assert!(!path.exists(), "owner removes the lock file on drop");
+
+        let third = acquire_instance_lock(&path).expect("lock released on drop");
+        drop(third);
     }
 }
