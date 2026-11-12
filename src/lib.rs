@@ -9,6 +9,7 @@ pub mod players;
 pub mod protocol;
 pub mod status;
 pub mod uinput;
+pub mod worker;
 
 pub use dsu::{DsuConfig, DsuServer, MotionInput};
 pub use hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
