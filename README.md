@@ -132,6 +132,7 @@ Contributions, bug reports, and pull requests are welcome!
 To maintain code stability:
 - Direct pushes to `main` are protected.
 - All code changes must come via a Pull Request and pass automated CI checks.
+- Please review [**HANDOVER.md**](HANDOVER.md) for critical reverse-engineering lessons, solved hardware traps, and Bluetooth kernel behaviors before modifying connection logic.
 
 ---
 
