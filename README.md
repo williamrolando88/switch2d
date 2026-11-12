@@ -239,6 +239,12 @@ in Steam or in `evtest` while the daemon holds the node.
 **Known:** rumble, DSU and the IMU node are not wired yet; combined-mode regressions are the most
 likely thing to find here, because that path has been rewritten most.
 
+### Round 2
+
+The current round's plan, with the exact measurements to capture and the questions
+it must answer, is [`docs/TEST_PLAN_ROUND2.md`](docs/TEST_PLAN_ROUND2.md). Start
+there: it supersedes Test A's checklist for this build (`1e50b79`).
+
 ### Recording findings
 
 Copy this block for every finding and keep the raw output — paraphrased logs are not usable:
