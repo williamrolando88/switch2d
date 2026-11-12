@@ -13,16 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::controller::{
-    BondPolicy, ConnectOptions, ControllerInputCallback, SwitchController,
+    BondPolicy, CalibratedInput, ConnectOptions, ControllerInputCallback, SwitchController,
 };
-use crate::protocol::calibration::normalize_gc_trigger;
-use crate::protocol::constants::{button_mask, NSO_GAMECUBE_PID};
+use crate::protocol::constants::button_mask;
 use crate::protocol::report::InputReport;
 use crate::status::battery_pct_from_mv;
-
-/// Stick deadzone used by the uinput mapper (`uinput/combined.rs` uses 120 for
-/// every stick). Keep the monitor's calibrated floats consistent with it.
-const STICK_DEADZONE: i32 = 120;
 
 /// Stable, ordered button table for the one-line report. Masks come from
 /// `protocol::constants::button_mask`; the order is defined once here and is
@@ -63,32 +58,6 @@ pub struct MonitorConfig {
     pub player: u8,
     /// Hard time limit. `0` means "until the link drops".
     pub seconds: u64,
-}
-
-/// Calibrated input mirroring legacy `SwitchController.calibrated_input()`
-/// (`device.py:436-454`): left/right stick floats in `-1.0..=1.0`, triggers in
-/// `0..=255`.
-///
-/// `controller.rs` does not expose this type/method yet and is off-limits this
-/// round, so the monitor computes it from the controller's public calibration
-/// fields ([`calibrated_input`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CalibratedInput {
-    pub left: (f32, f32),
-    pub right: (f32, f32),
-    pub lt: u8,
-    pub rt: u8,
-}
-
-impl Default for CalibratedInput {
-    fn default() -> Self {
-        Self {
-            left: (0.0, 0.0),
-            right: (0.0, 0.0),
-            lt: 0,
-            rt: 0,
-        }
-    }
 }
 
 /// One-second statistics window.
@@ -200,51 +169,6 @@ fn pressed_button_names(buttons: u32) -> String {
     }
 }
 
-/// Compute [`CalibratedInput`] from the controller's public calibration state.
-///
-/// Mirrors legacy `device.py:436-454`:
-/// * sticks use `StickCalibration::apply(raw, 120)` (same deadzone as the
-///   uinput mapper);
-/// * the NSO GameCube pad has analog L/R triggers (neutral + deadzone);
-/// * every other pad exposes ZL/ZR as digital buttons (0 or 255);
-/// * the digital L/R click forces its analog trigger to 255.
-fn calibrated_input(controller: &SwitchController, report: &InputReport) -> CalibratedInput {
-    let left = controller
-        .left_calib
-        .apply(report.left_stick_raw, STICK_DEADZONE);
-    let right = controller
-        .right_calib
-        .apply(report.right_stick_raw, STICK_DEADZONE);
-
-    let has_analog_triggers = controller
-        .info
-        .as_ref()
-        .map(|info| info.product_id == NSO_GAMECUBE_PID)
-        .unwrap_or(false);
-
-    let (mut lt, mut rt) = if has_analog_triggers {
-        (
-            normalize_gc_trigger(report.left_trigger_raw, controller.trigger_neutral.0),
-            normalize_gc_trigger(report.right_trigger_raw, controller.trigger_neutral.1),
-        )
-    } else {
-        (
-            u8::from(report.is_pressed(button_mask::ZL)) * 255,
-            u8::from(report.is_pressed(button_mask::ZR)) * 255,
-        )
-    };
-
-    // Digital L/R click fires at full pull; keep axes in sync with shoulders.
-    if report.is_pressed(button_mask::L) {
-        lt = 255;
-    }
-    if report.is_pressed(button_mask::R) {
-        rt = 255;
-    }
-
-    CalibratedInput { left, right, lt, rt }
-}
-
 fn flush_dropped(dropped: &AtomicU64, stats: &mut WindowStats) {
     stats.record_dropped(dropped.swap(0, Ordering::Relaxed));
 }
@@ -344,7 +268,7 @@ pub fn run_monitor(cfg: MonitorConfig) -> io::Result<()> {
             Ok(report) => {
                 seq += 1;
                 total += 1;
-                let cal = calibrated_input(&controller, &report);
+                let cal = controller.calibrated_input(&report);
                 println!("{}", format_report(seq, &report, &cal));
                 stats.observe(Instant::now());
 

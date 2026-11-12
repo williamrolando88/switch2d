@@ -9,7 +9,9 @@ use tracing::{debug, info, warn};
 
 use crate::bluetooth::att::{AttClient, ResolvedHandles};
 use crate::bluetooth::l2cap::L2capSocket;
-use crate::protocol::calibration::{StickCalibration, GC_TRIGGER_DEFAULT_NEUTRAL};
+use crate::protocol::calibration::{
+    normalize_gc_trigger, StickCalibration, GC_TRIGGER_DEFAULT_NEUTRAL,
+};
 use crate::protocol::command::{mac_to_le, ControllerInfo};
 use crate::protocol::constants::*;
 use crate::protocol::report::InputReport;
@@ -96,6 +98,85 @@ pub fn gc_trigger_neutral(raw: u8) -> u8 {
     } else {
         raw
     }
+}
+
+/// Stick deadzone used by every calibrated-input consumer. This matches the
+/// uinput mapper (`uinput/combined.rs` uses 120) so the monitor, worker, and
+/// daemon all agree on the neutral region.
+pub const STICK_DEADZONE: i32 = 120;
+
+/// Calibrated input mirroring legacy `SwitchController.calibrated_input()`
+/// (`device.py:436-454`): left/right stick floats in `-1.0..=1.0`, triggers in
+/// `0..=255`.
+///
+/// This is the single source of truth for stick/trigger conversion; the monitor,
+/// worker, and daemon must all go through [`SwitchController::calibrated_input`]
+/// rather than re-implementing the mapping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalibratedInput {
+    pub left: (f32, f32),
+    pub right: (f32, f32),
+    pub lt: u8,
+    pub rt: u8,
+}
+
+impl Default for CalibratedInput {
+    fn default() -> Self {
+        Self {
+            left: (0.0, 0.0),
+            right: (0.0, 0.0),
+            lt: 0,
+            rt: 0,
+        }
+    }
+}
+
+/// Whether a product id exposes true analog L/R triggers (legacy
+/// `protocol.py:54`): only the NSO GameCube pad does.
+pub fn has_analog_triggers(product_id: u16) -> bool {
+    product_id == NSO_GAMECUBE_PID
+}
+
+/// Pure core of [`SwitchController::calibrated_input`].
+///
+/// Mirrors legacy `device.py:436-454`:
+/// * sticks use [`StickCalibration::apply`] with [`STICK_DEADZONE`];
+/// * pads with analog triggers (NSO GameCube) normalize raw L/R against their
+///   neutral value via [`normalize_gc_trigger`];
+/// * all other pads map the digital ZL/ZR bits to 0 or 255;
+/// * the digital L/R click forces its analog trigger to 255 (legacy
+///   `device.py:443-447`) so the axis agrees with the shoulder button.
+pub fn calibrate(
+    left_calib: &StickCalibration,
+    right_calib: &StickCalibration,
+    trigger_neutral: (u8, u8),
+    has_analog_triggers: bool,
+    report: &InputReport,
+) -> CalibratedInput {
+    let left = left_calib.apply(report.left_stick_raw, STICK_DEADZONE);
+    let right = right_calib.apply(report.right_stick_raw, STICK_DEADZONE);
+
+    let (mut lt, mut rt) = if has_analog_triggers {
+        (
+            normalize_gc_trigger(report.left_trigger_raw, trigger_neutral.0),
+            normalize_gc_trigger(report.right_trigger_raw, trigger_neutral.1),
+        )
+    } else {
+        (
+            u8::from(report.is_pressed(button_mask::ZL)) * 255,
+            u8::from(report.is_pressed(button_mask::ZR)) * 255,
+        )
+    };
+
+    // Digital L/R click fires at full pull; keep axes in sync with shoulders.
+    if report.is_pressed(button_mask::L) {
+        lt = 255;
+    }
+    if report.is_pressed(button_mask::R) {
+        rt = 255;
+    }
+
+    CalibratedInput { left, right, lt, rt }
 }
 
 /// Run `f` up to `attempts` times, sleeping `delay` between attempts.
@@ -631,6 +712,25 @@ impl SwitchController {
         self.att.is_connected()
     }
 
+    /// Convert an input report into calibrated sticks and triggers.
+    ///
+    /// Single source of truth for the conversion described in
+    /// `device.py:436-454`; see [`calibrate`] for the per-PID trigger rules.
+    pub fn calibrated_input(&self, report: &InputReport) -> CalibratedInput {
+        let analog_triggers = self
+            .info
+            .as_ref()
+            .map(|info| has_analog_triggers(info.product_id))
+            .unwrap_or(false);
+        calibrate(
+            &self.left_calib,
+            &self.right_calib,
+            self.trigger_neutral,
+            analog_triggers,
+            report,
+        )
+    }
+
     /// Ask the pad to sleep, waiting for the correlated ACK before closing.
     pub fn sleep(&self) {
         if let Err(err) = self.write_command(
@@ -710,6 +810,112 @@ mod tests {
         assert_eq!(gc_trigger_neutral(0xFF), GC_TRIGGER_DEFAULT_NEUTRAL);
         assert_eq!(gc_trigger_neutral(30), 30);
         assert_eq!(gc_trigger_neutral(137), 137);
+    }
+
+    fn sample_report(
+        buttons: u32,
+        left_stick: (u16, u16),
+        right_stick: (u16, u16),
+        left_trigger: u8,
+        right_trigger: u8,
+    ) -> InputReport {
+        InputReport {
+            timestamp: 0,
+            buttons,
+            left_stick_raw: left_stick,
+            right_stick_raw: right_stick,
+            battery_mv: 0,
+            accel: (0, 0, 0),
+            gyro: (0, 0, 0),
+            left_trigger_raw: left_trigger,
+            right_trigger_raw: right_trigger,
+        }
+    }
+
+    #[test]
+    fn calibrated_sticks_scale_to_unit_range() {
+        let calib = StickCalibration::default();
+        let centre = sample_report(0, (2048, 2048), (2048, 2048), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), false, &centre);
+        assert_eq!(out.left, (0.0, 0.0));
+        assert_eq!(out.right, (0.0, 0.0));
+
+        // Default calibration: center 2048, max/min delta 1700.
+        let extremes = sample_report(0, (3748, 348), (348, 3748), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), false, &extremes);
+        assert!((out.left.0 - 1.0).abs() < 1e-6, "left x: {}", out.left.0);
+        assert!((out.left.1 + 1.0).abs() < 1e-6, "left y: {}", out.left.1);
+        assert!((out.right.0 + 1.0).abs() < 1e-6, "right x: {}", out.right.0);
+        assert!((out.right.1 - 1.0).abs() < 1e-6, "right y: {}", out.right.1);
+    }
+
+    #[test]
+    fn calibrated_ignores_values_inside_the_deadzone() {
+        let calib = StickCalibration::default();
+        // +120 and -120 are still inside STICK_DEADZONE (strict comparisons).
+        let inside = sample_report(0, (2168, 1928), (2148, 1948), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), false, &inside);
+        assert_eq!(out.left, (0.0, 0.0));
+        assert_eq!(out.right, (0.0, 0.0));
+    }
+
+    #[test]
+    fn calibrated_digital_lr_forces_full_trigger() {
+        let calib = StickCalibration::default();
+        // Analog branch would normalize raw 0 against neutral 30 to 0; the L/R
+        // click must force the axis to full scale (device.py:443-447).
+        let left = sample_report(button_mask::L | button_mask::ZL, (2048, 2048), (2048, 2048), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), true, &left);
+        assert_eq!(out.lt, 255);
+        assert_eq!(out.rt, 0);
+
+        let right = sample_report(button_mask::R | button_mask::ZR, (2048, 2048), (2048, 2048), 0, 0);
+        let out = calibrate(&calib, &calib, (30, 30), true, &right);
+        assert_eq!(out.lt, 0);
+        assert_eq!(out.rt, 255);
+    }
+
+    #[test]
+    fn calibrated_gc_pid_uses_analog_trigger_branch() {
+        assert!(has_analog_triggers(NSO_GAMECUBE_PID));
+        assert!(!has_analog_triggers(
+            crate::protocol::constants::PRO_CONTROLLER2_PID
+        ));
+
+        let calib = StickCalibration::default();
+        // ZL/ZR set is irrelevant in the analog branch: raw values decide.
+        let report = sample_report(
+            button_mask::ZL | button_mask::ZR,
+            (2048, 2048),
+            (2048, 2048),
+            255,
+            30,
+        );
+        let out = calibrate(
+            &calib,
+            &calib,
+            (30, 30),
+            has_analog_triggers(NSO_GAMECUBE_PID),
+            &report,
+        );
+        assert_eq!(out.lt, 255);
+        assert_eq!(out.rt, 0);
+    }
+
+    #[test]
+    fn calibrated_pro_pid_maps_zl_zr_to_0_or_255() {
+        let pid = crate::protocol::constants::PRO_CONTROLLER2_PID;
+        assert!(!has_analog_triggers(pid));
+        let calib = StickCalibration::default();
+
+        // Raw trigger bytes are ignored on non-analog pads.
+        let pressed = sample_report(button_mask::ZL | button_mask::ZR, (2048, 2048), (2048, 2048), 7, 9);
+        let out = calibrate(&calib, &calib, (30, 30), has_analog_triggers(pid), &pressed);
+        assert_eq!((out.lt, out.rt), (255, 255));
+
+        let released = sample_report(0, (2048, 2048), (2048, 2048), 255, 255);
+        let out = calibrate(&calib, &calib, (30, 30), has_analog_triggers(pid), &released);
+        assert_eq!((out.lt, out.rt), (0, 0));
     }
 
     #[test]
