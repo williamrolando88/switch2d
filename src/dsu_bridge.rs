@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn battery_and_mac_reach_the_slot_header() {
         let slot = 2;
-        let mac = "BC:89:A6:45:83:CC";
+        let mac = "AA:BB:CC:DD:EE:01";
         let battery_mv = 3700;
         let payload = info_payload(slot, true, mac, battery_enum(battery_mv));
 
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(payload[1], STATE_CONNECTED);
         assert_eq!(
             &payload[4..10],
-            &[0xBC, 0x89, 0xA6, 0x45, 0x83, 0xCC],
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
             "MAC bytes are in the shared slot header"
         );
         assert_eq!(payload[10], 3, "3700 mV -> battery enum 0x03");
