@@ -439,6 +439,35 @@ where
     (Err(err), report)
 }
 
+/// Heuristic for the LE-privacy failure signature, based on dial errors alone.
+///
+/// Returns true when at least one collected error carries `os error 38`
+/// (ENOSYS, the kernel mapping of HCI 0x3E "connection failed to be
+/// established"). A plain timeout is therefore not a match: that is the "pad
+/// is not advertising" signature and must not be conflated.
+///
+/// The caller knows whether the pad was advertising; that fact is deliberately
+/// not part of this pure decision.
+pub fn suspected_le_privacy_failure(errors: &[String]) -> bool {
+    errors
+        .iter()
+        .any(|err| err.contains("os error 38") || err.contains("ENOSYS"))
+}
+
+/// One-line remediation for the suspected LE-privacy signature.
+///
+/// The MAC is included so a field log identifies the affected pad.
+pub fn le_privacy_warning(mac: &str) -> String {
+    format!(
+        "Wake reconnect to {mac} failed with os error 38 (HCI 0x3E). \
+         This usually means Bluetooth LE privacy is enabled: the kernel then \
+         connects from a random address and a pad that stored this adapter \
+         address ignores it. Run `sudo btmgmt -i 0 power off; \
+         sudo btmgmt -i 0 privacy off; sudo btmgmt -i 0 power on` or install \
+         the switch2d-disable-le-privacy unit."
+    )
+}
+
 pub struct SwitchController {
     pub mac: String,
     pub adapter_mac: String,
@@ -497,21 +526,29 @@ impl SwitchController {
         };
 
         let (result, report) = dial_with_budget(&control, budget, mac, &mut dial);
-        result.map_err(|err| {
-            // FIX 3 diagnostics: rounds, both address types and their last OS
-            // errors (inside `err`), plus what the control plane managed.
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "{err} [rounds: {}/{}, attempts: {}, discovery_stop: {}, device_removal: {}]",
-                    report.rounds_attempted,
-                    budget.rounds,
-                    report.attempts,
-                    report.discovery_stop,
-                    report.device_removal
-                ),
-            )
-        })
+        match result {
+            Ok(controller) => Ok(controller),
+            Err(err) => {
+                // One additive WARN after the final failure, never per round.
+                let dial_error = report.last_error.clone().unwrap_or_else(|| err.to_string());
+                if suspected_le_privacy_failure(std::slice::from_ref(&dial_error)) {
+                    warn!("{}", le_privacy_warning(mac));
+                }
+                // FIX 3 diagnostics: rounds, both address types and their last OS
+                // errors (inside `err`), plus what the control plane managed.
+                Err(io::Error::new(
+                    err.kind(),
+                    format!(
+                        "{err} [rounds: {}/{}, attempts: {}, discovery_stop: {}, device_removal: {}]",
+                        report.rounds_attempted,
+                        budget.rounds,
+                        report.attempts,
+                        report.discovery_stop,
+                        report.device_removal
+                    ),
+                ))
+            }
+        }
     }
 
     /// Connect and initialize a Switch 2 controller with explicit handshake options.
@@ -1723,5 +1760,64 @@ mod tests {
         assert!(!needs_factory_calibration(Some(&[
             0x00, 0x08, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
         ])));
+    }
+
+    #[test]
+    fn le_privacy_classifier_matches_38_plus_timeout() {
+        let errors = vec![
+            "Function not implemented (os error 38)".to_string(),
+            "ATT request timed out".to_string(),
+        ];
+        assert!(suspected_le_privacy_failure(&errors));
+    }
+
+    #[test]
+    fn le_privacy_classifier_matches_38_plus_38() {
+        let errors = vec![
+            "LE_PUBLIC: Function not implemented (os error 38)".to_string(),
+            "LE_RANDOM: Function not implemented (os error 38)".to_string(),
+        ];
+        assert!(suspected_le_privacy_failure(&errors));
+    }
+
+    #[test]
+    fn le_privacy_classifier_ignores_plain_timeouts() {
+        let errors = vec![
+            "LE_PUBLIC: ATT request timed out".to_string(),
+            "LE_RANDOM: Connection timed out".to_string(),
+        ];
+        assert!(!suspected_le_privacy_failure(&errors));
+    }
+
+    #[test]
+    fn le_privacy_classifier_ignores_non_38_error() {
+        let errors = vec![
+            "LE_PUBLIC: Device or resource busy (os error 16)".to_string(),
+            "LE_RANDOM: ATT request timed out".to_string(),
+        ];
+        assert!(!suspected_le_privacy_failure(&errors));
+        // ENOSYS is the named form of the same signature.
+        assert!(suspected_le_privacy_failure(&[
+            "connect failed: ENOSYS".to_string()
+        ]));
+    }
+
+    #[test]
+    fn le_privacy_warning_names_remediation_and_mac() {
+        let message = le_privacy_warning("BC:89:A6:49:8D:74");
+        assert_eq!(
+            message,
+            "Wake reconnect to BC:89:A6:49:8D:74 failed with os error 38 (HCI 0x3E). \
+             This usually means Bluetooth LE privacy is enabled: the kernel then \
+             connects from a random address and a pad that stored this adapter \
+             address ignores it. Run `sudo btmgmt -i 0 power off; \
+             sudo btmgmt -i 0 privacy off; sudo btmgmt -i 0 power on` or install \
+             the switch2d-disable-le-privacy unit."
+        );
+        assert!(message.contains("BC:89:A6:49:8D:74"));
+        assert!(message.contains("sudo btmgmt -i 0 power off"));
+        assert!(message.contains("sudo btmgmt -i 0 privacy off"));
+        assert!(message.contains("sudo btmgmt -i 0 power on"));
+        assert!(message.contains("switch2d-disable-le-privacy"));
     }
 }
