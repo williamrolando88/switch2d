@@ -1,56 +1,68 @@
-//! Central daemon orchestrating multiple controller connections and virtual gamepad lifecycle.
+//! Daemon orchestration: one hub thread, one worker task per pad, one status
+//! supervisor task (architecture §10, task 09B).
+//!
+//! ```text
+//! main (tokio)
+//!  ├─ supervisor task   : 1.5 s tick + activate/teardown -> state.json
+//!  ├─ Hub thread (std)  : poll_once / dial_pending, owns ScanControl + AdvertSource
+//!  │     └─ Dialer::dial: controller::connect_with (blocking, single dialer)
+//!  │           └─ sends SwitchController over a per-pad channel to the worker
+//!  └─ worker task/pad   : owns uinput node, Worker state, idle sleep
+//!        └─ ATT reader thread -> try_send(report) on a bounded(64) channel
+//! ```
+//!
+//! Invariants (see `docs/architecture.md` §10):
+//!
+//! * **One dialer.** Only the hub thread calls `connect_with`, so two LE
+//!   create-connections are impossible (HANDOVER Bug 2) and no worker-side
+//!   connect lock is needed.
+//! * **The ATT reader never blocks.** Its callback does exactly one `try_send`
+//!   into a bounded channel and bumps a drop counter; a full channel drops the
+//!   frame instead of stalling command responses (analysis §5.6).
+//! * **Workers never dial.** When a session ends they tell the hub over a std
+//!   channel; the hub re-arms the pad so the next *live advert* dials again.
+//! * **The node survives sessions.** Teardown releases keys/axes (rumble stop
+//!   is not wired yet) and keeps the uinput node; the next session reuses it.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use std::sync::OnceLock;
-use std::time::Duration;
-use tokio::sync::Mutex;
+use std::collections::HashMap;
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver as StdReceiver, Sender as StdSender, TryRecvError};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+use evdev::{AbsoluteAxisType, Key};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::{DaemonConfig, DaemonMode};
-use crate::controller::{BondPolicy, ConnectOptions, DialBudget, SwitchController};
-use crate::protocol::calibration::StickCalibration;
-use crate::protocol::constants::*;
-use crate::uinput::{CombinedJoyConManager, VirtualGamepad};
+use crate::bluetooth::bluez::BluezAdvertSource;
+use crate::bluetooth::scan::{AdvertSource, ScanControl, ShellScanControl};
+use crate::config::{BondedController, DaemonConfig, DaemonMode};
+use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
+use crate::hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
+use crate::protocol::constants::{button_mask, PRO_CONTROLLER2_PID};
+use crate::protocol::report::InputReport;
+use crate::status::{
+    battery_pct_from_mv, ControllerStatus, DaemonStatus, ServiceState, StatusPublisher,
+};
+use crate::uinput::{PadSink, VirtualGamepad, STICK_MAX};
+use crate::worker::{Worker, WorkerConfig};
 
-/// The calibration a live session actually read, captured once when the
-/// session is established.
-///
-/// `SwitchController::left_calib` / `right_calib` are calibration *blocks*, not
-/// "the left half of the pad": a right Joy-Con keeps its stick calibration in
-/// `right_calib` (falling back to the left block inside the controller), so the
-/// callback has to pick the block belonging to the side it is updating. Feeding
-/// `StickCalibration::default()` here was the round-6 bug: it capped every
-/// stick at the default 0.74 of full scale even though the session had the real
-/// calibration.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SessionCalibration {
-    left: StickCalibration,
-    right: StickCalibration,
-}
+/// Bounded input-report channel: enough to absorb a scheduling hiccup without
+/// letting a stalled worker hold the ATT reader (analysis §5.6).
+const REPORT_CHANNEL_CAPACITY: usize = 64;
 
-impl SessionCalibration {
-    /// Capture the calibration the controller read during this connect.
-    pub(crate) fn capture(controller: &SwitchController) -> Self {
-        Self {
-            left: controller.left_calib,
-            right: controller.right_calib,
-        }
-    }
+/// How often a live session re-checks liveness and the idle timer.
+const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-    /// Calibration for the side being updated (`is_left` = this pad is a left
-    /// Joy-Con). Shared by combined and split mode.
-    pub(crate) fn for_side(&self, is_left: bool) -> &StickCalibration {
-        if is_left {
-            &self.left
-        } else {
-            &self.right
-        }
-    }
-}
+/// Hub error backoff floor/ceiling (architecture §10, sequencing rule 2).
+const HUB_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const HUB_BACKOFF_MAX: Duration = Duration::from_millis(2000);
+
+/// Status publication cadence (legacy `_STATUS_INTERVAL_S`).
+const STATUS_INTERVAL: Duration = Duration::from_millis(1500);
 
 pub struct Daemon {
     config: DaemonConfig,
@@ -65,7 +77,8 @@ impl Daemon {
         }
     }
 
-    /// Run the daemon event loop until cancelled.
+    /// Run the daemon: spawn the supervisor, one worker per configured pad and
+    /// the hub thread, then park (the daemon only stops when the process does).
     pub async fn run(&self) -> std::io::Result<()> {
         let adapter_mac = self.config.adapter_mac.clone();
         if adapter_mac.is_empty() {
@@ -83,270 +96,304 @@ impl Daemon {
             return Ok(());
         }
 
-        // MACs with a session we currently own. The dial envelope must never
-        // remove the BlueZ Device object for these: `bluetoothctl remove` tears
-        // the live link down (analysis 8.7 / legacy bridge.py:136-154).
-        let live_sessions: Arc<StdMutex<HashSet<String>>> = Arc::new(StdMutex::new(HashSet::new()));
+        let pads: Vec<PadSpec> = self
+            .config
+            .controllers
+            .iter()
+            .map(PadSpec::from_config)
+            .collect();
+        let idle_timeout = Duration::from_secs(self.config.idle_sleep_seconds.max(1));
+        let horizontal = self.config.mode == DaemonMode::Split;
 
-        match self.config.mode {
-            DaemonMode::Combined => self.run_combined(live_sessions).await,
-            DaemonMode::Split => self.run_split(live_sessions).await,
+        // Status plane: the supervisor is the only writer.
+        let (sup_tx, sup_rx) = tokio_mpsc::unbounded_channel();
+        let publisher = StatusPublisher::new();
+        let supervisor = tokio::spawn(supervisor_loop(sup_rx, publisher, pads.clone()));
+
+        // Worker -> hub notifications (low rate, std channel: the hub thread is
+        // synchronous and polls it once per cycle).
+        let (hub_tx, hub_rx) = mpsc::channel::<HubMsg>();
+
+        // Per-pad channels: sessions (hub -> worker) and reports (reader thread
+        // -> worker). The report Sender is cloned into the dialer's callback.
+        let mut session_senders: HashMap<String, SessionSender> = HashMap::new();
+        let mut links: HashMap<String, PadLink> = HashMap::new();
+        let mut receivers = Vec::with_capacity(pads.len());
+        for pad in &pads {
+            let (session_tx, session_rx) = tokio_mpsc::channel::<SwitchController>(1);
+            let (report_tx, report_rx) =
+                tokio_mpsc::channel::<InputReport>(REPORT_CHANNEL_CAPACITY);
+            let drops = Arc::new(AtomicU64::new(0));
+
+            session_senders.insert(pad.mac.clone(), SessionSender(session_tx));
+            links.insert(
+                pad.mac.clone(),
+                PadLink {
+                    reports: report_tx,
+                    drops: Arc::clone(&drops),
+                },
+            );
+            receivers.push((pad.clone(), session_rx, report_rx, drops));
         }
-    }
 
-    async fn run_combined(
-        &self,
-        live_sessions: Arc<StdMutex<HashSet<String>>>,
-    ) -> std::io::Result<()> {
-        // Create a single unified Virtual Gamepad for the combined Joy-Cons
-        let combined_gamepad = Arc::new(VirtualGamepad::new(
-            "Nintendo Switch 2 Combined Joy-Cons",
-            PRO_CONTROLLER2_PID,
-            "switch2-combined",
-        )?);
+        // Sinks. Combined mode maps both pads into one node; split mode gives
+        // each pad its own node (created once, reused by every session).
+        let combined_gamepad = match self.config.mode {
+            DaemonMode::Combined => Some(Arc::new(StdMutex::new(VirtualGamepad::new(
+                "Nintendo Switch 2 Combined Joy-Cons",
+                PRO_CONTROLLER2_PID,
+                "switch2-combined",
+            )?))),
+            DaemonMode::Split => None,
+        };
 
-        let manager = Arc::new(CombinedJoyConManager::new(combined_gamepad));
-        let connect_lock = Arc::new(Mutex::new(()));
-        let mut handles = Vec::new();
-
-        for ctrl_cfg in &self.config.controllers {
-            let ctrl_cfg = ctrl_cfg.clone();
-            let adapter_mac = self.config.adapter_mac.clone();
-            let running = self.running.clone();
-            let mgr = manager.clone();
-            let conn_lock = connect_lock.clone();
-            let live_sessions = Arc::clone(&live_sessions);
-
-            let handle = tokio::spawn(async move {
-                let is_left = ctrl_cfg.name.to_lowercase().contains("left");
-
-                while running.load(Ordering::Relaxed) {
-                    let mgr_cb = mgr.clone();
-                    let mac_str = ctrl_cfg.mac.clone();
-                    let adapter_str = adapter_mac.clone();
-                    // Filled as soon as the session is established; the callback
-                    // only reads it (no I/O, no locks), so the ATT reader is
-                    // never blocked (analysis 5.6).
-                    let session_calib: Arc<OnceLock<SessionCalibration>> =
-                        Arc::new(OnceLock::new());
-                    let calib_for_cb = Arc::clone(&session_calib);
-
-                    // Serialize connection attempts so hardware adapter does not hit EBUSY
-                    let conn_permit = conn_lock.lock().await;
-
-                    let live_for_dial = Arc::clone(&live_sessions);
-                    let res = tokio::task::spawn_blocking(move || {
-                        let is_l = is_left;
-                        let mgr_for_cb = mgr_cb.clone();
-                        // Never drop the BlueZ Device object for a MAC we own a
-                        // session for: the removal kills the live link.
-                        let has_live_session = live_for_dial
-                            .lock()
-                            .map(|live| live.contains(&mac_str))
-                            .unwrap_or(false);
-                        let budget = DialBudget {
-                            remove_bluez_device: !has_live_session,
-                            ..DialBudget::default()
-                        };
-                        // `connect_session` stops discovery before every round,
-                        // drops the BlueZ Device object once up front, and uses
-                        // the legacy 16 x 0.8 s envelope (analysis 8.7/8.8).
-                        SwitchController::connect_session(
-                            &mac_str,
-                            &adapter_str,
-                            ConnectOptions {
-                                player: ctrl_cfg.player,
-                                // Already-bonded pads only need a wake; unbonded
-                                // ones must store host MAC + LTK on this connect.
-                                bond: if ctrl_cfg.bonded {
-                                    BondPolicy::Skip
-                                } else {
-                                    BondPolicy::IfNeeded
-                                },
-                            },
-                            Box::new(move |report| {
-                                // A report can beat the capture by a few frames
-                                // (is_ready is set just before connect returns);
-                                // skipping those is better than emitting
-                                // default-calibrated values.
-                                let Some(calib) = calib_for_cb.get() else {
-                                    return;
-                                };
-                                if is_l {
-                                    mgr_for_cb.update_left(report, calib.for_side(true));
-                                } else {
-                                    mgr_for_cb.update_right(report, calib.for_side(false));
-                                }
-                            }),
-                            budget,
-                        )
-                    }).await;
-
-                    // Release connect lock regardless of success or failure
-                    drop(conn_permit);
-
-                    match res {
-                        Ok(Ok(controller)) => {
-                            // Capture before the 500 ms health poll so the
-                            // callback switches from "skip" to real values now.
-                            let _ = session_calib.set(SessionCalibration::capture(&controller));
-                            info!("Controller {} connected and streaming inputs!", ctrl_cfg.mac);
-                            if let Ok(mut live) = live_sessions.lock() {
-                                live.insert(ctrl_cfg.mac.clone());
-                            }
-                            while controller.is_connected() && running.load(Ordering::Relaxed) {
-                                sleep(Duration::from_millis(500)).await;
-                            }
-                            if let Ok(mut live) = live_sessions.lock() {
-                                live.remove(&ctrl_cfg.mac);
-                            }
-                            warn!("Controller {} disconnected.", ctrl_cfg.mac);
-                        }
-                        Ok(Err(e)) => {
-                            log_connect_failure(&ctrl_cfg.mac, &e);
-                            sleep(Duration::from_millis(1500)).await;
-                        }
-                        Err(e) => {
-                            error!("Spawn task error: {}", e);
-                            sleep(Duration::from_millis(1500)).await;
-                        }
-                    }
+        for (pad, session_rx, report_rx, drops) in receivers {
+            let hub_tx = hub_tx.clone();
+            let sup_tx = sup_tx.clone();
+            match &combined_gamepad {
+                Some(gamepad) => {
+                    let sink = CombinedSideSink {
+                        gamepad: Arc::clone(gamepad),
+                        side: pad.side(),
+                        horizontal,
+                    };
+                    tokio::spawn(run_pad_worker(
+                        pad,
+                        sink,
+                        session_rx,
+                        report_rx,
+                        drops,
+                        hub_tx,
+                        sup_tx,
+                        idle_timeout,
+                    ));
                 }
-            });
-
-            handles.push(handle);
-        }
-
-        for h in handles {
-            let _ = h.await;
-        }
-
-        Ok(())
-    }
-
-    async fn run_split(
-        &self,
-        live_sessions: Arc<StdMutex<HashSet<String>>>,
-    ) -> std::io::Result<()> {
-        let mut handles = Vec::new();
-        let connect_lock = Arc::new(Mutex::new(()));
-
-        for ctrl_cfg in &self.config.controllers {
-            let ctrl_cfg = ctrl_cfg.clone();
-            let adapter_mac = self.config.adapter_mac.clone();
-            let running = self.running.clone();
-            let conn_lock = connect_lock.clone();
-            let live_sessions = Arc::clone(&live_sessions);
-
-            let handle = tokio::spawn(async move {
-                let gp_name = format!("Nintendo Switch 2 {}", ctrl_cfg.name);
-                let gamepad = match VirtualGamepad::new(&gp_name, ctrl_cfg.product_id, &ctrl_cfg.mac) {
-                    Ok(gp) => Arc::new(gp),
-                    Err(e) => {
-                        error!("Failed to create virtual gamepad: {}", e);
-                        return;
-                    }
-                };
-
-                let manager = Arc::new(CombinedJoyConManager::new(gamepad));
-
-                while running.load(Ordering::Relaxed) {
-                    let mgr_cb = manager.clone();
-                    let mac_str = ctrl_cfg.mac.clone();
-                    let adapter_str = adapter_mac.clone();
-                    let is_left = ctrl_cfg.name.to_lowercase().contains("left");
-                    // Same session calibration capture as combined mode.
-                    let session_calib: Arc<OnceLock<SessionCalibration>> =
-                        Arc::new(OnceLock::new());
-                    let calib_for_cb = Arc::clone(&session_calib);
-
-                    let conn_permit = conn_lock.lock().await;
-
-                    let live_for_dial = Arc::clone(&live_sessions);
-                    let res = tokio::task::spawn_blocking(move || {
-                        let is_l = is_left;
-                        let mgr_for_cb = mgr_cb.clone();
-                        // Same guard as combined mode: no Device-object removal
-                        // while we own a live session for this MAC.
-                        let has_live_session = live_for_dial
-                            .lock()
-                            .map(|live| live.contains(&mac_str))
-                            .unwrap_or(false);
-                        let budget = DialBudget {
-                            remove_bluez_device: !has_live_session,
-                            ..DialBudget::default()
-                        };
-                        SwitchController::connect_session(
-                            &mac_str,
-                            &adapter_str,
-                            ConnectOptions {
-                                player: ctrl_cfg.player,
-                                bond: if ctrl_cfg.bonded {
-                                    BondPolicy::Skip
-                                } else {
-                                    BondPolicy::IfNeeded
-                                },
-                            },
-                            Box::new(move |report| {
-                                let Some(calib) = calib_for_cb.get() else {
-                                    return;
-                                };
-                                if is_l {
-                                    mgr_for_cb.update_horizontal_left(report, calib.for_side(true));
-                                } else {
-                                    mgr_for_cb
-                                        .update_horizontal_right(report, calib.for_side(false));
-                                }
-                            }),
-                            budget,
-                        )
-                    }).await;
-
-                    drop(conn_permit);
-
-                    match res {
-                        Ok(Ok(controller)) => {
-                            let _ = session_calib.set(SessionCalibration::capture(&controller));
-                            info!("Controller {} connected in split mode!", ctrl_cfg.mac);
-                            if let Ok(mut live) = live_sessions.lock() {
-                                live.insert(ctrl_cfg.mac.clone());
-                            }
-                            while controller.is_connected() && running.load(Ordering::Relaxed) {
-                                sleep(Duration::from_millis(500)).await;
-                            }
-                            if let Ok(mut live) = live_sessions.lock() {
-                                live.remove(&ctrl_cfg.mac);
-                            }
-                            warn!("Controller {} disconnected.", ctrl_cfg.mac);
-                        }
-                        Ok(Err(e)) => {
-                            log_connect_failure(&ctrl_cfg.mac, &e);
-                            sleep(Duration::from_millis(1500)).await;
-                        }
-                        Err(e) => {
-                            error!("Spawn task error: {}", e);
-                            sleep(Duration::from_millis(1500)).await;
-                        }
-                    }
+                None => {
+                    let name = format!("Nintendo Switch 2 {}", pad.name);
+                    let gamepad = Arc::new(StdMutex::new(VirtualGamepad::new(
+                        &name,
+                        pad.product_id,
+                        &pad.mac,
+                    )?));
+                    let sink = SharedPadSink { gamepad };
+                    tokio::spawn(run_pad_worker(
+                        pad,
+                        sink,
+                        session_rx,
+                        report_rx,
+                        drops,
+                        hub_tx,
+                        sup_tx,
+                        idle_timeout,
+                    ));
                 }
-            });
-
-            handles.push(handle);
+            }
         }
 
-        for h in handles {
-            let _ = h.await;
+        // One OS thread owns the Hub (it shells out and sleeps, so it must not
+        // occupy a tokio worker).
+        let queue = SessionQueue::default();
+        let dialer = ControllerDialer::new(adapter_mac.clone(), links, &pads, queue.clone());
+        let mut hub = Hub::new(
+            BluezAdvertSource::new(),
+            ShellScanControl::from_env(),
+            dialer,
+            HubConfig::default(),
+        );
+        hub.set_adapter_mac(&adapter_mac);
+        for pad in &pads {
+            hub.register_known(&pad.mac);
         }
 
+        // A second handle on the same HCI index, used only to undo the
+        // `prepare_global` stop after a dial batch (same thread as the hub).
+        let discovery_restorer = ShellScanControl::from_env();
+        let running = Arc::clone(&self.running);
+        std::thread::Builder::new()
+            .name("switch2d-hub".to_string())
+            .spawn(move || {
+                hub_thread_loop(
+                    hub,
+                    queue,
+                    session_senders,
+                    hub_rx,
+                    sup_tx,
+                    running,
+                    discovery_restorer,
+                )
+            })?;
+
+        // The supervisor and the workers run for the lifetime of the process.
+        let _ = supervisor.await;
         Ok(())
     }
 }
 
-/// Log a failed connect attempt: the first failure for a pad is a warning with
-/// the full diagnostic (MAC, both address types, both OS errors, discovery
-/// outcome); later retries drop to debug so a parked/unreachable pad does not
-/// spam the log.
-fn log_connect_failure(mac: &str, err: &std::io::Error) {
+// ---------------------------------------------------------------------------
+// Hub thread
+// ---------------------------------------------------------------------------
+
+/// Notification from a worker to the hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HubMsg {
+    /// The worker's session ended (link loss, idle sleep or teardown).
+    SessionEnded(String),
+}
+
+/// Hub -> worker session delivery handle.
+#[derive(Clone)]
+struct SessionSender(tokio_mpsc::Sender<SwitchController>);
+
+impl SessionSender {
+    /// Deliver an established session to its worker.
+    ///
+    /// Blocks only until the worker takes it (the channel holds one session):
+    /// dial success must reach the worker *before* the hub polls again, or the
+    /// still-advertising pad queues a second dial for a link that is already up
+    /// (architecture §10, sequencing rule 3).
+    fn send(&self, controller: SwitchController) -> bool {
+        self.0.blocking_send(controller).is_ok()
+    }
+}
+
+/// The scheduler loop. Never exits on error: hub failures back off and retry
+/// (architecture §10, sequencing rule 2).
+#[allow(clippy::too_many_arguments)]
+fn hub_thread_loop(
+    mut hub: Hub<BluezAdvertSource, ShellScanControl, ControllerDialer>,
+    queue: SessionQueue,
+    sessions: HashMap<String, SessionSender>,
+    hub_rx: StdReceiver<HubMsg>,
+    sup_tx: UnboundedSender<SupervisorMsg>,
+    running: Arc<AtomicBool>,
+    discovery_restorer: ShellScanControl,
+) {
+    let config = HubConfig::default();
+    let mut backoff = HUB_BACKOFF_MIN;
+
+    while running.load(Ordering::Relaxed) {
+        drain_hub_messages(&mut hub, &hub_rx);
+
+        match hub.poll_once(Instant::now()) {
+            Ok(HubOutcome::AllConnected) => {
+                sup_tx.send(SupervisorMsg::Scanning(false)).ok();
+                std::thread::sleep(config.all_connected_sleep);
+                backoff = HUB_BACKOFF_MIN;
+            }
+            Ok(HubOutcome::Idle) => {
+                sup_tx.send(SupervisorMsg::Scanning(true)).ok();
+                std::thread::sleep(config.cycle_sleep);
+                backoff = HUB_BACKOFF_MIN;
+            }
+            Ok(HubOutcome::Pending(pending)) => {
+                std::thread::sleep(config.dial_pause);
+                let results = hub.dial_pending(&pending);
+                // `dial_pending` stops discovery before dialing so the LE
+                // create-connection succeeds, but the hub still believes
+                // discovery is running and will not restart it until
+                // `idle_restart_cycles` (~20 s). Restore it now or a second
+                // pad's wake advert would go unseen for that long.
+                if let Err(err) = discovery_restorer.start_le_scan() {
+                    warn!("Could not restart discovery after dialing: {err}");
+                }
+                for result in &results {
+                    if let Err(err) = &result.outcome {
+                        log_dial_failure(&result.mac, err);
+                    }
+                    let controller = queue.take(&result.mac);
+                    let delivered = match controller {
+                        Some(controller) => sessions
+                            .get(&result.mac)
+                            .map(|sender| sender.send(controller))
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if handoff_session(&mut hub, result, || delivered) {
+                        info!("{}: session handed to its worker", result.mac);
+                    }
+                }
+                sup_tx.send(SupervisorMsg::Scanning(true)).ok();
+                backoff = HUB_BACKOFF_MIN;
+            }
+            Err(err) => {
+                warn!("Hub cycle failed: {err}");
+                sup_tx
+                    .send(SupervisorMsg::HubError(Some(err.to_string())))
+                    .ok();
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(HUB_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+/// Apply worker notifications before polling (re-arming pads whose session ended).
+fn drain_hub_messages<S, C, D>(hub: &mut Hub<S, C, D>, rx: &StdReceiver<HubMsg>)
+where
+    S: AdvertSource,
+    C: ScanControl,
+    D: Dialer,
+{
+    loop {
+        match rx.try_recv() {
+            Ok(HubMsg::SessionEnded(mac)) => {
+                debug!("{mac}: session ended, re-arming the pad");
+                rearm_pad(hub, &mac);
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+/// Hand a freshly dialled session to its worker, then tell the hub the pad is
+/// up. Returns whether the pad was marked connected.
+///
+/// `deliver` is the actual handoff (channel send); marking connected only
+/// happens when the worker really accepted the session, so a dead worker can
+/// never leave a pad permanently "connected" and invisible to the scanner.
+fn handoff_session<S, C, D>(
+    hub: &mut Hub<S, C, D>,
+    result: &DialResult,
+    deliver: impl FnOnce() -> bool,
+) -> bool
+where
+    S: AdvertSource,
+    C: ScanControl,
+    D: Dialer,
+{
+    if let Err(err) = &result.outcome {
+        debug!("Dial {} failed: {}", result.mac, err);
+        return false;
+    }
+    if !deliver() {
+        warn!(
+            "worker for {} is gone; dropping the established session",
+            result.mac
+        );
+        // A successful dial already marks the pad connected; without a worker
+        // that session is lost, so put the pad straight back into the dialable
+        // state instead of leaving it "connected" and invisible to the scanner.
+        rearm_pad(hub, &result.mac);
+        return false;
+    }
+    hub.mark_connected(&result.mac);
+    true
+}
+
+/// A worker's session ended: re-arm the pad so the hub dials it again on its
+/// next *live advert* (`register_known` also clears the connected flag).
+fn rearm_pad<S, C, D>(hub: &mut Hub<S, C, D>, mac: &str)
+where
+    S: AdvertSource,
+    C: ScanControl,
+    D: Dialer,
+{
+    hub.register_known(mac);
+}
+
+/// Warn once per pad slot about a failed dial: the hub only dials pads that are
+/// advertising, so a failure is worth seeing once and then only at debug level.
+fn log_dial_failure(mac: &str, err: &str) {
     use std::sync::atomic::AtomicBool;
     static WARNED: [AtomicBool; 8] = [
         AtomicBool::new(false),
@@ -358,76 +405,1030 @@ fn log_connect_failure(mac: &str, err: &std::io::Error) {
         AtomicBool::new(false),
         AtomicBool::new(false),
     ];
-    // Cheap per-MAC slot: last hex digit of the MAC.
     let slot = mac.chars().last().and_then(|c| c.to_digit(16)).unwrap_or(0);
     let slot = (slot as usize) % WARNED.len();
 
     if !WARNED[slot].swap(true, Ordering::Relaxed) {
         warn!("Connect to {mac} failed: {err}");
     } else {
-        tracing::debug!("Connect to {mac} failed (retrying): {err}");
+        debug!("Connect to {mac} failed (retrying): {err}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dialer
+// ---------------------------------------------------------------------------
+
+/// Report channel + drop counter for one pad (cloned into the ATT callback).
+#[derive(Clone)]
+struct PadLink {
+    reports: tokio_mpsc::Sender<InputReport>,
+    drops: Arc<AtomicU64>,
+}
+
+/// Sessions the dialer established, waiting to be handed to their workers.
+///
+/// The hub owns the dialer, so the daemon cannot read a result out of it after
+/// `dial_pending`; the dialer therefore parks each new controller here and the
+/// hub thread drains it immediately afterwards. This keeps `src/hub.rs`
+/// untouched.
+#[derive(Clone, Default)]
+struct SessionQueue(Arc<StdMutex<Vec<(String, SwitchController)>>>);
+
+impl SessionQueue {
+    fn push(&self, mac: &str, controller: SwitchController) {
+        let mut queue = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.push((mac.to_ascii_uppercase(), controller));
+    }
+
+    fn take(&self, mac: &str) -> Option<SwitchController> {
+        let mut queue = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = mac.to_ascii_uppercase();
+        let index = queue.iter().position(|(entry, _)| *entry == key)?;
+        Some(queue.remove(index).1)
+    }
+}
+
+/// The only code path that dials a controller.
+struct ControllerDialer {
+    adapter_mac: String,
+    links: HashMap<String, PadLink>,
+    players: HashMap<String, (u8, BondPolicy)>,
+    queue: SessionQueue,
+}
+
+impl ControllerDialer {
+    fn new(
+        adapter_mac: String,
+        links: HashMap<String, PadLink>,
+        pads: &[PadSpec],
+        queue: SessionQueue,
+    ) -> Self {
+        let players = pads
+            .iter()
+            .map(|pad| {
+                let bond = if pad.bonded {
+                    BondPolicy::Skip
+                } else {
+                    BondPolicy::IfNeeded
+                };
+                (pad.mac.clone(), (pad.player, bond))
+            })
+            .collect();
+        Self {
+            adapter_mac,
+            links,
+            players,
+            queue,
+        }
+    }
+}
+
+impl Dialer for ControllerDialer {
+    fn dial(&mut self, mac: &str) -> io::Result<()> {
+        let key = mac.to_ascii_uppercase();
+        let link = self.links.get(&key).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("{mac} is not configured"))
+        })?;
+        let (player, bond) = *self.players.get(&key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("{mac} is not configured"))
+        })?;
+
+        // The ATT reader thread only ever does one non-blocking send per report
+        // and one atomic increment on drop: it must never block on the worker
+        // (analysis §5.6).
+        let reports = link.reports;
+        let drops = link.drops;
+        let input_cb: crate::controller::ControllerInputCallback = Box::new(move |report| {
+            if reports.try_send(report.clone()).is_err() {
+                drops.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // The hub has already stopped discovery (`prepare_global`) and dropped
+        // the cached BlueZ object for this MAC; one connect attempt is enough
+        // because the pad is advertising right now. A failure simply re-arms on
+        // the next advert.
+        let controller = SwitchController::connect_with(
+            mac,
+            &self.adapter_mac,
+            ConnectOptions { player, bond },
+            input_cb,
+        )?;
+
+        self.queue.push(&key, controller);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workers
+// ---------------------------------------------------------------------------
+
+/// Static per-pad identity from the config (never mutated at runtime).
+#[derive(Debug, Clone)]
+struct PadSpec {
+    /// Upper-case MAC.
+    mac: String,
+    player: u8,
+    name: String,
+    bonded: bool,
+    product_id: u16,
+    /// `true` when the config name says this pad is a left Joy-Con (legacy
+    /// heuristic, kept as-is: combined/split mapping needs it).
+    is_left: bool,
+}
+
+impl PadSpec {
+    fn from_config(entry: &BondedController) -> Self {
+        Self {
+            mac: entry.mac.to_ascii_uppercase(),
+            player: entry.player,
+            name: entry.name.clone(),
+            bonded: entry.bonded,
+            product_id: entry.product_id,
+            is_left: entry.name.to_lowercase().contains("left"),
+        }
+    }
+
+    fn side(&self) -> Side {
+        if self.is_left {
+            Side::Left
+        } else {
+            Side::Right
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// One worker task: waits for sessions and runs them until the link drops or
+/// the pad goes idle. The uinput node lives in the sink and survives sessions.
+#[allow(clippy::too_many_arguments)]
+async fn run_pad_worker<S>(
+    pad: PadSpec,
+    sink: S,
+    mut sessions: tokio_mpsc::Receiver<SwitchController>,
+    mut reports: tokio_mpsc::Receiver<InputReport>,
+    drops: Arc<AtomicU64>,
+    hub_tx: StdSender<HubMsg>,
+    sup_tx: UnboundedSender<SupervisorMsg>,
+    idle_timeout: Duration,
+) where
+    S: PadSink + Clone,
+{
+    while let Some(controller) = sessions.recv().await {
+        run_session(
+            &pad,
+            &sink,
+            controller,
+            &mut reports,
+            &drops,
+            &hub_tx,
+            &sup_tx,
+            idle_timeout,
+        )
+        .await;
+    }
+}
+
+/// Drive one established session until it ends.
+#[allow(clippy::too_many_arguments)]
+async fn run_session<S>(
+    pad: &PadSpec,
+    sink: &S,
+    controller: SwitchController,
+    reports: &mut tokio_mpsc::Receiver<InputReport>,
+    drops: &AtomicU64,
+    hub_tx: &StdSender<HubMsg>,
+    sup_tx: &UnboundedSender<SupervisorMsg>,
+    idle_timeout: Duration,
+) where
+    S: PadSink + Clone,
+{
+    // Frames queued for a previous session must not be applied to this one.
+    while reports.try_recv().is_ok() {}
+
+    let mut worker = Worker::new(
+        WorkerConfig {
+            mac: pad.mac.clone(),
+            player: pad.player,
+            idle_timeout,
+        },
+        sink.clone(),
+    );
+    info!(
+        "{}: session active (player {}) - calibration from this session",
+        pad.mac, pad.player
+    );
+    sup_tx
+        .send(SupervisorMsg::Activated {
+            mac: pad.mac.clone(),
+        })
+        .ok();
+
+    let mut battery_mv = 0u16;
+    let mut idle_sleep = false;
+
+    loop {
+        tokio::select! {
+            maybe = reports.recv() => {
+                let Some(report) = maybe else { break };
+                // The controller owns the calibration read during its connect
+                // handshake; use it rather than any daemon-side default.
+                let calibrated = controller.calibrated_input(&report);
+                if let Err(err) = worker.on_report(&report, &calibrated, Instant::now()) {
+                    warn!("{}: uinput update failed: {err}", pad.mac);
+                }
+                if worker.battery_mv() != battery_mv {
+                    battery_mv = worker.battery_mv();
+                    sup_tx
+                        .send(SupervisorMsg::Battery {
+                            mac: pad.mac.clone(),
+                            mv: battery_mv,
+                        })
+                        .ok();
+                }
+                let sleep_now = worker.should_sleep(Instant::now());
+                if !controller.is_connected() {
+                    break;
+                }
+                if sleep_now {
+                    idle_sleep = true;
+                    break;
+                }
+            }
+            _ = sleep(SESSION_POLL_INTERVAL) => {
+                if !controller.is_connected() {
+                    break;
+                }
+                if worker.should_sleep(Instant::now()) {
+                    idle_sleep = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if idle_sleep {
+        info!(
+            "{}: idle for {:?}, putting the pad to sleep",
+            pad.mac, idle_timeout
+        );
+    }
+    // Teardown order (deviation 6): rumble stop (not wired yet), release every
+    // key/axis, keep the node open for the next session.
+    teardown_session(&mut worker, &pad.mac);
+    if idle_sleep {
+        // Waits (<= 1 s) for the HCI-state reply, then closes the link.
+        controller.sleep();
+    }
+    drop(controller);
+
+    let dropped = drops.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        warn!(
+            "{}: dropped {dropped} input report(s) (worker channel full)",
+            pad.mac
+        );
+    }
+
+    hub_tx.send(HubMsg::SessionEnded(pad.mac.clone())).ok();
+    sup_tx
+        .send(SupervisorMsg::TornDown {
+            mac: pad.mac.clone(),
+        })
+        .ok();
+}
+
+/// Release input without closing the node (deviation 6).
+fn teardown_session<S: PadSink>(worker: &mut Worker<S>, mac: &str) {
+    if let Err(err) = worker.teardown() {
+        warn!("{mac}: teardown failed: {err}");
+    }
+}
+
+fn lock_gamepad(
+    gamepad: &Arc<StdMutex<VirtualGamepad>>,
+) -> std::sync::MutexGuard<'_, VirtualGamepad> {
+    gamepad
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sink for split mode: one node per pad, full dual-stick mapping.
+#[derive(Clone)]
+struct SharedPadSink {
+    gamepad: Arc<StdMutex<VirtualGamepad>>,
+}
+
+impl PadSink for SharedPadSink {
+    fn update(
+        &mut self,
+        buttons: u32,
+        sticks: (f32, f32, f32, f32),
+        triggers: (u8, u8),
+    ) -> io::Result<()> {
+        let mut gamepad = lock_gamepad(&self.gamepad);
+        PadSink::update(&mut *gamepad, buttons, sticks, triggers)
+    }
+
+    fn release_all(&mut self) -> io::Result<()> {
+        let mut gamepad = lock_gamepad(&self.gamepad);
+        PadSink::release_all(&mut *gamepad)
+    }
+
+    fn set_player(&mut self, player: u8) -> io::Result<()> {
+        let mut gamepad = lock_gamepad(&self.gamepad);
+        PadSink::set_player(&mut *gamepad, player)
+    }
+}
+
+/// Sink for combined mode: one half of the shared combined node.
+///
+/// This mirrors `uinput::combined::update_left/right` (and the horizontal
+/// variants) but consumes the already-calibrated values the worker produces.
+/// The conversion is the same truncating `* 32767.0` as
+/// `StickCalibration::apply_scaled_i16`, so the emitted axis values are
+/// unchanged from the pre-worker daemon.
+#[derive(Clone)]
+struct CombinedSideSink {
+    gamepad: Arc<StdMutex<VirtualGamepad>>,
+    side: Side,
+    horizontal: bool,
+}
+
+impl PadSink for CombinedSideSink {
+    fn update(
+        &mut self,
+        buttons: u32,
+        sticks: (f32, f32, f32, f32),
+        _triggers: (u8, u8),
+    ) -> io::Result<()> {
+        let gamepad = lock_gamepad(&self.gamepad);
+        let (lx, ly, rx, ry) = sticks;
+        let pressed = |mask: u32| buttons & mask != 0;
+
+        match (self.side, self.horizontal) {
+            (Side::Left, false) => {
+                gamepad.set_abs(AbsoluteAxisType::ABS_X, axis_from_unit(lx));
+                gamepad.set_abs(AbsoluteAxisType::ABS_Y, -axis_from_unit(ly));
+                gamepad.set_abs(AbsoluteAxisType::ABS_HAT0X, hat_x(buttons));
+                gamepad.set_abs(AbsoluteAxisType::ABS_HAT0Y, hat_y(buttons));
+                gamepad.set_key(Key::BTN_SELECT, pressed(button_mask::MINUS));
+                gamepad.set_key(Key::BTN_Z, pressed(button_mask::CAPTURE));
+                gamepad.set_key(Key::BTN_TL, pressed(button_mask::L));
+                gamepad.set_key(Key::BTN_TL2, pressed(button_mask::ZL));
+                gamepad.set_key(Key::BTN_THUMBL, pressed(button_mask::L_STICK_BTN));
+                gamepad.set_abs(
+                    AbsoluteAxisType::ABS_Z,
+                    if pressed(button_mask::ZL) { 255 } else { 0 },
+                );
+            }
+            (Side::Right, false) => {
+                gamepad.set_abs(AbsoluteAxisType::ABS_RX, axis_from_unit(rx));
+                gamepad.set_abs(AbsoluteAxisType::ABS_RY, -axis_from_unit(ry));
+                gamepad.set_key(Key::BTN_SOUTH, pressed(button_mask::A));
+                gamepad.set_key(Key::BTN_EAST, pressed(button_mask::B));
+                gamepad.set_key(Key::BTN_WEST, pressed(button_mask::X));
+                gamepad.set_key(Key::BTN_NORTH, pressed(button_mask::Y));
+                gamepad.set_key(Key::BTN_START, pressed(button_mask::PLUS));
+                gamepad.set_key(Key::BTN_MODE, pressed(button_mask::HOME));
+                gamepad.set_key(Key::BTN_C, pressed(button_mask::C_BTN));
+                gamepad.set_key(Key::BTN_TR, pressed(button_mask::R));
+                gamepad.set_key(Key::BTN_TR2, pressed(button_mask::ZR));
+                gamepad.set_key(Key::BTN_THUMBR, pressed(button_mask::R_STICK_BTN));
+                gamepad.set_abs(
+                    AbsoluteAxisType::ABS_RZ,
+                    if pressed(button_mask::ZR) { 255 } else { 0 },
+                );
+            }
+            (Side::Left, true) => {
+                // Split mode: 90 deg CCW, rail buttons on the bumpers.
+                gamepad.set_abs(AbsoluteAxisType::ABS_X, -axis_from_unit(ly));
+                gamepad.set_abs(AbsoluteAxisType::ABS_Y, -axis_from_unit(lx));
+                gamepad.set_key(Key::BTN_SOUTH, pressed(button_mask::LEFT));
+                gamepad.set_key(Key::BTN_EAST, pressed(button_mask::DOWN));
+                gamepad.set_key(Key::BTN_WEST, pressed(button_mask::UP));
+                gamepad.set_key(Key::BTN_NORTH, pressed(button_mask::RIGHT));
+                gamepad.set_key(Key::BTN_TL, pressed(button_mask::SL_L));
+                gamepad.set_key(Key::BTN_TR, pressed(button_mask::SR_L));
+                gamepad.set_key(
+                    Key::BTN_TL2,
+                    pressed(button_mask::L) || pressed(button_mask::ZL),
+                );
+                gamepad.set_key(Key::BTN_SELECT, pressed(button_mask::MINUS));
+                gamepad.set_key(Key::BTN_START, pressed(button_mask::CAPTURE));
+                gamepad.set_key(Key::BTN_THUMBL, pressed(button_mask::L_STICK_BTN));
+            }
+            (Side::Right, true) => {
+                // Split mode: 90 deg CW.
+                gamepad.set_abs(AbsoluteAxisType::ABS_X, axis_from_unit(ry));
+                gamepad.set_abs(AbsoluteAxisType::ABS_Y, axis_from_unit(rx));
+                gamepad.set_key(Key::BTN_SOUTH, pressed(button_mask::A));
+                gamepad.set_key(Key::BTN_EAST, pressed(button_mask::X));
+                gamepad.set_key(Key::BTN_WEST, pressed(button_mask::B));
+                gamepad.set_key(Key::BTN_NORTH, pressed(button_mask::Y));
+                gamepad.set_key(Key::BTN_TL, pressed(button_mask::SL_R));
+                gamepad.set_key(Key::BTN_TR, pressed(button_mask::SR_R));
+                gamepad.set_key(
+                    Key::BTN_TR2,
+                    pressed(button_mask::R) || pressed(button_mask::ZR),
+                );
+                gamepad.set_key(Key::BTN_START, pressed(button_mask::PLUS));
+                gamepad.set_key(Key::BTN_MODE, pressed(button_mask::HOME));
+                gamepad.set_key(Key::BTN_THUMBL, pressed(button_mask::R_STICK_BTN));
+            }
+        }
+
+        gamepad.sync();
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> io::Result<()> {
+        // A combined node is one physical pad split in two, and the mapper
+        // re-emits on the next report, so neutralising the whole node is safe
+        // and leaves no half-stuck keys behind.
+        let mut gamepad = lock_gamepad(&self.gamepad);
+        gamepad.release_all();
+        Ok(())
+    }
+
+    fn set_player(&mut self, _player: u8) -> io::Result<()> {
+        // The combined node has a fixed identity; per-pad player LEDs are set
+        // on the controller during the connect handshake.
+        Ok(())
+    }
+}
+
+/// `-1.0..=1.0` -> evdev stick value, truncating exactly like
+/// `StickCalibration::apply_scaled_i16`.
+fn axis_from_unit(value: f32) -> i32 {
+    let scaled = value.clamp(-1.0, 1.0) * STICK_MAX as f32;
+    if scaled.is_nan() {
+        0
+    } else {
+        scaled as i32
+    }
+}
+
+fn hat_x(buttons: u32) -> i32 {
+    i32::from(buttons & button_mask::RIGHT != 0) - i32::from(buttons & button_mask::LEFT != 0)
+}
+
+fn hat_y(buttons: u32) -> i32 {
+    i32::from(buttons & button_mask::DOWN != 0) - i32::from(buttons & button_mask::UP != 0)
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor / status plane
+// ---------------------------------------------------------------------------
+
+/// Events the supervisor folds into `state.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisorMsg {
+    /// A worker's session became active.
+    Activated { mac: String },
+    /// A session ended (link loss, idle sleep or teardown).
+    TornDown { mac: String },
+    /// Live battery value from a session.
+    Battery { mac: String, mv: u16 },
+    /// Discovery is running (or not).
+    Scanning(bool),
+    /// Latest hub error (`None` clears it).
+    HubError(Option<String>),
+}
+
+/// The only writer of `state.json`: publishes on activate/teardown and every
+/// 1.5 s (legacy behaviour).
+async fn supervisor_loop(
+    mut rx: UnboundedReceiver<SupervisorMsg>,
+    publisher: StatusPublisher,
+    pads: Vec<PadSpec>,
+) {
+    let mut status = DaemonStatus::new();
+    status.hub_alive = true;
+    status.set_service(ServiceState::Running);
+    for pad in &pads {
+        status.upsert_controller(initial_controller_status(pad));
+    }
+    publish_status(&publisher, &mut status);
+
+    loop {
+        let publish_now = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(msg) => apply_supervisor_msg(&mut status, msg),
+                None => break,
+            },
+            _ = sleep(STATUS_INTERVAL) => true,
+        };
+        if publish_now {
+            publish_status(&publisher, &mut status);
+        }
+    }
+}
+
+/// Apply one message; returns `true` when the change must be published at once.
+fn apply_supervisor_msg(status: &mut DaemonStatus, msg: SupervisorMsg) -> bool {
+    match msg {
+        SupervisorMsg::Activated { mac } => {
+            set_connected(status, &mac, true);
+            true
+        }
+        SupervisorMsg::TornDown { mac } => {
+            set_connected(status, &mac, false);
+            true
+        }
+        SupervisorMsg::Battery { mac, mv } => {
+            if let Some(entry) = find_controller(status, &mac) {
+                entry.battery_mv = Some(mv);
+                entry.battery_pct = battery_pct_from_mv(mv);
+            }
+            false
+        }
+        SupervisorMsg::Scanning(scanning) => {
+            status.hub_scanning = scanning;
+            status.hub_alive = true;
+            false
+        }
+        SupervisorMsg::HubError(err) => {
+            let failed = err.is_some();
+            status.hub_error = err;
+            status.set_service(if failed {
+                ServiceState::Error
+            } else {
+                ServiceState::Running
+            });
+            true
+        }
+    }
+}
+
+fn find_controller<'a>(
+    status: &'a mut DaemonStatus,
+    mac: &str,
+) -> Option<&'a mut ControllerStatus> {
+    status
+        .controllers
+        .iter_mut()
+        .find(|entry| entry.mac.eq_ignore_ascii_case(mac))
+}
+
+fn set_connected(status: &mut DaemonStatus, mac: &str, connected: bool) {
+    if let Some(entry) = find_controller(status, mac) {
+        entry.connected = connected;
+        if !connected {
+            entry.battery_mv = None;
+            entry.battery_pct = None;
+        }
+    }
+}
+
+fn initial_controller_status(pad: &PadSpec) -> ControllerStatus {
+    ControllerStatus {
+        mac: pad.mac.clone(),
+        player: pad.player,
+        effective_player: None,
+        name: pad.name.clone(),
+        bonded: pad.bonded,
+        connected: false,
+        battery_pct: None,
+        battery_mv: None,
+    }
+}
+
+/// Refresh timestamps/summary text and write the atomic state file.
+fn publish_status(publisher: &StatusPublisher, status: &mut DaemonStatus) {
+    refresh_summary(status);
+    status.touch();
+    if let Err(err) = publisher.publish(status) {
+        debug!("state publish failed: {err}");
+    }
+}
+
+fn refresh_summary(status: &mut DaemonStatus) {
+    let headline = status_headline(status);
+    let detail = status_detail(status);
+    status.headline = headline;
+    status.detail = detail;
+}
+
+/// Legacy headline precedence (analysis §7.2).
+fn status_headline(status: &DaemonStatus) -> String {
+    if status.service == ServiceState::Stopping {
+        return "Stopping".to_string();
+    }
+    if status.hub_error.is_some() {
+        return "Needs attention".to_string();
+    }
+    if status.controllers.is_empty() {
+        return "Set up".to_string();
+    }
+    let connected = status.connected_count();
+    if connected > 0 {
+        return format!("{connected} connected");
+    }
+    if status.hub_scanning {
+        return "Scanning".to_string();
+    }
+    "Ready".to_string()
+}
+
+/// Legacy detail precedence (analysis §7.2).
+fn status_detail(status: &DaemonStatus) -> String {
+    if let Some(err) = &status.hub_error {
+        return err.chars().take(120).collect();
+    }
+    if status.controllers.is_empty() {
+        return "Add a controller once with Sync.".to_string();
+    }
+    let connected: Vec<String> = status
+        .controllers
+        .iter()
+        .filter(|entry| entry.connected)
+        .map(|entry| format!("P{} {}", entry.player, entry.name))
+        .collect();
+    if !connected.is_empty() {
+        return format!("{} - ready in Steam and emulators", connected.join(", "));
+    }
+    "Press a button or hold Sync on a saved controller.".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
 
-    /// Realistic single-stick calibration block: centre 2048, max/min delta
-    /// 1254. The same shape the controller tests use; raw 3302 is a hard right
-    /// deflection that this block maps to full scale.
-    const REAL_STICK_CALIBRATION: [u8; 11] = [
-        0x00, 0x08, 0x80, 0xE6, 0x64, 0x4E, 0xE6, 0x64, 0x4E, 0x00, 0x00,
-    ];
+    use crate::bluetooth::scan::{AdvertMode, DeviceAdvert};
+    use crate::controller::CalibratedInput;
+    use crate::hub::Dialer;
+    use crate::protocol::advert::{host_field_from_adapter, AdvertInfo, HostBinding};
+    use crate::protocol::constants::{NINTENDO_VENDOR_ID, PRO_CONTROLLER2_PID};
 
-    /// Deadzone the virtual-pad mapper applies (CombinedJoyConManager calls
-    /// `apply_scaled_i16(raw, 120)` for every stick update).
-    const MAPPER_DEADZONE: i32 = 120;
+    const PAD: &str = "AA:BB:CC:DD:EE:01";
+    const ADAPTER: &str = "AA:BB:CC:DD:EE:FF";
+
+    // --- Hub fakes -------------------------------------------------------
+
+    /// Always reports the same live advert, so a re-armed pad is dialable again.
+    struct FakeSource(Vec<DeviceAdvert>);
+
+    impl AdvertSource for FakeSource {
+        fn devices(&mut self) -> io::Result<Vec<DeviceAdvert>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FakeControl;
+
+    impl ScanControl for FakeControl {
+        fn prepare_global(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn start_le_scan(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn stop_le_scan(&self, _force: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_bluez_device(&self, _mac: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDialer {
+        dialed: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl Dialer for FakeDialer {
+        fn dial(&mut self, mac: &str) -> io::Result<()> {
+            self.dialed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(mac.to_ascii_uppercase());
+            Ok(())
+        }
+    }
+
+    fn live_pad() -> DeviceAdvert {
+        DeviceAdvert {
+            address: PAD.to_string(),
+            connected: false,
+            rssi: Some(-45),
+            advert: Some(AdvertInfo {
+                address: PAD.to_string(),
+                vid: NINTENDO_VENDOR_ID,
+                pid: PRO_CONTROLLER2_PID,
+                host: HostBinding::Host(host_field_from_adapter(ADAPTER).expect("adapter MAC")),
+            }),
+        }
+    }
+
+    fn fake_hub() -> Hub<FakeSource, FakeControl, FakeDialer> {
+        let mut hub = Hub::new(
+            FakeSource(vec![live_pad()]),
+            FakeControl,
+            FakeDialer::default(),
+            HubConfig::default(),
+        );
+        hub.register_known(PAD);
+        hub.set_adapter_mac(ADAPTER);
+        hub
+    }
+
+    fn hub_poll(hub: &mut Hub<FakeSource, FakeControl, FakeDialer>, now: Instant) -> HubOutcome {
+        hub.poll_once(now).expect("poll succeeds")
+    }
+
+    // --- Sink fake -------------------------------------------------------
+
+    #[derive(Default)]
+    struct FakeSink {
+        updates: usize,
+        buttons: u32,
+        sticks: (f32, f32, f32, f32),
+        releases: usize,
+    }
+
+    impl PadSink for FakeSink {
+        fn update(
+            &mut self,
+            buttons: u32,
+            sticks: (f32, f32, f32, f32),
+            _triggers: (u8, u8),
+        ) -> io::Result<()> {
+            self.updates += 1;
+            self.buttons = buttons;
+            self.sticks = sticks;
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> io::Result<()> {
+            self.releases += 1;
+            self.buttons = 0;
+            self.sticks = (0.0, 0.0, 0.0, 0.0);
+            Ok(())
+        }
+
+        fn set_player(&mut self, _player: u8) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pad_spec() -> PadSpec {
+        PadSpec {
+            mac: PAD.to_string(),
+            player: 2,
+            name: "Joy-Con 2 (Left)".to_string(),
+            bonded: true,
+            product_id: 0x2067,
+            is_left: true,
+        }
+    }
+
+    fn report(buttons: u32) -> InputReport {
+        InputReport {
+            timestamp: 0,
+            buttons,
+            left_stick_raw: (2048, 2048),
+            right_stick_raw: (2048, 2048),
+            battery_mv: 4000,
+            accel: (0, 0, 0),
+            gyro: (0, 0, 0),
+            left_trigger_raw: 0,
+            right_trigger_raw: 0,
+        }
+    }
+
+    fn calibrated() -> CalibratedInput {
+        CalibratedInput {
+            left: (0.75, -0.5),
+            right: (0.0, 0.0),
+            lt: 0,
+            rt: 0,
+        }
+    }
+
+    // --- Temp dir (tempfile is deliberately not a dependency) ------------
+
+    struct TempDir {
+        root: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "switch2d-daemon-{}-{}-{}",
+                std::process::id(),
+                seq,
+                tag
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create temp dir");
+            Self { root }
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.root.join("state.json")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn read_state(path: &PathBuf) -> DaemonStatus {
+        let text = fs::read_to_string(path).expect("state.json exists");
+        serde_json::from_str(&text).expect("state.json parses")
+    }
+
+    // --- Tests -----------------------------------------------------------
 
     #[test]
-    fn daemon_feeds_session_calibration_not_defaults() {
-        let real = StickCalibration::from_bytes(&REAL_STICK_CALIBRATION).expect("block parses");
-        let default = StickCalibration::default();
-        // Hard right deflection: (3302 - 2048) is exactly this block's max delta.
-        let raw = (3302, 2048);
+    fn hub_to_worker_handoff_marks_connected_and_disconnected() {
+        let mut hub = fake_hub();
+        let now = Instant::now();
 
-        // A right Joy-Con keeps its calibration in the right block (left stays
-        // default), so the daemon must feed the right block for that side.
-        let right_pad = SessionCalibration {
-            left: default,
-            right: real,
+        let pending = match hub_poll(&mut hub, now) {
+            HubOutcome::Pending(pending) => pending,
+            other => panic!("expected a pending pad, got {other:?}"),
         };
-        assert_eq!(*right_pad.for_side(false), real);
-        assert_eq!(
-            right_pad
-                .for_side(false)
-                .apply_scaled_i16(raw, MAPPER_DEADZONE),
-            (32767, 0)
+        assert_eq!(pending.len(), 1, "the live advert selects the pad");
+        assert_eq!(pending[0].mode, AdvertMode::Wake);
+
+        let results = hub.dial_pending(&pending);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].outcome.is_ok());
+
+        // Hand-off stand-in for the per-pad session channel: the session must
+        // reach its worker before the hub polls again (sequencing rule 3).
+        let (tx, rx) = std::sync::mpsc::channel::<&str>();
+        assert!(handoff_session(&mut hub, &results[0], || tx
+            .send(PAD)
+            .is_ok()));
+        assert_eq!(rx.recv().expect("worker received the session"), PAD);
+        assert!(hub.is_connected(PAD), "session delivery marks it connected");
+
+        // Link drop / idle sleep: the worker reports the session ended.
+        rearm_pad(&mut hub, PAD);
+        assert!(!hub.is_connected(PAD), "teardown clears the connected flag");
+
+        // Re-armed: the next live advert dials the pad again.
+        let again = hub_poll(&mut hub, now + Duration::from_secs(1));
+        match again {
+            HubOutcome::Pending(pending) => assert_eq!(pending[0].mac, PAD),
+            other => panic!("re-armed pad is not dialable: {other:?}"),
+        }
+
+        // A lost worker must not leave the pad stuck as "connected": the
+        // handoff re-arms it so a future advert can dial it again.
+        let results = hub.dial_pending(&pending);
+        assert!(results[0].outcome.is_ok());
+        assert!(hub.is_connected(PAD), "hub marks a successful dial");
+        assert!(!handoff_session(&mut hub, &results[0], || false));
+        assert!(!hub.is_connected(PAD), "failed handoff re-arms the pad");
+    }
+
+    #[test]
+    fn worker_session_teardown_releases_input() {
+        let t0 = Instant::now();
+        let mut worker = Worker::new(
+            WorkerConfig {
+                mac: PAD.to_string(),
+                player: 2,
+                idle_timeout: Duration::from_secs(300),
+            },
+            FakeSink::default(),
         );
 
-        // A left Joy-Con is the mirror image.
-        let left_pad = SessionCalibration {
-            left: real,
-            right: default,
-        };
-        assert_eq!(*left_pad.for_side(true), real);
+        // A report as the session loop feeds it (controller-produced calibration).
+        worker
+            .on_report(&report(button_mask::A | button_mask::ZL), &calibrated(), t0)
+            .expect("sink accepts the report");
+        assert_ne!(worker.frames(), 0);
+
+        // The daemon's teardown path (deviation 6) releases everything.
+        teardown_session(&mut worker, PAD);
+
+        // The worker stays usable: the node is not closed, so the next session
+        // reuses it and a second teardown is harmless.
+        teardown_session(&mut worker, PAD);
+        assert_eq!(worker.frames(), 1, "teardown does not drop the worker");
+    }
+
+    #[test]
+    fn status_is_published_on_activate_and_teardown() {
+        let dir = TempDir::new("status");
+        let path = dir.state_path();
+        let publisher = StatusPublisher::with_path(path.clone());
+
+        let mut status = DaemonStatus::new();
+        status.hub_alive = true;
+        status.upsert_controller(initial_controller_status(&pad_spec()));
+        publish_status(&publisher, &mut status);
+
+        let initial = read_state(&path);
+        assert_eq!(initial.controllers.len(), 1);
+        assert!(!initial.controllers[0].connected);
+        assert_eq!(initial.pid, std::process::id());
+
+        // Activate: published immediately.
+        assert!(apply_supervisor_msg(
+            &mut status,
+            SupervisorMsg::Activated {
+                mac: PAD.to_string()
+            }
+        ));
+        publish_status(&publisher, &mut status);
+        let activated = read_state(&path);
+        assert!(activated.controllers[0].connected);
+        assert_eq!(activated.headline, "1 connected");
         assert_eq!(
-            left_pad
-                .for_side(true)
-                .apply_scaled_i16(raw, MAPPER_DEADZONE),
-            (32767, 0)
+            activated.detail,
+            "P2 Joy-Con 2 (Left) - ready in Steam and emulators"
         );
 
-        // The round-6 bug: defaults cap the same sample at
-        // (3302 - 2048) / 1700 = 0.7376 of the i16 range.
+        // Battery from the session lands in the same document.
+        apply_supervisor_msg(
+            &mut status,
+            SupervisorMsg::Battery {
+                mac: PAD.to_string(),
+                mv: 4000,
+            },
+        );
+        publish_status(&publisher, &mut status);
+        let with_battery = read_state(&path);
+        assert_eq!(with_battery.controllers[0].battery_mv, Some(4000));
         assert_eq!(
-            default.apply_scaled_i16(raw, MAPPER_DEADZONE),
-            (24170, 0),
-            "default calibration caps at ~0.74 (the observed evtest peak)"
+            with_battery.controllers[0].battery_pct,
+            battery_pct_from_mv(4000)
         );
 
-        // And the daemon must never pick the other side's block.
-        assert_ne!(*right_pad.for_side(false), default);
-        assert_eq!(*right_pad.for_side(true), default);
+        // Teardown: published immediately, flag cleared, battery dropped.
+        assert!(apply_supervisor_msg(
+            &mut status,
+            SupervisorMsg::TornDown {
+                mac: PAD.to_string()
+            }
+        ));
+        publish_status(&publisher, &mut status);
+        let torn_down = read_state(&path);
+        assert!(!torn_down.controllers[0].connected);
+        assert_eq!(torn_down.controllers[0].battery_mv, None);
+        assert!(torn_down.updated_at_unix >= activated.updated_at_unix);
+    }
+
+    #[test]
+    fn hub_errors_back_off_and_recover() {
+        // The supervisor turns a hub error into a published error state and
+        // clears it again on recovery (never fatal, architecture rule 2).
+        let mut status = DaemonStatus::new();
+        status.upsert_controller(initial_controller_status(&pad_spec()));
+
+        assert!(apply_supervisor_msg(
+            &mut status,
+            SupervisorMsg::HubError(Some("StartDiscovery failed".to_string()))
+        ));
+        assert_eq!(status.service, ServiceState::Error);
+        assert_eq!(status_headline(&status), "Needs attention");
+
+        assert!(apply_supervisor_msg(
+            &mut status,
+            SupervisorMsg::HubError(None)
+        ));
+        assert_eq!(status.service, ServiceState::Running);
+        assert!(status.hub_error.is_none());
+    }
+
+    #[test]
+    fn scanning_status_is_updated_without_an_immediate_publish() {
+        let mut status = DaemonStatus::new();
+        status.upsert_controller(initial_controller_status(&pad_spec()));
+        assert!(!apply_supervisor_msg(
+            &mut status,
+            SupervisorMsg::Scanning(true)
+        ));
+        assert!(status.hub_scanning);
+        assert_eq!(status_headline(&status), "Scanning");
     }
 }
