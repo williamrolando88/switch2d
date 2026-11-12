@@ -158,9 +158,9 @@ impl Daemon {
                             ctrl_cfg.player,
                             Box::new(move |report| {
                                 if is_l {
-                                    mgr_for_cb.update_left(report, &crate::protocol::calibration::StickCalibration::default());
+                                    mgr_for_cb.update_horizontal_left(report, &crate::protocol::calibration::StickCalibration::default());
                                 } else {
-                                    mgr_for_cb.update_right(report, &crate::protocol::calibration::StickCalibration::default());
+                                    mgr_for_cb.update_horizontal_right(report, &crate::protocol::calibration::StickCalibration::default());
                                 }
                             }),
                         )
