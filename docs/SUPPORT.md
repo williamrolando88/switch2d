@@ -5,7 +5,11 @@ reproduced) from **speculative** behaviour (implemented from the protocol refere
 from the upstream Python project, never observed here). Nothing in the speculative rows
 should be quoted as working.
 
-Last updated: after round 4 hardware sessions (build `ce84d69`).
+Last updated: after round 6 hardware sessions (build `ab31ac3`).
+
+Round 6 validated the full path end to end: clean-slate pairing, both pads, combined
+input without starvation, wake reconnect without SYNC, and automatic recovery after a
+`bluetoothd` restart. Two defects it exposed are listed as open in the table below.
 
 ## Legend
 
@@ -33,7 +37,7 @@ Last updated: after round 4 hardware sessions (build `ce84d69`).
 |---|---|---|---|
 | Pairing in SYNC mode | ✅ | 🧪 | 🧪 |
 | Bond stored (`SET_MAC` + LTK) | ✅ verified via advertised host field | 🧪 | 🧪 |
-| Reconnect after wake | ✅ requires LE privacy off, see README | 🧪 | 🧪 |
+| Reconnect after wake | ✅ round 6, no SYNC needed; takes 9-12 dial rounds (~8-11 s) | 🧪 | 🧪 |
 | Player LED pattern | ✅ (1 LED / 2 LEDs observed) | 🧪 | 🧪 |
 | Digital buttons | ✅ all 11 per pad | 🧪 | 🧪 |
 | Stick range | ✅ Left / ⚠️ Right (`0.74`, calibration fallback) | 🧪 | 🧪 |
