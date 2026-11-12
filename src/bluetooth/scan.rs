@@ -16,7 +16,7 @@
 //! discovery session.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -57,6 +57,41 @@ impl PendingConnect {
             None => false,
         }
     }
+}
+
+/// One device as reported by an [`AdvertSource`].
+///
+/// `advert` is `None` whenever the manufacturer block is missing or too short,
+/// and callers must treat that as wake-compatible only for a known bonded MAC
+/// (see [`crate::protocol::advert::accepts`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceAdvert {
+    /// Device MAC address as reported by the backend (usually uppercase).
+    pub address: String,
+    /// Backend view of the link state.
+    pub connected: bool,
+    /// Latest RSSI in dBm, when the backend has one.
+    pub rssi: Option<i16>,
+    /// Decoded Nintendo advertisement, if the block was usable.
+    pub advert: Option<AdvertInfo>,
+}
+
+impl DeviceAdvert {
+    /// Whether this entry reflects a live advertisement rather than a cached
+    /// BlueZ property set.
+    ///
+    /// BlueZ keeps `Device1` properties after a pad stops advertising, but only
+    /// sets `RSSI` from live adverts, so a missing or `-127` sentinel RSSI means
+    /// stale. The hub, not this module, decides eligibility.
+    pub fn is_live(&self) -> bool {
+        matches!(self.rssi, Some(rssi) if rssi > -127)
+    }
+}
+
+/// A source of device advertisements.
+pub trait AdvertSource: Send {
+    /// Snapshot of every device currently known to the backend.
+    fn devices(&mut self) -> io::Result<Vec<DeviceAdvert>>;
 }
 
 /// Recently seen controllers keyed by uppercase MAC (legacy `_last_seen`).
@@ -223,7 +258,7 @@ impl ScanControl for ShellScanControl {
 
     fn start_le_scan(&self) -> io::Result<()> {
         let index = self.hci_index.to_string();
-        run_command(Command::new("btmgmt").args(["-i", index.as_str(), "find", "-l"]))
+        run_command(Command::new("btmgmt").args(["-i", index.as_str(), "find", "-l"])).map(|_| ())
     }
 
     fn stop_le_scan(&self, force: bool) -> io::Result<()> {
@@ -265,35 +300,52 @@ impl ScanControl for ShellScanControl {
     }
 
     fn remove_bluez_device(&self, mac: &str) -> io::Result<()> {
-        run_command(Command::new("bluetoothctl").args(["remove", mac]))
+        run_command(Command::new("bluetoothctl").args(["remove", mac])).map(|_| ())
     }
 }
 
-/// Spawn `cmd` with null stdio and wait up to [`COMMAND_TIMEOUT`], killing and
-/// reaping it on expiry. Spawn failures (e.g. missing binary) become
-/// `io::Error`s; a non-zero exit becomes [`io::Error::other`].
-fn run_command(cmd: &mut Command) -> io::Result<()> {
+/// Spawn `cmd` with a 1.5 s deadline, killing and reaping it on expiry, and
+/// return its stdout.
+///
+/// Shared by [`ShellScanControl`] and `BluezAdvertSource`. Stdout is drained on
+/// a helper thread so a chatty child can never block on a full pipe. Spawn
+/// failures (e.g. missing binary) become `io::Error`s keeping the original
+/// [`io::ErrorKind`]; a non-zero exit becomes [`io::Error::other`].
+pub(crate) fn run_command(cmd: &mut Command) -> io::Result<Vec<u8>> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn {program}: {err}")))?;
 
+    let reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = pipe.read_to_end(&mut output);
+            output
+        })
+    });
+
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                return Err(io::Error::other(format!("{program} exited with {status}")));
+                let output = join_reader(reader);
+                return if status.success() {
+                    Ok(output)
+                } else {
+                    Err(io::Error::other(format!("{program} exited with {status}")))
+                };
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     // Reap the killed child so it cannot linger as a zombie.
                     let _ = child.wait();
+                    let _ = join_reader(reader);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("{program} timed out after {COMMAND_TIMEOUT:?}"),
@@ -304,6 +356,7 @@ fn run_command(cmd: &mut Command) -> io::Result<()> {
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_reader(reader);
                 return Err(io::Error::new(
                     err.kind(),
                     format!("failed to poll {program}: {err}"),
@@ -311,6 +364,13 @@ fn run_command(cmd: &mut Command) -> io::Result<()> {
             }
         }
     }
+}
+
+/// Collect a stdout-drain thread's output, tolerating a panicked reader.
+fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
