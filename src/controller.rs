@@ -236,6 +236,207 @@ fn negotiate_mtu(att: &AttClient, requested: u16) -> io::Result<u16> {
     Ok(mtu)
 }
 
+// ---------------------------------------------------------------------------
+// Dial envelope (legacy `_ConnectHub._connect_sync`, bridge.py:436-469)
+// ---------------------------------------------------------------------------
+
+/// Legacy dial envelope: many short attempts instead of one long one.
+///
+/// `bridge.py:52-53, 443-469`: 16 rounds, 0.80 s per *(round, address type)*,
+/// 20 ms between rounds. Rationale in legacy: a short window fails fast when
+/// something else (Steam, decky) keeps the adapter's LE scan busy, while a long
+/// attempt can sit inside a pending create-connection and starve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialBudget {
+    /// Rounds; each round attempts both address types.
+    pub rounds: u32,
+    /// Timeout for each address type within a round.
+    pub per_type_timeout: Duration,
+    /// Pause between rounds.
+    pub between_rounds: Duration,
+    /// Remove the BlueZ `Device` object once before the first round
+    /// ("drop BlueZ Device object so it can't race our raw ATT connect",
+    /// bridge.py:136-154).
+    ///
+    /// Must be **false** while we own a live session for the MAC: removing the
+    /// object tears that link down.
+    pub remove_bluez_device: bool,
+}
+
+impl Default for DialBudget {
+    fn default() -> Self {
+        Self {
+            rounds: 16,
+            per_type_timeout: Duration::from_millis(800),
+            between_rounds: Duration::from_millis(20),
+            remove_bluez_device: true,
+        }
+    }
+}
+
+/// Per-round view of a [`DialBudget`], shrinking as rounds are spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundBudget {
+    /// 0-based round index.
+    pub round: u32,
+    /// Rounds left after this one (shrinks to 0).
+    pub rounds_left: u32,
+    /// Timeout for *each* address type in this round.
+    pub per_type: Duration,
+    /// Pause after this round before the next one (`ZERO` after the last).
+    pub pause_after: Duration,
+}
+
+impl DialBudget {
+    /// Plan for `round`, or `None` once the budget is spent.
+    pub fn round(&self, round: u32) -> Option<RoundBudget> {
+        if round >= self.rounds {
+            return None;
+        }
+        Some(RoundBudget {
+            round,
+            rounds_left: self.rounds - round - 1,
+            per_type: self.per_type_timeout,
+            pause_after: if round + 1 < self.rounds {
+                self.between_rounds
+            } else {
+                Duration::ZERO
+            },
+        })
+    }
+
+    /// Worst-case time spent dialling (both address types, every round).
+    pub fn worst_case(&self) -> Duration {
+        self.per_type_timeout * 2 * self.rounds
+            + self.between_rounds * self.rounds.saturating_sub(1)
+    }
+}
+
+/// Control-plane operations the envelope needs between attempts.
+///
+/// Blanket-implemented for anything that is a
+/// [`crate::bluetooth::scan::ScanControl`] (production:
+/// `ShellScanControl::from_env()`); tests inject a recorder.
+pub trait DialControl {
+    /// Forced global scan stop (also kills helper processes).
+    fn prepare_global(&self) -> io::Result<()>;
+    /// Rate-limited LE scan stop (0.35 s) used between rounds.
+    fn stop_le_scan(&self, force: bool) -> io::Result<()>;
+    /// Drop the BlueZ `Device` object for `mac`.
+    fn remove_bluez_device(&self, mac: &str) -> io::Result<()>;
+}
+
+impl<T: crate::bluetooth::scan::ScanControl> DialControl for T {
+    fn prepare_global(&self) -> io::Result<()> {
+        crate::bluetooth::scan::ScanControl::prepare_global(self)
+    }
+
+    fn stop_le_scan(&self, force: bool) -> io::Result<()> {
+        crate::bluetooth::scan::ScanControl::stop_le_scan(self, force)
+    }
+
+    fn remove_bluez_device(&self, mac: &str) -> io::Result<()> {
+        crate::bluetooth::scan::ScanControl::remove_bluez_device(self, mac)
+    }
+}
+
+/// What the envelope did, for logging and diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DialReport {
+    pub rounds_attempted: u32,
+    /// Address-type attempts (2 per round).
+    pub attempts: u32,
+    /// `"ok"` or `"failed: <err>"`.
+    pub discovery_stop: String,
+    /// `"ok"`, `"failed: <err>"` or `"skipped (live session)"`.
+    pub device_removal: String,
+    pub last_error: Option<String>,
+}
+
+fn note(result: io::Result<()>) -> String {
+    match result {
+        Ok(()) => "ok".to_string(),
+        Err(err) => format!("failed: {err}"),
+    }
+}
+
+/// Run the dial envelope with an injectable control plane and dial step.
+///
+/// The dial step is called once per round and is expected to attempt both
+/// address types with `per_type` each (production: [`SwitchController::connect_with_timeout`]).
+pub fn dial_with_budget<C, D, T>(
+    control: &C,
+    budget: DialBudget,
+    mac: &str,
+    dial: &mut D,
+) -> (io::Result<T>, DialReport)
+where
+    C: DialControl,
+    D: FnMut(Duration) -> io::Result<T>,
+{
+    let mut report = DialReport::default();
+
+    // Forced global stop once, before the first attempt.
+    report.discovery_stop = note(control.prepare_global());
+
+    // Drop the BlueZ Device object **once**, before the first round: each
+    // `bluetoothctl remove` is slow and races the attempt that follows.
+    report.device_removal = if budget.remove_bluez_device {
+        note(control.remove_bluez_device(mac))
+    } else {
+        "skipped (live session)".to_string()
+    };
+
+    let mut last_error = None;
+    for round in 0..budget.rounds {
+        // Non-forced, rate-limited scan stop immediately before every round
+        // (legacy issues it before every address-type attempt; the 0.35 s
+        // limiter coalesces the pair into one).
+        if let Err(err) = control.stop_le_scan(false) {
+            debug!("scan stop before round {round} for {mac} failed: {err}");
+        }
+
+        report.rounds_attempted = round + 1;
+        report.attempts = report.rounds_attempted * 2;
+
+        match dial(budget.per_type_timeout) {
+            Ok(session) => {
+                if round > 0 {
+                    // How many rounds a real pad needed is the signal for
+                    // whether this envelope is what fixes the hardware.
+                    info!(
+                        "Dial to {} succeeded after {} rounds ({} address-type attempts)",
+                        mac,
+                        round + 1,
+                        (round + 1) * 2
+                    );
+                }
+                return (Ok(session), report);
+            }
+            Err(err) => {
+                debug!(
+                    "Dial round {}/{} for {} failed: {}",
+                    round + 1,
+                    budget.rounds,
+                    mac,
+                    err
+                );
+                report.last_error = Some(err.to_string());
+                last_error = Some(err);
+                if let Some(plan) = budget.round(round) {
+                    if !plan.pause_after.is_zero() {
+                        thread::sleep(plan.pause_after);
+                    }
+                }
+            }
+        }
+    }
+
+    let err = last_error
+        .unwrap_or_else(|| io::Error::other(format!("dial budget for {mac} has 0 rounds")));
+    (Err(err), report)
+}
+
 pub struct SwitchController {
     pub mac: String,
     pub adapter_mac: String,
@@ -270,6 +471,47 @@ impl SwitchController {
         )
     }
 
+    /// Dial a controller using the legacy envelope ([`DialBudget`]): many short
+    /// rounds, fresh socket per address type, scan stopped before every round,
+    /// BlueZ `Device` object dropped once up front.
+    ///
+    /// This is the entry point for monitor, the daemon dialer and `pair`;
+    /// [`Self::connect_with`] stays the single-attempt primitive.
+    pub fn connect_session(
+        mac: &str,
+        adapter_mac: &str,
+        options: ConnectOptions,
+        input_cb: ControllerInputCallback,
+        budget: DialBudget,
+    ) -> io::Result<Self> {
+        let control = crate::bluetooth::scan::ShellScanControl::from_env();
+
+        // Every round needs a fresh callback; share the caller's one.
+        let input_cb: Arc<dyn Fn(&InputReport) + Send + Sync> = Arc::from(input_cb);
+        let mut dial = |per_type: Duration| {
+            let shared = Arc::clone(&input_cb);
+            let cb: ControllerInputCallback = Box::new(move |report| shared(report));
+            Self::connect_with_timeout(mac, adapter_mac, options, cb, per_type * 2)
+        };
+
+        let (result, report) = dial_with_budget(&control, budget, mac, &mut dial);
+        result.map_err(|err| {
+            // FIX 3 diagnostics: rounds, both address types and their last OS
+            // errors (inside `err`), plus what the control plane managed.
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "{err} [rounds: {}/{}, attempts: {}, discovery_stop: {}, device_removal: {}]",
+                    report.rounds_attempted,
+                    budget.rounds,
+                    report.attempts,
+                    report.discovery_stop,
+                    report.device_removal
+                ),
+            )
+        })
+    }
+
     /// Connect and initialize a Switch 2 controller with explicit handshake options.
     ///
     /// Handshake order mirrors legacy `initialize()`: link, MTU, GATT
@@ -283,6 +525,20 @@ impl SwitchController {
         options: ConnectOptions,
         input_cb: ControllerInputCallback,
     ) -> io::Result<Self> {
+        Self::connect_with_timeout(mac, adapter_mac, options, input_cb, L2CAP_CONNECT_TIMEOUT)
+    }
+
+    /// Single connect attempt with an explicit per-attempt time budget.
+    ///
+    /// `connect_timeout` is split between the two address types, so the dial
+    /// envelope passes `per_type_timeout * 2` here.
+    fn connect_with_timeout(
+        mac: &str,
+        adapter_mac: &str,
+        options: ConnectOptions,
+        input_cb: ControllerInputCallback,
+        connect_timeout: Duration,
+    ) -> io::Result<Self> {
         let dest_le = mac_to_le(mac)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid controller MAC"))?;
         let adapter_le = mac_to_le(adapter_mac)
@@ -294,15 +550,13 @@ impl SwitchController {
         // (`bridge.py:436-474`). A socket whose connect(2) failed is poisoned,
         // so retrying on it would only ever yield EINVAL and hide the real
         // failure of the first attempt.
-        let (socket, addr_type) =
-            L2capSocket::connect_new(adapter_le, dest_le, L2CAP_CONNECT_TIMEOUT).map_err(
-                |err| {
-                    io::Error::new(
-                        err.kind(),
-                        format!("connect to {mac} via adapter {adapter_mac}: {err}"),
-                    )
-                },
-            )?;
+        let (socket, addr_type) = L2capSocket::connect_new(adapter_le, dest_le, connect_timeout)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("connect to {mac} via adapter {adapter_mac}: {err}"),
+                )
+            })?;
         info!(
             "L2CAP link established with {} (type: {})",
             mac,
@@ -554,6 +808,13 @@ impl SwitchController {
             ));
         }
 
+        // Evidence before validation-by-parsing: what the pad actually sent.
+        debug!(
+            "memory read addr=0x{address:08X} req_len={length} resp_len={} resp_first8={:02X?}",
+            data.len(),
+            &data[..data.len().min(8)]
+        );
+
         Ok(data[8..].to_vec())
     }
 
@@ -590,7 +851,15 @@ impl SwitchController {
         factory_address: u32,
         stick: &str,
     ) -> StickCalibration {
-        let user = match self.read_memory(CALIBRATION_LEN, user_address) {
+        let user_result = self.read_memory(CALIBRATION_LEN, user_address);
+        crate::protocol::calibration::log_calibration_read(
+            stick,
+            "user",
+            user_address,
+            CALIBRATION_LEN,
+            &user_result,
+        );
+        let user = match user_result {
             Ok(data) => Some(data),
             Err(err) => {
                 warn!(
@@ -601,7 +870,15 @@ impl SwitchController {
         };
 
         let factory = if needs_factory_calibration(user.as_deref()) {
-            match self.read_memory(CALIBRATION_LEN, factory_address) {
+            let factory_result = self.read_memory(CALIBRATION_LEN, factory_address);
+            crate::protocol::calibration::log_calibration_read(
+                stick,
+                "factory",
+                factory_address,
+                CALIBRATION_LEN,
+                &factory_result,
+            );
+            match factory_result {
                 Ok(data) => Some(data),
                 Err(err) => {
                     warn!(
@@ -985,5 +1262,178 @@ mod tests {
         assert!(should_bond(BondPolicy::Force, true));
         assert!(should_bond(BondPolicy::IfNeeded, false));
         assert!(!should_bond(BondPolicy::IfNeeded, true));
+    }
+
+    #[test]
+    fn budget_narrows_with_rounds() {
+        let budget = DialBudget::default();
+        assert_eq!(budget.rounds, 16, "legacy _CONNECT_ATTEMPTS");
+        assert_eq!(budget.per_type_timeout, Duration::from_millis(800));
+        assert_eq!(budget.between_rounds, Duration::from_millis(20));
+        assert!(budget.remove_bluez_device);
+
+        // Rounds shrink monotonically to zero and then stop.
+        let left: Vec<u32> = (0..16).filter_map(|r| budget.round(r)).map(|p| p.rounds_left).collect();
+        assert_eq!(left, (0..16).rev().collect::<Vec<u32>>());
+        assert_eq!(budget.round(15).unwrap().pause_after, Duration::ZERO);
+        assert_eq!(budget.round(14).unwrap().pause_after, budget.between_rounds);
+        assert!(budget.round(16).is_none());
+        assert!(budget.round(99).is_none());
+
+        // Worst case: 16 * 2 * 0.8 s + 15 * 20 ms = 25.9 s.
+        let expected = Duration::from_millis(16 * 2 * 800 + 15 * 20);
+        assert_eq!(budget.worst_case(), expected);
+
+        // A shrunken budget (tests / diagnostics) keeps the same shape.
+        let tiny = DialBudget {
+            rounds: 3,
+            per_type_timeout: Duration::from_millis(1),
+            between_rounds: Duration::ZERO,
+            remove_bluez_device: false,
+        };
+        assert_eq!(tiny.worst_case(), Duration::from_millis(6));
+        assert_eq!(tiny.round(2).unwrap().rounds_left, 0);
+    }
+
+    #[derive(Default)]
+    struct FakeControl {
+        prepare_calls: std::cell::Cell<usize>,
+        stop_calls: std::cell::Cell<usize>,
+        removals: std::cell::Cell<usize>,
+        /// Ordered event names, so ordering can be asserted too.
+        events: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl DialControl for FakeControl {
+        fn prepare_global(&self) -> io::Result<()> {
+            self.prepare_calls.set(self.prepare_calls.get() + 1);
+            self.events.borrow_mut().push("prepare".to_string());
+            Ok(())
+        }
+
+        fn stop_le_scan(&self, force: bool) -> io::Result<()> {
+            self.stop_calls.set(self.stop_calls.get() + 1);
+            self.events.borrow_mut().push(format!("stop(force={force})"));
+            Ok(())
+        }
+
+        fn remove_bluez_device(&self, mac: &str) -> io::Result<()> {
+            self.removals.set(self.removals.get() + 1);
+            self.events.borrow_mut().push(format!("remove({mac})"));
+            Ok(())
+        }
+    }
+
+    fn tiny_budget(rounds: u32) -> DialBudget {
+        DialBudget {
+            rounds,
+            per_type_timeout: Duration::from_millis(1),
+            between_rounds: Duration::ZERO,
+            remove_bluez_device: true,
+        }
+    }
+
+    #[test]
+    fn connect_session_gives_up_after_budget() {
+        let control = FakeControl::default();
+        let mut calls = 0;
+
+        let (result, report) = dial_with_budget(
+            &control,
+            tiny_budget(3),
+            "AA:BB:CC:DD:EE:FF",
+            &mut |_per_type: Duration| {
+                calls += 1;
+                Err::<u32, _>(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "L2CAP connect failed (LE_PUBLIC: timed out; LE_RANDOM: timed out)",
+                ))
+            },
+        );
+
+        assert!(result.is_err(), "exhausted budget must report an error");
+        assert_eq!(calls, 3, "one dial per round");
+        assert_eq!(report.rounds_attempted, 3);
+        assert_eq!(report.attempts, 6, "both address types per round");
+        assert!(report
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("LE_PUBLIC: timed out"));
+        assert_eq!(report.discovery_stop, "ok");
+        assert_eq!(report.device_removal, "ok");
+
+        // One forced global stop, one removal, one rate-limited stop per round.
+        assert_eq!(control.prepare_calls.get(), 1);
+        assert_eq!(control.removals.get(), 1);
+        assert_eq!(control.stop_calls.get(), 3);
+    }
+
+    #[test]
+    fn connect_session_stops_at_first_success() {
+        let control = FakeControl::default();
+        let mut calls = 0;
+
+        let (result, report) = dial_with_budget(
+            &control,
+            tiny_budget(16),
+            "AA:BB:CC:DD:EE:FF",
+            &mut |_per_type: Duration| {
+                calls += 1;
+                if calls < 3 {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "not yet"))
+                } else {
+                    Ok(calls)
+                }
+            },
+        );
+
+        assert_eq!(result.unwrap(), 3, "returns the session from round 3");
+        assert_eq!(calls, 3, "no dialling after success");
+        assert_eq!(report.rounds_attempted, 3);
+        assert_eq!(report.attempts, 6);
+        assert_eq!(report.last_error.as_deref(), Some("not yet"));
+        assert_eq!(control.stop_calls.get(), 3);
+        assert_eq!(control.removals.get(), 1);
+    }
+
+    #[test]
+    fn remove_bluez_device_is_called_once_before_rounds_not_per_round() {
+        let control = FakeControl::default();
+        let mut dial_calls = 0;
+
+        let _ = dial_with_budget(
+            &control,
+            tiny_budget(4),
+            "BC:89:A6:45:83:CC",
+            &mut |_per_type: Duration| -> io::Result<()> {
+                dial_calls += 1;
+                control.events.borrow_mut().push(format!("dial#{dial_calls}"));
+                Err(io::Error::new(io::ErrorKind::TimedOut, "nope"))
+            },
+        );
+
+        assert_eq!(control.removals.get(), 1, "exactly one bluetoothctl remove");
+        let events = control.events.borrow();
+        assert_eq!(events[0], "prepare", "global stop comes first");
+        assert_eq!(events[1], "remove(BC:89:A6:45:83:CC)", "removal before dialling");
+        assert_eq!(events[2], "stop(force=false)", "scan stop before round 1");
+        assert_eq!(events[3], "dial#1");
+        // Removals never repeat between rounds.
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("remove(")).count(),
+            1
+        );
+
+        // A live session disables the removal entirely.
+        let control = FakeControl::default();
+        let mut budget = tiny_budget(2);
+        budget.remove_bluez_device = false;
+        let (result, report) = dial_with_budget(&control, budget, "AA:BB:CC:DD:EE:FF", &mut |_| {
+            Err::<(), _>(io::Error::new(io::ErrorKind::TimedOut, "nope"))
+        });
+        assert!(result.is_err());
+        assert_eq!(control.removals.get(), 0, "never remove under a live session");
+        assert_eq!(report.device_removal, "skipped (live session)");
     }
 }

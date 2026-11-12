@@ -1,16 +1,16 @@
 //! Central daemon orchestrating multiple controller connections and virtual gamepad lifecycle.
 
-use std::io;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::bluetooth::scan::{ScanControl, ShellScanControl};
 use crate::config::{DaemonConfig, DaemonMode};
-use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
+use crate::controller::{BondPolicy, ConnectOptions, DialBudget, SwitchController};
 use crate::protocol::constants::*;
 use crate::uinput::{CombinedJoyConManager, VirtualGamepad};
 
@@ -45,13 +45,21 @@ impl Daemon {
             return Ok(());
         }
 
+        // MACs with a session we currently own. The dial envelope must never
+        // remove the BlueZ Device object for these: `bluetoothctl remove` tears
+        // the live link down (analysis 8.7 / legacy bridge.py:136-154).
+        let live_sessions: Arc<StdMutex<HashSet<String>>> = Arc::new(StdMutex::new(HashSet::new()));
+
         match self.config.mode {
-            DaemonMode::Combined => self.run_combined().await,
-            DaemonMode::Split => self.run_split().await,
+            DaemonMode::Combined => self.run_combined(live_sessions).await,
+            DaemonMode::Split => self.run_split(live_sessions).await,
         }
     }
 
-    async fn run_combined(&self) -> std::io::Result<()> {
+    async fn run_combined(
+        &self,
+        live_sessions: Arc<StdMutex<HashSet<String>>>,
+    ) -> std::io::Result<()> {
         // Create a single unified Virtual Gamepad for the combined Joy-Cons
         let combined_gamepad = Arc::new(VirtualGamepad::new(
             "Nintendo Switch 2 Combined Joy-Cons",
@@ -69,6 +77,7 @@ impl Daemon {
             let running = self.running.clone();
             let mgr = manager.clone();
             let conn_lock = connect_lock.clone();
+            let live_sessions = Arc::clone(&live_sessions);
 
             let handle = tokio::spawn(async move {
                 let is_left = ctrl_cfg.name.to_lowercase().contains("left");
@@ -81,16 +90,24 @@ impl Daemon {
                     // Serialize connection attempts so hardware adapter does not hit EBUSY
                     let conn_permit = conn_lock.lock().await;
 
+                    let live_for_dial = Arc::clone(&live_sessions);
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
-                        // HANDOVER Bug 3: stop discovery *per attempt*, not once
-                        // at startup — another app (decky, a stray bluetoothctl,
-                        // BlueZ itself) can restart scanning at any time, and a
-                        // live LE scan makes create-connection fail (ENOSYS).
-                        // Task 09B moves this into the hub.
-                        let discovery_note = stop_discovery_for_connect(&mac_str);
-                        SwitchController::connect_with(
+                        // Never drop the BlueZ Device object for a MAC we own a
+                        // session for: the removal kills the live link.
+                        let has_live_session = live_for_dial
+                            .lock()
+                            .map(|live| live.contains(&mac_str))
+                            .unwrap_or(false);
+                        let budget = DialBudget {
+                            remove_bluez_device: !has_live_session,
+                            ..DialBudget::default()
+                        };
+                        // `connect_session` stops discovery before every round,
+                        // drops the BlueZ Device object once up front, and uses
+                        // the legacy 16 x 0.8 s envelope (analysis 8.7/8.8).
+                        SwitchController::connect_session(
                             &mac_str,
                             &adapter_str,
                             ConnectOptions {
@@ -110,13 +127,8 @@ impl Daemon {
                                     mgr_for_cb.update_right(report, &crate::protocol::calibration::StickCalibration::default());
                                 }
                             }),
+                            budget,
                         )
-                        .map_err(|err| {
-                            io::Error::new(
-                                err.kind(),
-                                format!("{err} [discovery_stop: {discovery_note}]"),
-                            )
-                        })
                     }).await;
 
                     // Release connect lock regardless of success or failure
@@ -125,8 +137,14 @@ impl Daemon {
                     match res {
                         Ok(Ok(controller)) => {
                             info!("Controller {} connected and streaming inputs!", ctrl_cfg.mac);
+                            if let Ok(mut live) = live_sessions.lock() {
+                                live.insert(ctrl_cfg.mac.clone());
+                            }
                             while controller.is_connected() && running.load(Ordering::Relaxed) {
                                 sleep(Duration::from_millis(500)).await;
+                            }
+                            if let Ok(mut live) = live_sessions.lock() {
+                                live.remove(&ctrl_cfg.mac);
                             }
                             warn!("Controller {} disconnected.", ctrl_cfg.mac);
                         }
@@ -152,7 +170,10 @@ impl Daemon {
         Ok(())
     }
 
-    async fn run_split(&self) -> std::io::Result<()> {
+    async fn run_split(
+        &self,
+        live_sessions: Arc<StdMutex<HashSet<String>>>,
+    ) -> std::io::Result<()> {
         let mut handles = Vec::new();
         let connect_lock = Arc::new(Mutex::new(()));
 
@@ -161,6 +182,7 @@ impl Daemon {
             let adapter_mac = self.config.adapter_mac.clone();
             let running = self.running.clone();
             let conn_lock = connect_lock.clone();
+            let live_sessions = Arc::clone(&live_sessions);
 
             let handle = tokio::spawn(async move {
                 let gp_name = format!("Nintendo Switch 2 {}", ctrl_cfg.name);
@@ -182,14 +204,21 @@ impl Daemon {
 
                     let conn_permit = conn_lock.lock().await;
 
+                    let live_for_dial = Arc::clone(&live_sessions);
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
-                        // HANDOVER Bug 3: discovery stops per connect attempt
-                        // (see the combined-mode branch; 09B centralises this in
-                        // the hub, which is the only dialer).
-                        let discovery_note = stop_discovery_for_connect(&mac_str);
-                        SwitchController::connect_with(
+                        // Same guard as combined mode: no Device-object removal
+                        // while we own a live session for this MAC.
+                        let has_live_session = live_for_dial
+                            .lock()
+                            .map(|live| live.contains(&mac_str))
+                            .unwrap_or(false);
+                        let budget = DialBudget {
+                            remove_bluez_device: !has_live_session,
+                            ..DialBudget::default()
+                        };
+                        SwitchController::connect_session(
                             &mac_str,
                             &adapter_str,
                             ConnectOptions {
@@ -207,13 +236,8 @@ impl Daemon {
                                     mgr_for_cb.update_horizontal_right(report, &crate::protocol::calibration::StickCalibration::default());
                                 }
                             }),
+                            budget,
                         )
-                        .map_err(|err| {
-                            io::Error::new(
-                                err.kind(),
-                                format!("{err} [discovery_stop: {discovery_note}]"),
-                            )
-                        })
                     }).await;
 
                     drop(conn_permit);
@@ -221,8 +245,14 @@ impl Daemon {
                     match res {
                         Ok(Ok(controller)) => {
                             info!("Controller {} connected in split mode!", ctrl_cfg.mac);
+                            if let Ok(mut live) = live_sessions.lock() {
+                                live.insert(ctrl_cfg.mac.clone());
+                            }
                             while controller.is_connected() && running.load(Ordering::Relaxed) {
                                 sleep(Duration::from_millis(500)).await;
+                            }
+                            if let Ok(mut live) = live_sessions.lock() {
+                                live.remove(&ctrl_cfg.mac);
                             }
                             warn!("Controller {} disconnected.", ctrl_cfg.mac);
                         }
@@ -246,19 +276,6 @@ impl Daemon {
         }
 
         Ok(())
-    }
-}
-
-/// Stop all Bluetooth discovery before an LE create-connection (HANDOVER
-/// Bug 3, TEST_RESULTS.md finding 3/4). Best effort: failures are reported in
-/// the connect error text, never fatal.
-fn stop_discovery_for_connect(mac: &str) -> String {
-    match ShellScanControl::from_env().prepare_global() {
-        Ok(()) => "ok".to_string(),
-        Err(err) => {
-            warn!("Could not stop Bluetooth discovery before connecting {mac}: {err}");
-            format!("failed: {err}")
-        }
     }
 }
 

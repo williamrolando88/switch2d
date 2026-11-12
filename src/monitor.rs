@@ -12,14 +12,13 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::bluetooth::scan::{ScanControl, ShellScanControl};
 use crate::controller::{
-    BondPolicy, CalibratedInput, ConnectOptions, ControllerInputCallback, SwitchController,
+    BondPolicy, CalibratedInput, ConnectOptions, ControllerInputCallback, DialBudget,
+    SwitchController,
 };
 use crate::protocol::constants::button_mask;
 use crate::protocol::report::InputReport;
 use crate::status::battery_pct_from_mv;
-use tracing::warn;
 
 /// Stable, ordered button table for the one-line report. Masks come from
 /// `protocol::constants::button_mask`; the order is defined once here and is
@@ -218,20 +217,12 @@ pub fn run_monitor(cfg: MonitorConfig) -> io::Result<()> {
         }
     });
 
-    // HANDOVER Bug 3: an LE scan still running on the adapter makes the LE
-    // create-connection fail (kernel surfaces it as ENOSYS), so all discovery
-    // is stopped immediately before dialing. Best effort: a failure here must
-    // never abort the connect attempt, only be visible in the diagnostics.
-    let discovery = ShellScanControl::from_env().prepare_global();
-    let discovery_note = match &discovery {
-        Ok(()) => "ok".to_string(),
-        Err(err) => {
-            warn!("Could not stop Bluetooth discovery before connecting: {err}");
-            format!("failed: {err}")
-        }
-    };
-
-    let controller = SwitchController::connect_with(
+    // Live monitor owns no session registry, so the dial envelope may drop the
+    // BlueZ Device object unconditionally before dialling: that object is what
+    // BlueZ/Steam otherwise race with our raw ATT connect (HANDOVER Bug 3/4,
+    // analysis 8.7). `connect_session` also stops LE discovery before every
+    // round and reports both the removal and the discovery outcome on failure.
+    let controller = SwitchController::connect_session(
         &cfg.mac,
         &cfg.adapter_mac,
         ConnectOptions {
@@ -239,15 +230,8 @@ pub fn run_monitor(cfg: MonitorConfig) -> io::Result<()> {
             bond: BondPolicy::Skip,
         },
         callback,
-    )
-    .map_err(|err| {
-        // FIX 3 (TEST_RESULTS.md finding 3): keep the MAC, both address-type
-        // errors (inside `err`) and the discovery-stop outcome together.
-        io::Error::new(
-            err.kind(),
-            format!("{err} [discovery_stop: {discovery_note}]"),
-        )
-    })?;
+        DialBudget::default(),
+    )?;
 
     print_handshake(&cfg, &controller);
 
