@@ -65,9 +65,35 @@ Testing fix `b380fad` where re-pairing an already bonded controller preserves it
 
 ---
 
-## 3. Test C: Reconnect Dial Rounds (Optional)
+## 3. Test C: Reconnect Dial Rounds & Collision Analysis
 
-- **Status**: Skipped by user request (optional per test plan; core target fixes are fully verified in Tests A & B).
+Testing reconnect dial behavior and timing after waking a sleeping controller.
+
+- **Setup**: Daemon run under systemd user unit with `RUST_LOG=debug`.
+- **Pre-wake Phase (Rounds 1–14)**:
+  - Joy-Cons untouched / asleep.
+  - Per-round logs:
+    - `discovery_stop=ok`
+    - `scan_stop=ok`
+    - `device_removal=failed: bluetoothctl exited with exit status: 1` (Device not yet present in BlueZ device list, expected)
+    - Connection attempt timed out as expected (`LE_PUBLIC` & `LE_RANDOM` timeouts of 800ms each) because pad radio was powered down.
+- **Wake Phase (Round 15)**:
+  - User pressed button on Left Joy-Con (`BC:89:A6:45:83:CC`).
+  - **Log Output**:
+    ```text
+    DEBUG Dial round 15/16 for BC:89:A6:45:83:CC: elapsed=24.048282689s, discovery_stop=ok, device_removal=failed: bluetoothctl exited with exit status: 1, scan_stop=ok
+    INFO Connecting to Switch 2 controller BC:89:A6:45:83:CC...
+    INFO L2CAP link established with BC:89:A6:45:83:CC (type: LE_PUBLIC)
+    DEBUG Skipping bonding for BC:89:A6:45:83:CC (BondPolicy::Skip)
+    INFO Dial to BC:89:A6:45:83:CC succeeded after 15 rounds (30 address-type attempts)
+    INFO Controller BC:89:A6:45:83:CC connected and streaming inputs!
+    ```
+- **Hardware Observation**: Left Joy-Con LED locked solid as **Player 1** (1 LED).
+- **Collision Diagnosis**:
+  - Zero `scan_stop` or D-Bus discovery collision issues.
+  - Failing rounds prior to Round 15 were solely due to the pad not advertising yet.
+  - The instant the pad woke up, connection established on the first available dial round over `LE_PUBLIC`.
+  - ✅ **Pass**: Reconnect timing envelope functions cleanly without adapter or BlueZ deadlock.
 
 ---
 
@@ -78,14 +104,15 @@ Testing fix `b380fad` where re-pairing an already bonded controller preserves it
 | **0. Prep & SHA256** | Hash matches | Verified `afacee...` | ✅ Pass |
 | **A. Daemon Stick Calibration** | `±30000` or better on both sticks | Reached full `±32767` on `ABS_X`, `ABS_Y`, `ABS_RX`, `ABS_RY` | ✅ Pass |
 | **B. Re-pairing Player Slot** | Keeps Player 1 (1 LED) | Logged `re-pairing ..., keeping Player 1`, 1 solid LED | ✅ Pass |
-| **C. Reconnect Timing** | Connects without collision | Skipped (Optional) | ⏭️ Skipped |
+| **C. Reconnect Timing** | Connects without collision | Connected cleanly on wake (Round 15, instant on wake advertisement) | ✅ Pass |
 
 ---
 
 ## 5. Conclusions & Handoff Summary
 
-Both fixes identified in Round 6 are **100% verified and functional on real hardware**:
-1. **Fix `5e8c4a9` (Daemon Calibration Routing)**: The daemon now passes individual Joy-Con calibration blocks to the combined virtual gamepad mapper. All four stick axes (`ABS_X`, `ABS_Y`, `ABS_RX`, `ABS_RY`) reach the maximum possible hardware range of **`±32767`**.
-2. **Fix `b380fad` (Player Slot Retention)**: Re-pairing a bonded Joy-Con without passing `--player` no longer allocates an incrementing free slot (e.g. Player 3). It detects the existing MAC and cleanly preserves **Player 1** with **1 solid LED**.
+All three tests in Round 6B are **100% verified and functional on real hardware**:
+1. **Fix `5e8c4a9` (Daemon Calibration Routing)**: Real calibration tables route to the combined uinput mapper. Both Joy-Con sticks reach the maximum hardware limit of **`±32767`**.
+2. **Fix `b380fad` (Player Slot Retention)**: Re-pairing an already bonded controller without `-p` preserves its configured player slot (**Player 1**, 1 LED).
+3. **Test C (Reconnect Timing & Dial Envelope)**: Proved that multiple dial rounds before wake are purely due to pad silence (radio sleeping), and reconnection occurs immediately upon advertisement without discovery collisions or adapter deadlocks.
 
 All logs preserved at `~/switch2d-test/round6b-1403.log` and `~/switch2d-test/round6b-evtest.log`.
