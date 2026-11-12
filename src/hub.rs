@@ -15,14 +15,19 @@
 //!
 //! # Connected-state model
 //!
-//! The hub knows a pad is connected when a dial succeeded ([`Hub::dial_pending`])
-//! and forgets that again as soon as an acceptable advert for it is recorded
-//! (an advertising pad is awake, not connected). The early-out therefore means
-//! "every known pad is connected" exactly like legacy `disconnected == []`, and
-//! it must never trigger just because *some* pad is connected (HANDOVER Bug 1:
-//! that locked out player 2). Re-registering a MAC with
-//! [`Hub::register_known`] re-arms it as expected-and-disconnected, which is how
-//! the daemon resumes scanning after a session drops.
+//! Connection state is **explicit**: only [`Hub::mark_connected`],
+//! [`Hub::mark_disconnected`], [`Hub::unregister_known`], a successful
+//! [`Hub::dial_pending`] and the re-arm inside [`Hub::register_known`] change
+//! it. Advertisements never do: BlueZ keeps `ManufacturerData`/`RSSI` for a
+//! while after a link is up, so treating "still advertising" as "disconnected"
+//! would re-open scanning while every pad is connected (CPU/battery cost plus
+//! `StopDiscovery` churn).
+//!
+//! The early-out therefore means "every known pad is connected" exactly like
+//! legacy `disconnected == []`, and it must never trigger just because *some*
+//! pad is connected (HANDOVER Bug 1: that locked out player 2). The daemon
+//! calls [`Hub::register_known`] when a pad becomes expected again, which
+//! re-arms it as expected-and-disconnected.
 //!
 //! # Connect serialization
 //!
@@ -151,6 +156,29 @@ where
         self.adapter_mac = mac.to_string();
     }
 
+    /// Mark a pad as connected (daemon: session activated).
+    pub fn mark_connected(&mut self, mac: &str) {
+        self.connected.insert(mac.to_ascii_uppercase());
+    }
+
+    /// Mark a pad as disconnected again (daemon: session torn down). The pad
+    /// must also be registered as known for scanning to resume for it.
+    pub fn mark_disconnected(&mut self, mac: &str) {
+        self.connected.remove(&mac.to_ascii_uppercase());
+    }
+
+    pub fn is_connected(&self, mac: &str) -> bool {
+        self.connected.contains(&mac.to_ascii_uppercase())
+    }
+
+    /// Remove a pad entirely: no longer expected to wake and no longer counted
+    /// as connected.
+    pub fn unregister_known(&mut self, mac: &str) {
+        let mac = mac.to_ascii_uppercase();
+        self.known.remove(&mac);
+        self.connected.remove(&mac);
+    }
+
     pub fn seen(&self) -> &SeenAdverts {
         &self.seen
     }
@@ -203,13 +231,10 @@ where
                 continue;
             }
 
-            if self
-                .seen
-                .record(device.advert.as_ref(), &mac, &self.adapter_mac, policy, now)
-            {
-                // An advertising pad is awake, not connected.
-                self.connected.remove(&mac);
-            }
+            // Recording never touches connection state: a pad that is still
+            // advertising may already be linked (BlueZ caches adverts).
+            self.seen
+                .record(device.advert.as_ref(), &mac, &self.adapter_mac, policy, now);
         }
 
         // 4. Connection state comes from this snapshot.
@@ -229,6 +254,10 @@ where
             if self.idle_cycles >= self.config.idle_restart_cycles {
                 self.seen = SeenAdverts::new();
                 self.idle_cycles = 0;
+                // Analogue of legacy recreating a wedged BleakScanner: if the
+                // discovery session died externally (Steam, bluetoothctl) the
+                // hub would otherwise stay mute with no visible symptom.
+                self.discovery_started = false;
             }
             return Ok(HubOutcome::Idle);
         }
@@ -682,6 +711,147 @@ mod tests {
         let results = hub.dial_pending(&pending);
         assert_eq!(results[0].outcome, Ok(()));
         assert!(hub.seen().is_empty(), "successful dial forgets the entry");
+    }
+
+    #[test]
+    fn connected_pad_that_still_advertises_does_not_reopen_scanning() {
+        let base = Instant::now();
+        // A is connected but BlueZ still reports its advert/RSSI.
+        let connected_advert = device(
+            PAD_A,
+            true,
+            Some(-50),
+            Some(info(PAD_A, bonded_to(ADAPTER))),
+        );
+        let (mut hub, _calls, polls) = make_hub(
+            HubConfig::default(),
+            vec![vec![connected_advert, live_pad(PAD_B)]],
+            &[],
+        );
+        hub.register_known(PAD_A);
+        hub.set_adapter_mac(ADAPTER);
+        hub.mark_connected(PAD_A);
+        assert!(hub.is_connected(PAD_A));
+
+        // Single connected pad: early-out, source untouched even though the
+        // snapshot it would have returned contains a live advert.
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::AllConnected);
+        assert_eq!(poll_count(&polls), 0);
+        assert!(hub.is_connected(PAD_A));
+
+        // With a second, disconnected pad registered the record loop does run
+        // and must not flip A to disconnected.
+        hub.register_known(PAD_B);
+        match hub
+            .poll_once(base + Duration::from_millis(250))
+            .expect("poll")
+        {
+            HubOutcome::Pending(pending) => {
+                let macs: Vec<&str> = pending.iter().map(|entry| entry.mac.as_str()).collect();
+                assert_eq!(macs, vec![PAD_B]);
+            }
+            other => panic!("expected Pending for {PAD_B}, got {other:?}"),
+        }
+        assert_eq!(poll_count(&polls), 1);
+        assert!(
+            hub.is_connected(PAD_A),
+            "recording an advert must not change explicit connection state"
+        );
+    }
+
+    #[test]
+    fn mark_disconnected_reopens_scanning() {
+        let base = Instant::now();
+        let (mut hub, _calls, polls) =
+            make_hub(HubConfig::default(), vec![vec![live_pad(PAD_B)]], &[]);
+        register_default_pads(&mut hub);
+        hub.mark_connected(PAD_A);
+        hub.mark_connected(PAD_B);
+
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::AllConnected);
+        assert_eq!(poll_count(&polls), 0);
+
+        hub.mark_disconnected(PAD_B);
+        assert!(!hub.is_connected(PAD_B));
+
+        match hub
+            .poll_once(base + Duration::from_millis(250))
+            .expect("poll")
+        {
+            HubOutcome::Pending(pending) => {
+                let macs: Vec<&str> = pending.iter().map(|entry| entry.mac.as_str()).collect();
+                assert_eq!(macs, vec![PAD_B]);
+            }
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        assert_eq!(poll_count(&polls), 1, "scanning resumed");
+        assert!(hub.is_connected(PAD_A));
+    }
+
+    #[test]
+    fn unregister_known_removes_from_early_out() {
+        let base = Instant::now();
+        let (mut hub, _calls, polls) = make_hub(
+            HubConfig::default(),
+            vec![vec![device(PAD_B, false, Some(-127), None)]],
+            &[],
+        );
+        register_default_pads(&mut hub);
+        hub.mark_connected(PAD_A);
+
+        // B is known and disconnected, so this cycle polls.
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::Idle);
+        assert_eq!(poll_count(&polls), 1);
+
+        hub.unregister_known(PAD_B);
+        assert!(!hub.is_connected(PAD_B));
+
+        // Only A remains and it is connected: early-out without polling.
+        assert_eq!(
+            hub.poll_once(base + Duration::from_millis(250))
+                .expect("poll"),
+            HubOutcome::AllConnected
+        );
+        assert_eq!(
+            poll_count(&polls),
+            1,
+            "unregistered pad no longer forces a poll"
+        );
+    }
+
+    #[test]
+    fn idle_restart_reissues_start_discovery() {
+        let base = Instant::now();
+        let config = HubConfig {
+            idle_restart_cycles: 1,
+            ..HubConfig::default()
+        };
+        let (mut hub, calls, _polls) = make_hub(
+            config,
+            vec![
+                vec![device(PAD_A, false, Some(-127), None)],
+                vec![device(PAD_A, false, Some(-127), None)],
+            ],
+            &[],
+        );
+        register_default_pads(&mut hub);
+
+        // First cycle starts discovery, then hits the idle threshold.
+        assert_eq!(hub.poll_once(base).expect("poll"), HubOutcome::Idle);
+        assert_eq!(calls.count("start"), 1);
+        assert_eq!(hub.idle_cycles(), 0, "threshold reset the counter");
+
+        // Restart must re-issue StartDiscovery (the session may have died).
+        assert_eq!(
+            hub.poll_once(base + Duration::from_millis(250))
+                .expect("poll"),
+            HubOutcome::Idle
+        );
+        assert_eq!(
+            calls.count("start"),
+            2,
+            "start re-issued across the restart"
+        );
     }
 
     #[test]
