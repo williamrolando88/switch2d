@@ -241,8 +241,10 @@ likely thing to find here, because that path has been rewritten most.
 
 ### Round 2
 
-The current round's plan, with the exact measurements to capture and the questions
-it must answer, is [`docs/TEST_PLAN_ROUND2.md`](docs/TEST_PLAN_ROUND2.md). Start
+The current plan is [`docs/TEST_PLAN_ROUND3.md`](docs/TEST_PLAN_ROUND3.md): round 2
+proved pairing works but reconnect-after-wake does not, so round 3 is read-only
+diagnostics on the pad's advertisement and the kernel connect path. The previous
+round is [`docs/TEST_PLAN_ROUND2.md`](docs/TEST_PLAN_ROUND2.md). Start
 there: it supersedes Test A's checklist for this build (`2aaa36a`). Step 1 purges
 both Joy-Cons from BlueZ and switch2d, and pairing is re-verified from scratch.
 
