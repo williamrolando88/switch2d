@@ -77,6 +77,66 @@ sudo btmgmt -i 0 power on
 If it connects with privacy off, the earlier HCI capture will show why, and the fix
 belongs in our dial path rather than in the strategy.
 
+## Phase P — privacy experiment (was skipped in round 3, do it explicitly)
+
+Round 3 read `privacy` and `ll-privacy` in `btmgmt info` but never turned them off, so
+that hypothesis is still open. `btmgmt` on this host does have the subcommands
+(`btmgmt privacy <on|off>`, `btmgmt power <on|off>`), and `sudo -n` is not enough for
+them — you need your interactive password. Do this in a normal terminal, not through
+the frozen binary.
+
+```fish
+# 1. record the before-state
+sudo btmgmt -i 0 info 2>&1 | tee -a $LOG
+
+# 2. the sequence (privacy can only be changed while powered off)
+sudo btmgmt -i 0 power off
+sudo btmgmt -i 0 privacy off
+sudo btmgmt -i 0 power on
+
+# 3. VERIFY it actually stuck - this is the step that was missed last time
+sudo btmgmt -i 0 info 2>&1 | tee -a $LOG
+```
+
+In step 3, `current settings:` must **no longer contain** `privacy` or `ll-privacy`.
+If they are still there, `bluetoothd` re-applied them on power-up; go to Phase P2.
+
+```fish
+# 4. with privacy off, wake the pad and dial
+~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 45 2>&1 | tee -a $LOG
+```
+
+### Phase P2 — only if privacy came back in step 3
+
+Stop BlueZ entirely so it cannot re-apply the setting. Our dial path does not need it
+(raw L2CAP), it only loses the advert source and the object removal, both of which are
+best-effort.
+
+```fish
+sudo systemctl stop bluetooth
+sudo btmgmt -i 0 power on
+sudo btmgmt -i 0 info 2>&1 | tee -a $LOG        # privacy now stays off
+# wake the pad, then:
+~/switch2d-test/switch2d monitor BC:89:A6:45:83:CC --seconds 45 2>&1 | tee -a $LOG
+```
+
+This variant is also a result on its own: if the pad connects with `bluetoothd`
+stopped, then BlueZ's presence — not our code — is what blocks the reconnect, and the
+fix is architectural (keep BlueZ away from the pad, or let BlueZ own the link).
+
+### Restore afterwards, always
+
+```fish
+sudo btmgmt -i 0 power off
+sudo btmgmt -i 0 privacy on
+sudo btmgmt -i 0 power on
+sudo systemctl start bluetooth
+systemctl --user stop switch2d.service
+sudo btmgmt -i 0 info 2>&1 | tee -a $LOG        # privacy back, service down
+```
+
+Do not leave the box with privacy off or `bluetoothd` stopped.
+
 ## Also capture, from the round 3 log
 
 The calibration diagnostics were in that session but not pasted. They decide the Right
@@ -98,6 +158,7 @@ second confirms it is not model-specific.
 | Capture shows | Meaning | Next step |
 |---|---|---|
 | `Own_Address_Type = 0x01` (random) | explanation A confirmed | force a public initiator address in the dial path |
+| privacy off and the pad **connects** | A confirmed without needing the capture | same fix, and Phase P2 tells us whether BlueZ may own the link instead |
 | `Own_Address_Type = 0x00`, peer correct, status `0x3E` | explanation B confirmed | the pad only accepts inside a burst: change dialing strategy (connect immediately on the advert, not on a timer) |
 | `Own_Address_Type = 0x00`, peer correct, status `0x00` | we connect at HCI level and then drop | the fault is above L2CAP — look at the ATT/handshake side |
 | `ADV_DIRECT_IND` visible | the pad really is calling us specifically, which narrows timing to the burst | measure how long after the button press the first burst starts |
