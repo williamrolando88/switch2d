@@ -1,5 +1,7 @@
 # 🧪 Hardware Validation Test Results & Session Log — Round 6B
 
+> Hardware identifiers (MAC addresses, serial numbers, adapter address) have been replaced with synthetic values so the project can be distributed. Everything else is verbatim from the test session.
+
 - **Date**: 2026-11-12
 - **Build under test**: `b380fad` (frozen at `~/switch2d-test/switch2d`)
 - **Binary SHA256**: `afacee4ed953828d295d45165a910802fe01f5450bb692132e2e7d2f49bba003`

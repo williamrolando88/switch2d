@@ -1,5 +1,7 @@
 # 🧪 Hardware Validation Test Results & Session Log
 
+> Hardware identifiers (MAC addresses, serial numbers, adapter address) have been replaced with synthetic values so the project can be distributed. Everything else is verbatim from the test session.
+
 Date: 2026-11-11
 Target Hardware: Nintendo Switch 2 Controllers (Joy-Con 2 Left & Joy-Con 2 Right)
 Host: Linux (Bazzite) / Adapter `0A:0B:0C:0D:0E:0F`

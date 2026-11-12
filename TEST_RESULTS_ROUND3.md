@@ -1,5 +1,7 @@
 # 🧪 Hardware Validation Test Results & Session Log — Round 3
 
+> Hardware identifiers (MAC addresses, serial numbers, adapter address) have been replaced with synthetic values so the project can be distributed. Everything else is verbatim from the test session.
+
 - **Date**: 2026-11-12
 - **Build under test**: `70bf2e5` (binary frozen at `~/switch2d-test/switch2d`)
 - **Host**: Linux (Bazzite) / Adapter `0A:0B:0C:0D:0E:0F`
