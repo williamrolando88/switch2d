@@ -1,10 +1,12 @@
 # Test Round 6 — the whole product, from a clean slate
 
-Build: `~/switch2d-test/switch2d` — record its identity before you start, it's the only
-way to attribute the results later:
+Build: **`ab31ac3`**, frozen at `~/switch2d-test/switch2d`, sha256
+`97f307e6c1f24a16dd077c8650656faafe7bcd31338c3bab8f64b16a159081a6`. Verify before you
+start — if it differs, the binary was rebuilt and the numbers are not comparable:
 
 ```fish
 sha256sum ~/switch2d-test/switch2d | tee ~/switch2d-test/round6-build.txt
+# must print 97f307e6c1f24a16dd077c8650656faafe7bcd31338c3bab8f64b16a159081a6
 ```
 
 This round starts from **zero** — both Joy-Cons unpaired, config cleared — and ends with a
