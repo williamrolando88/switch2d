@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
+use tracing::debug;
 
 use super::scan::{run_command, AdvertSource, DeviceAdvert};
 use crate::protocol::advert::AdvertInfo;
@@ -34,6 +35,9 @@ const BUSCTL_FALLBACK: &str = "/usr/bin/busctl";
 pub struct BluezAdvertSource {
     command: PathBuf,
     adapter_mac: Option<String>,
+    /// The busctl command line/status is logged only on the first invocation
+    /// per source, so `advert` polling every 300 ms does not flood debug logs.
+    busctl_logged: bool,
 }
 
 impl Default for BluezAdvertSource {
@@ -48,6 +52,7 @@ impl BluezAdvertSource {
         Self {
             command: resolve_busctl(),
             adapter_mac: None,
+            busctl_logged: false,
         }
     }
 
@@ -56,6 +61,7 @@ impl BluezAdvertSource {
         Self {
             command: command.into(),
             adapter_mac: None,
+            busctl_logged: false,
         }
     }
 
@@ -77,16 +83,32 @@ impl BluezAdvertSource {
         Ok(mac)
     }
 
-    fn managed_objects_json(&self) -> io::Result<String> {
-        let output = run_command(Command::new(&self.command).args([
+    fn managed_objects_json(&mut self) -> io::Result<String> {
+        let command_line = format!(
+            "{} call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects --json=short",
+            self.command.display()
+        );
+        let first = !self.busctl_logged;
+        self.busctl_logged = true;
+        if first {
+            debug!("BlueZ query command: {command_line}");
+        }
+
+        let result = run_command(Command::new(&self.command).args([
             "call",
             "org.bluez",
             "/",
             "org.freedesktop.DBus.ObjectManager",
             "GetManagedObjects",
             "--json=short",
-        ]))?;
+        ]));
+        match &result {
+            Ok(_) if first => debug!("BlueZ query status: 0 ({command_line})"),
+            Err(err) if first => debug!("BlueZ query failed: {err} ({command_line})"),
+            _ => {}
+        }
 
+        let output = result?;
         String::from_utf8(output).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -100,6 +122,7 @@ impl BluezAdvertSource {
     /// Snapshot including the raw fields used by `switch2d advert`.
     pub fn snapshot(&mut self) -> io::Result<Vec<AdvertSnapshot>> {
         let json = self.managed_objects_json()?;
+        debug_advert_objects(&json);
         parse_advert_snapshots(&json)
     }
 }
@@ -134,6 +157,17 @@ impl AdvertSnapshot {
     /// Live advertisement rather than a cached BlueZ property set.
     pub fn is_live(&self) -> bool {
         matches!(self.rssi, Some(rssi) if rssi > -127)
+    }
+
+    /// Whether this snapshot has anything worth printing in the `advert`
+    /// diagnostic: manufacturer data, a live RSSI, or a connected device.
+    ///
+    /// This is deliberately looser than [`Self::is_live`] / the hub's
+    /// `DeviceAdvert::is_live`: BlueZ keeps cached manufacturer data after its
+    /// RSSI monitor window closes, which is useful proof for a human but must
+    /// not re-arm a dial for a cached ghost. The two rules differ on purpose.
+    pub fn has_adv_payload(&self) -> bool {
+        self.manufacturer_data.is_some() || self.is_live() || self.connected
     }
 }
 
@@ -183,6 +217,67 @@ pub fn parse_advert_snapshots(json: &str) -> io::Result<Vec<AdvertSnapshot>> {
         }
     }
     Ok(devices)
+}
+
+/// Dump every BlueZ `Device1` object before `advert` filtering, at DEBUG.
+///
+/// This is the evidence for "BlueZ has no object" vs "object exists without
+/// adv data" vs "our parser rejected the block". It is unconditional at debug
+/// level so no extra CLI flag is needed; stdout formatting stays unchanged.
+fn debug_advert_objects(json: &str) {
+    let Ok(objects) = parse_object_map(json) else {
+        return;
+    };
+    for object in objects.values() {
+        let Some(device) = object.get(ORG_BLUEZ_DEVICE1) else {
+            continue;
+        };
+        let address = property_string(device, "Address").unwrap_or_else(|| "<missing>".to_string());
+        let address_type = property_string(device, "AddressType")
+            .map(|kind| kind.to_lowercase())
+            .unwrap_or_else(|| "-".to_string());
+        let connected = property_bool(device, "Connected").unwrap_or(false);
+        let rssi = match property_i16(device, "RSSI") {
+            Some(value) => format!("some({value})"),
+            None => "none".to_string(),
+        };
+        let manufacturer_data = manufacturer_data(device);
+        let md = match &manufacturer_data {
+            Some(bytes) => format!("len{}", bytes.len()),
+            None => "absent".to_string(),
+        };
+        let parsed = match manufacturer_data
+            .as_ref()
+            .and_then(|bytes| AdvertInfo::parse(&address, Some(bytes)))
+        {
+            Some(advert) => format!(
+                "yes pid=0x{:04X} host={}",
+                advert.pid,
+                debug_host(&advert.host)
+            ),
+            None if manufacturer_data.is_some() => "no".to_string(),
+            None => "no-md".to_string(),
+        };
+
+        debug!(
+            "advert object addr={address} type={address_type} connected={connected} \
+             rssi={rssi} md={md} parsed={parsed}"
+        );
+    }
+}
+
+fn debug_host(host: &crate::protocol::advert::HostBinding) -> String {
+    use crate::protocol::advert::HostBinding;
+    match host {
+        HostBinding::Pairing => "pairing".to_string(),
+        HostBinding::Unknown => "unknown".to_string(),
+        HostBinding::Host(bytes) => bytes
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    }
 }
 
 /// Extract `org.bluez.Adapter1.Address` for `/org/bluez/hci{hci_index}`.
@@ -434,6 +529,45 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].rssi, None);
         assert!(!devices[0].is_live());
+    }
+
+    #[test]
+    fn snapshot_with_manufacturer_data_but_no_rssi_has_payload() {
+        let bytes = [0, 0, 0, 126, 5, 105, 32, 0, 0, 0, 1, 2, 3, 4, 5, 6];
+        let json = managed_objects_with(&[(
+            "/org/bluez/hci0/dev_AA",
+            device_object(&format!(
+                r#""Address": {{"type":"s","data":"AA:BB:CC:DD:EE:FF"}},
+                   "ManufacturerData": {{"type":"a{{qv}}","data":[{{"1363":{{"type":"ay","data":{bytes:?}}}}}]}}"#
+            )),
+        )]);
+
+        let snapshots = parse_advert_snapshots(&json).expect("snapshot parses");
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.rssi, None);
+        assert!(!snapshot.is_live());
+        assert!(
+            snapshot.has_adv_payload(),
+            "cached manufacturer data counts as payload for advert"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_no_payload_has_no_payload() {
+        let json = managed_objects_with(&[(
+            "/org/bluez/hci0/dev_AA",
+            device_object(
+                r#""Address": {"type":"s","data":"AA:BB:CC:DD:EE:FF"},
+                   "Connected": {"type":"b","data":false}"#,
+            ),
+        )]);
+
+        let snapshots = parse_advert_snapshots(&json).expect("snapshot parses");
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.manufacturer_data, None);
+        assert_eq!(snapshot.rssi, None);
+        assert!(!snapshot.connected);
+        assert!(!snapshot.has_adv_payload());
     }
 
     #[test]

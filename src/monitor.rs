@@ -80,14 +80,15 @@ pub fn advert_line_for(item: &AdvertSnapshot) -> String {
 /// here" signal than RSSI. Returns `None` when the entry should be printed, or
 /// a human-readable reason when it should be skipped.
 ///
-/// The hub keeps using RSSI-only liveness ([`DeviceAdvert::is_live`]): cached
-/// properties must not re-arm a dial.
+/// The rule lives next to the raw snapshot as
+/// [`AdvertSnapshot::has_adv_payload`] so both the diagnostic and its tests see
+/// the same definition. The hub deliberately stays on the stricter RSSI-only
+/// [`DeviceAdvert::is_live`]: cached data must not re-arm a dial for a ghost.
+/// The two rules differ on purpose and are now both named.
 ///
 /// [`DeviceAdvert::is_live`]: crate::bluetooth::scan::DeviceAdvert::is_live
 pub fn advert_skip_reason(item: &AdvertSnapshot) -> Option<&'static str> {
-    let has_data = item.manufacturer_data.is_some();
-    let has_rssi = matches!(item.rssi, Some(rssi) if rssi > -127);
-    if has_data || has_rssi || item.connected {
+    if item.has_adv_payload() {
         None
     } else {
         Some("no manufacturer data, no live rssi, not connected")
