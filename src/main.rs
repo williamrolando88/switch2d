@@ -106,9 +106,15 @@ enum Commands {
     /// Hardware smoke test: create a virtual pad, print what the kernel sees,
     /// and drive a visible button/stick sweep. No controller or Bluetooth needed.
     Selftest {
-        /// How long to drive the visible sweep, in seconds
+        /// How long to drive the visible sweep, in seconds (only with --drive)
         #[arg(long, default_value_t = 6)]
         seconds: u64,
+
+        /// Actually move sticks and press buttons. Off by default: a node that
+        /// Steam, a desktop controller daemon or an emulator is watching can
+        /// otherwise steal focus or move the pointer while it is being read.
+        #[arg(long)]
+        drive: bool,
     },
 }
 
@@ -403,8 +409,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.save()?;
             println!("Registered controller {} ({}) as Player {}.", final_name, clean_mac, player);
         }
-        Commands::Selftest { seconds } => {
-            run_selftest(seconds).await?;
+        Commands::Selftest { seconds, drive } => {
+            run_selftest(seconds, drive).await?;
         }
         Commands::Remove { mac } => {
             let clean_mac = mac.trim().to_uppercase();
@@ -554,7 +560,7 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-async fn run_selftest(seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_selftest(seconds: u64, drive: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== switch2d selftest (uinput only, no Bluetooth) ===");
 
     let gamepad = match VirtualGamepad::new(SELFTEST_NAME, SELFTEST_PRODUCT_ID, SELFTEST_TAG) {
@@ -637,6 +643,26 @@ async fn run_selftest(seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
         "  stop:       {}",
         hex(&stop_payload(Layout::SingleBlock, 0x50))
     );
+    println!();
+
+    if !drive {
+        // Passive mode: the node exists and is described, but nothing moves.
+        // A uinput pad that suddenly sweeps buttons is a very good way to steal
+        // focus from whatever has controller support enabled.
+        println!(
+            "Passive mode: the pad is up but NOT driven. Press Ctrl-C when done, or re-run with \
+             --drive to sweep sticks and buttons."
+        );
+        println!("If anything on this desktop maps gamepads (Steam Input, antimicrox), close it first.");
+        println!();
+        let _ = tokio::signal::ctrl_c().await;
+        drop(gamepad);
+        println!("selftest: pad released.");
+        return Ok(());
+    }
+
+    println!("This will sweep sticks and press every button.");
+    println!("If anything on this desktop maps gamepads (Steam Input, antimicrox), close it first.");
     println!();
 
     let plan = sweep_plan();
