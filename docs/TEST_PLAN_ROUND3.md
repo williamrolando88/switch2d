@@ -1,8 +1,7 @@
 # Test Round 3 — pair, validate in a live session, then attack the wake path
 
-Build: **`1e50b79` + the two new commands** (`pair --hold`, `advert`) — I will tell you
-the exact commit to use before you start; do not start on the old binary, `pair --hold`
-is what makes phase B possible.
+Build: **`70bf2e5`** — frozen binary at `~/switch2d-test/switch2d`, which now has
+`pair --hold` and `advert`. Do not use the old `1e50b79` binary: phase B needs `advert`.
 
 Why this shape: round 2 proved we connect from SYNC mode and never after a wake. So we
 first **earn a session we know works**, measure everything in it, and only then drop the
