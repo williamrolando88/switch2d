@@ -48,7 +48,8 @@ input without starvation, wake reconnect without SYNC, and automatic recovery af
 | HD rumble (60 Hz stream) | 🧪 coded, not wired to force-feedback | 🧪 | 🧪 |
 | Preset rumble | — | — | 🧪 coded, not wired |
 | DSU motion output | 🧪 coded, not wired | 🧪 | 🧪 |
-| Combined mode | 🧪 implemented, round 5 hardware validation pending | — | — |
+| Combined mode | ✅ both pads, one node, no starvation (round 6); daemon calibration fix `5e8c4a9` awaiting a hardware re-check | — | — |
+| Player LED in combined mode | ⚠️ cosmetic gap: each pad lights its own configured player (1 LED / 2 LEDs) instead of both showing the pair's number, as real hardware does. Scheduled with the 09B daemon rewrite, where the combined player becomes a first-class field. | — | — |
 | Split mode | 🧪 coded, not hardware-validated | — | — |
 
 ## What "speculative" means for you as a user
