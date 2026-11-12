@@ -34,7 +34,6 @@ use std::sync::mpsc::{self, Receiver as StdReceiver, Sender as StdSender, TryRec
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use evdev::{AbsoluteAxisType, Key};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
@@ -47,7 +46,7 @@ use crate::controller::{BondPolicy, CalibratedInput, ConnectOptions, SwitchContr
 use crate::dsu_bridge::DsuBridge;
 use crate::hub::{DialResult, Dialer, Hub, HubConfig, HubOutcome};
 use crate::players::{path_in, LedPlayers};
-use crate::protocol::constants::{button_mask, PRO_CONTROLLER2_PID};
+use crate::protocol::constants::PRO_CONTROLLER2_PID;
 use crate::protocol::report::InputReport;
 use crate::protocol::vibration::SUSTAIN_INTERVAL;
 use crate::rumble::{RumbleAction, RumbleEngine};
@@ -55,7 +54,7 @@ use crate::status::{
     battery_pct_from_mv, ControllerStatus, DaemonStatus, ServiceState, StatusPublisher,
 };
 use crate::uinput::ff::FfEvent;
-use crate::uinput::{MotionNode, PadSink, VirtualGamepad, STICK_MAX};
+use crate::uinput::{CombinedSide, MotionNode, PadSink, Side, VirtualGamepad};
 use crate::worker::{Worker, WorkerConfig};
 
 /// Bounded input-report channel: enough to absorb a scheduling hiccup without
@@ -126,6 +125,7 @@ impl Daemon {
             .collect();
         let idle_timeout = Duration::from_secs(self.config.idle_sleep_seconds.max(1));
         let horizontal = self.config.mode == DaemonMode::Split;
+        let face_layout = self.config.face_button_layout;
 
         // ADR-4 player identity: the supervisor re-reads `led-players.json` on
         // every publish (1.5 s tick and session events) and stores the per-pad
@@ -192,11 +192,10 @@ impl Daemon {
             let sup_tx = sup_tx.clone();
             match &combined_gamepad {
                 Some(gamepad) => {
-                    let sink = CombinedSideSink {
-                        gamepad: Arc::clone(gamepad),
-                        side: pad.side(),
-                        horizontal,
-                    };
+                    // `uinput::combined::CombinedSide` is the single owner of
+                    // the per-side mapping (one table in uinput::mapping).
+                    let mut sink = CombinedSide::new(Arc::clone(gamepad), pad.side(), horizontal);
+                    sink.set_face_layout(face_layout);
                     tokio::spawn(run_pad_worker(
                         pad,
                         sink,
@@ -214,11 +213,9 @@ impl Daemon {
                 }
                 None => {
                     let name = format!("Nintendo Switch 2 {}", pad.name);
-                    let gamepad = Arc::new(StdMutex::new(VirtualGamepad::new(
-                        &name,
-                        pad.product_id,
-                        &pad.mac,
-                    )?));
+                    let mut node = VirtualGamepad::new(&name, pad.product_id, &pad.mac)?;
+                    node.set_face_layout(face_layout);
+                    let gamepad = Arc::new(StdMutex::new(node));
                     let sink = SharedPadSink { gamepad };
                     tokio::spawn(run_pad_worker(
                         pad,
@@ -622,12 +619,6 @@ impl PadSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Left,
-    Right,
-}
-
 /// One worker task: waits for sessions and runs them until the link drops or
 /// the pad goes idle. The uinput node lives in the sink and survives sessions.
 #[allow(clippy::too_many_arguments)]
@@ -1017,154 +1008,17 @@ impl PadSink for SharedPadSink {
     }
 }
 
-/// Sink for combined mode: one half of the shared combined node.
-///
-/// This mirrors `uinput::combined::update_left/right` (and the horizontal
-/// variants) but consumes the already-calibrated values the worker produces.
-/// The conversion is the same truncating `* 32767.0` as
-/// `StickCalibration::apply_scaled_i16`, so the emitted axis values are
-/// unchanged from the pre-worker daemon.
-#[derive(Clone)]
-struct CombinedSideSink {
-    gamepad: Arc<StdMutex<VirtualGamepad>>,
-    side: Side,
-    horizontal: bool,
-}
-
-impl FfPad for CombinedSideSink {
+impl FfPad for CombinedSide {
     // The combined node has one kernel FF queue shared by both halves; either
     // worker may drain it, and `ff_target()` afterwards reports the same level
     // to both, which the level comparison in `pump_rumble` relies on.
     fn poll_ff(&mut self) -> io::Result<Vec<FfEvent>> {
-        let mut gamepad = lock_gamepad(&self.gamepad);
-        gamepad.poll_ff()
+        CombinedSide::poll_ff(self)
     }
 
     fn ff_target(&self) -> (u16, u16) {
-        lock_gamepad(&self.gamepad).ff_target()
+        CombinedSide::ff_target(self)
     }
-}
-
-impl PadSink for CombinedSideSink {
-    fn update(
-        &mut self,
-        buttons: u32,
-        sticks: (f32, f32, f32, f32),
-        _triggers: (u8, u8),
-    ) -> io::Result<()> {
-        let gamepad = lock_gamepad(&self.gamepad);
-        let (lx, ly, rx, ry) = sticks;
-        let pressed = |mask: u32| buttons & mask != 0;
-
-        match (self.side, self.horizontal) {
-            (Side::Left, false) => {
-                gamepad.set_abs(AbsoluteAxisType::ABS_X, axis_from_unit(lx));
-                gamepad.set_abs(AbsoluteAxisType::ABS_Y, -axis_from_unit(ly));
-                gamepad.set_abs(AbsoluteAxisType::ABS_HAT0X, hat_x(buttons));
-                gamepad.set_abs(AbsoluteAxisType::ABS_HAT0Y, hat_y(buttons));
-                gamepad.set_key(Key::BTN_SELECT, pressed(button_mask::MINUS));
-                gamepad.set_key(Key::BTN_Z, pressed(button_mask::CAPTURE));
-                gamepad.set_key(Key::BTN_TL, pressed(button_mask::L));
-                gamepad.set_key(Key::BTN_TL2, pressed(button_mask::ZL));
-                gamepad.set_key(Key::BTN_THUMBL, pressed(button_mask::L_STICK_BTN));
-                gamepad.set_abs(
-                    AbsoluteAxisType::ABS_Z,
-                    if pressed(button_mask::ZL) { 255 } else { 0 },
-                );
-            }
-            (Side::Right, false) => {
-                gamepad.set_abs(AbsoluteAxisType::ABS_RX, axis_from_unit(rx));
-                gamepad.set_abs(AbsoluteAxisType::ABS_RY, -axis_from_unit(ry));
-                gamepad.set_key(Key::BTN_SOUTH, pressed(button_mask::A));
-                gamepad.set_key(Key::BTN_EAST, pressed(button_mask::B));
-                gamepad.set_key(Key::BTN_WEST, pressed(button_mask::X));
-                gamepad.set_key(Key::BTN_NORTH, pressed(button_mask::Y));
-                gamepad.set_key(Key::BTN_START, pressed(button_mask::PLUS));
-                gamepad.set_key(Key::BTN_MODE, pressed(button_mask::HOME));
-                gamepad.set_key(Key::BTN_C, pressed(button_mask::C_BTN));
-                gamepad.set_key(Key::BTN_TR, pressed(button_mask::R));
-                gamepad.set_key(Key::BTN_TR2, pressed(button_mask::ZR));
-                gamepad.set_key(Key::BTN_THUMBR, pressed(button_mask::R_STICK_BTN));
-                gamepad.set_abs(
-                    AbsoluteAxisType::ABS_RZ,
-                    if pressed(button_mask::ZR) { 255 } else { 0 },
-                );
-            }
-            (Side::Left, true) => {
-                // Split mode: 90 deg CCW, rail buttons on the bumpers.
-                gamepad.set_abs(AbsoluteAxisType::ABS_X, -axis_from_unit(ly));
-                gamepad.set_abs(AbsoluteAxisType::ABS_Y, -axis_from_unit(lx));
-                gamepad.set_key(Key::BTN_SOUTH, pressed(button_mask::LEFT));
-                gamepad.set_key(Key::BTN_EAST, pressed(button_mask::DOWN));
-                gamepad.set_key(Key::BTN_WEST, pressed(button_mask::UP));
-                gamepad.set_key(Key::BTN_NORTH, pressed(button_mask::RIGHT));
-                gamepad.set_key(Key::BTN_TL, pressed(button_mask::SL_L));
-                gamepad.set_key(Key::BTN_TR, pressed(button_mask::SR_L));
-                gamepad.set_key(
-                    Key::BTN_TL2,
-                    pressed(button_mask::L) || pressed(button_mask::ZL),
-                );
-                gamepad.set_key(Key::BTN_SELECT, pressed(button_mask::MINUS));
-                gamepad.set_key(Key::BTN_START, pressed(button_mask::CAPTURE));
-                gamepad.set_key(Key::BTN_THUMBL, pressed(button_mask::L_STICK_BTN));
-            }
-            (Side::Right, true) => {
-                // Split mode: 90 deg CW.
-                gamepad.set_abs(AbsoluteAxisType::ABS_X, axis_from_unit(ry));
-                gamepad.set_abs(AbsoluteAxisType::ABS_Y, axis_from_unit(rx));
-                gamepad.set_key(Key::BTN_SOUTH, pressed(button_mask::A));
-                gamepad.set_key(Key::BTN_EAST, pressed(button_mask::X));
-                gamepad.set_key(Key::BTN_WEST, pressed(button_mask::B));
-                gamepad.set_key(Key::BTN_NORTH, pressed(button_mask::Y));
-                gamepad.set_key(Key::BTN_TL, pressed(button_mask::SL_R));
-                gamepad.set_key(Key::BTN_TR, pressed(button_mask::SR_R));
-                gamepad.set_key(
-                    Key::BTN_TR2,
-                    pressed(button_mask::R) || pressed(button_mask::ZR),
-                );
-                gamepad.set_key(Key::BTN_START, pressed(button_mask::PLUS));
-                gamepad.set_key(Key::BTN_MODE, pressed(button_mask::HOME));
-                gamepad.set_key(Key::BTN_THUMBL, pressed(button_mask::R_STICK_BTN));
-            }
-        }
-
-        gamepad.sync();
-        Ok(())
-    }
-
-    fn release_all(&mut self) -> io::Result<()> {
-        // A combined node is one physical pad split in two, and the mapper
-        // re-emits on the next report, so neutralising the whole node is safe
-        // and leaves no half-stuck keys behind.
-        let mut gamepad = lock_gamepad(&self.gamepad);
-        gamepad.release_all();
-        Ok(())
-    }
-
-    fn set_player(&mut self, _player: u8) -> io::Result<()> {
-        // The combined node has a fixed identity; per-pad player LEDs are set
-        // on the controller during the connect handshake.
-        Ok(())
-    }
-}
-
-/// `-1.0..=1.0` -> evdev stick value, truncating exactly like
-/// `StickCalibration::apply_scaled_i16`.
-fn axis_from_unit(value: f32) -> i32 {
-    let scaled = value.clamp(-1.0, 1.0) * STICK_MAX as f32;
-    if scaled.is_nan() {
-        0
-    } else {
-        scaled as i32
-    }
-}
-
-fn hat_x(buttons: u32) -> i32 {
-    i32::from(buttons & button_mask::RIGHT != 0) - i32::from(buttons & button_mask::LEFT != 0)
-}
-
-fn hat_y(buttons: u32) -> i32 {
-    i32::from(buttons & button_mask::DOWN != 0) - i32::from(buttons & button_mask::UP != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,7 +1629,7 @@ mod tests {
     use crate::controller::CalibratedInput;
     use crate::hub::Dialer;
     use crate::protocol::advert::{host_field_from_adapter, AdvertInfo, HostBinding};
-    use crate::protocol::constants::{NINTENDO_VENDOR_ID, PRO_CONTROLLER2_PID};
+    use crate::protocol::constants::{button_mask, NINTENDO_VENDOR_ID, PRO_CONTROLLER2_PID};
 
     const PAD: &str = "AA:BB:CC:DD:EE:01";
     const ADAPTER: &str = "AA:BB:CC:DD:EE:FF";

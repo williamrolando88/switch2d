@@ -4,6 +4,7 @@ use evdev::{AbsoluteAxisType, Key};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::gamepad::{PadSink, VirtualGamepad, STICK_MAX};
+use super::mapping::{face_keys, horizontal_dpad_keys, horizontal_face_keys, FaceLayout};
 use crate::protocol::calibration::StickCalibration;
 use crate::protocol::constants::button_mask;
 use crate::protocol::report::InputReport;
@@ -11,11 +12,20 @@ use crate::protocol::report::InputReport;
 /// Coordinates two individual Joy-Cons (Left and Right) into a single virtual gamepad.
 pub struct CombinedJoyConManager {
     gamepad: Arc<VirtualGamepad>,
+    face_layout: FaceLayout,
 }
 
 impl CombinedJoyConManager {
     pub fn new(gamepad: Arc<VirtualGamepad>) -> Self {
-        Self { gamepad }
+        Self {
+            gamepad,
+            face_layout: FaceLayout::Positions,
+        }
+    }
+
+    /// Select the face-button convention (default: physical Nintendo positions).
+    pub fn set_face_layout(&mut self, layout: FaceLayout) {
+        self.face_layout = layout;
     }
 
     /// Process input report from Joy-Con 2 Left.
@@ -29,18 +39,36 @@ impl CombinedJoyConManager {
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_Y, -ly);
 
         // D-Pad Hat
-        changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_HAT0X, report.hat_x());
-        changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_HAT0Y, report.hat_y());
+        changed |= self
+            .gamepad
+            .set_abs(AbsoluteAxisType::ABS_HAT0X, report.hat_x());
+        changed |= self
+            .gamepad
+            .set_abs(AbsoluteAxisType::ABS_HAT0Y, report.hat_y());
 
         // Buttons
-        changed |= self.gamepad.set_key(Key::BTN_SELECT, report.is_pressed(button_mask::MINUS));
-        changed |= self.gamepad.set_key(Key::BTN_Z, report.is_pressed(button_mask::CAPTURE));
-        changed |= self.gamepad.set_key(Key::BTN_TL, report.is_pressed(button_mask::L));
-        changed |= self.gamepad.set_key(Key::BTN_TL2, report.is_pressed(button_mask::ZL));
-        changed |= self.gamepad.set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::L_STICK_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_SELECT, report.is_pressed(button_mask::MINUS));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_Z, report.is_pressed(button_mask::CAPTURE));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TL, report.is_pressed(button_mask::L));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TL2, report.is_pressed(button_mask::ZL));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::L_STICK_BTN));
 
         // Digital trigger axis emulation for ZL
-        let zl_val = if report.is_pressed(button_mask::ZL) { 255 } else { 0 };
+        let zl_val = if report.is_pressed(button_mask::ZL) {
+            255
+        } else {
+            0
+        };
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_Z, zl_val);
 
         if changed {
@@ -58,24 +86,39 @@ impl CombinedJoyConManager {
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_RX, rx);
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_RY, -ry);
 
-        // Face buttons (Nintendo layout to evdev standard diamond)
-        changed |= self.gamepad.set_key(Key::BTN_SOUTH, report.is_pressed(button_mask::A));
-        changed |= self.gamepad.set_key(Key::BTN_EAST, report.is_pressed(button_mask::B));
-        changed |= self.gamepad.set_key(Key::BTN_WEST, report.is_pressed(button_mask::X));
-        changed |= self.gamepad.set_key(Key::BTN_NORTH, report.is_pressed(button_mask::Y));
+        // Face buttons: one shared table (config-selectable convention).
+        for (key, down) in face_keys(self.face_layout, report.buttons) {
+            changed |= self.gamepad.set_key(key, down);
+        }
 
         // System & Menu
-        changed |= self.gamepad.set_key(Key::BTN_START, report.is_pressed(button_mask::PLUS));
-        changed |= self.gamepad.set_key(Key::BTN_MODE, report.is_pressed(button_mask::HOME));
-        changed |= self.gamepad.set_key(Key::BTN_C, report.is_pressed(button_mask::C_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_START, report.is_pressed(button_mask::PLUS));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_MODE, report.is_pressed(button_mask::HOME));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_C, report.is_pressed(button_mask::C_BTN));
 
         // Bumpers & Triggers
-        changed |= self.gamepad.set_key(Key::BTN_TR, report.is_pressed(button_mask::R));
-        changed |= self.gamepad.set_key(Key::BTN_TR2, report.is_pressed(button_mask::ZR));
-        changed |= self.gamepad.set_key(Key::BTN_THUMBR, report.is_pressed(button_mask::R_STICK_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TR, report.is_pressed(button_mask::R));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TR2, report.is_pressed(button_mask::ZR));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_THUMBR, report.is_pressed(button_mask::R_STICK_BTN));
 
         // Digital trigger axis emulation for ZR
-        let zr_val = if report.is_pressed(button_mask::ZR) { 255 } else { 0 };
+        let zr_val = if report.is_pressed(button_mask::ZR) {
+            255
+        } else {
+            0
+        };
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_RZ, zr_val);
 
         if changed {
@@ -96,27 +139,37 @@ impl CombinedJoyConManager {
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_X, h_x);
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_Y, h_y);
 
-        // Face buttons (D-pad cluster rotated 90° CCW):
-        // Bottom (6 o'clock) = Left Arrow  -> BTN_SOUTH (B on Nintendo)
-        // Right  (3 o'clock) = Down Arrow  -> BTN_EAST  (A on Nintendo)
-        // Left   (9 o'clock) = Up Arrow    -> BTN_WEST  (Y on Nintendo)
-        // Top   (12 o'clock) = Right Arrow -> BTN_NORTH (X on Nintendo)
-        changed |= self.gamepad.set_key(Key::BTN_SOUTH, report.is_pressed(button_mask::LEFT));
-        changed |= self.gamepad.set_key(Key::BTN_EAST, report.is_pressed(button_mask::DOWN));
-        changed |= self.gamepad.set_key(Key::BTN_WEST, report.is_pressed(button_mask::UP));
-        changed |= self.gamepad.set_key(Key::BTN_NORTH, report.is_pressed(button_mask::RIGHT));
+        // The left half has no A/B/X/Y: its d-pad becomes the diamond, rotated
+        // 90 deg CCW. The table lives in `uinput::mapping` (position-based, so
+        // the face layout does not apply to a sideways grip).
+        for (key, down) in horizontal_dpad_keys(report.buttons) {
+            changed |= self.gamepad.set_key(key, down);
+        }
 
         // Shoulder bumpers on the rail
-        changed |= self.gamepad.set_key(Key::BTN_TL, report.is_pressed(button_mask::SL_L));
-        changed |= self.gamepad.set_key(Key::BTN_TR, report.is_pressed(button_mask::SR_L));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TL, report.is_pressed(button_mask::SL_L));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TR, report.is_pressed(button_mask::SR_L));
 
         // Outer triggers (for extra flexibility)
-        changed |= self.gamepad.set_key(Key::BTN_TL2, report.is_pressed(button_mask::L) || report.is_pressed(button_mask::ZL));
+        changed |= self.gamepad.set_key(
+            Key::BTN_TL2,
+            report.is_pressed(button_mask::L) || report.is_pressed(button_mask::ZL),
+        );
 
         // System buttons
-        changed |= self.gamepad.set_key(Key::BTN_SELECT, report.is_pressed(button_mask::MINUS));
-        changed |= self.gamepad.set_key(Key::BTN_START, report.is_pressed(button_mask::CAPTURE));
-        changed |= self.gamepad.set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::L_STICK_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_SELECT, report.is_pressed(button_mask::MINUS));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_START, report.is_pressed(button_mask::CAPTURE));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::L_STICK_BTN));
 
         if changed {
             self.gamepad.sync();
@@ -136,27 +189,37 @@ impl CombinedJoyConManager {
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_X, h_x);
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_Y, h_y);
 
-        // Face buttons (ABXY diamond rotated 90° CW):
-        // Bottom (6 o'clock) = Physical A -> BTN_SOUTH (Primary confirm/action)
-        // Right  (3 o'clock) = Physical X -> BTN_EAST  (Secondary action)
-        // Left   (9 o'clock) = Physical B -> BTN_WEST
-        // Top   (12 o'clock) = Physical Y -> BTN_NORTH
-        changed |= self.gamepad.set_key(Key::BTN_SOUTH, report.is_pressed(button_mask::A));
-        changed |= self.gamepad.set_key(Key::BTN_EAST, report.is_pressed(button_mask::X));
-        changed |= self.gamepad.set_key(Key::BTN_WEST, report.is_pressed(button_mask::B));
-        changed |= self.gamepad.set_key(Key::BTN_NORTH, report.is_pressed(button_mask::Y));
+        // Right half held sideways: ABXY diamond rotated 90 deg CW, table in
+        // `uinput::mapping::horizontal_face_keys`. Its own rotation, unaffected
+        // by the face layout.
+        for (key, down) in horizontal_face_keys(report.buttons) {
+            changed |= self.gamepad.set_key(key, down);
+        }
 
         // Shoulder bumpers on the rail
-        changed |= self.gamepad.set_key(Key::BTN_TL, report.is_pressed(button_mask::SL_R));
-        changed |= self.gamepad.set_key(Key::BTN_TR, report.is_pressed(button_mask::SR_R));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TL, report.is_pressed(button_mask::SL_R));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TR, report.is_pressed(button_mask::SR_R));
 
         // Outer triggers (for extra flexibility)
-        changed |= self.gamepad.set_key(Key::BTN_TR2, report.is_pressed(button_mask::R) || report.is_pressed(button_mask::ZR));
+        changed |= self.gamepad.set_key(
+            Key::BTN_TR2,
+            report.is_pressed(button_mask::R) || report.is_pressed(button_mask::ZR),
+        );
 
         // System buttons
-        changed |= self.gamepad.set_key(Key::BTN_START, report.is_pressed(button_mask::PLUS));
-        changed |= self.gamepad.set_key(Key::BTN_MODE, report.is_pressed(button_mask::HOME));
-        changed |= self.gamepad.set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::R_STICK_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_START, report.is_pressed(button_mask::PLUS));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_MODE, report.is_pressed(button_mask::HOME));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::R_STICK_BTN));
 
         if changed {
             self.gamepad.sync();
@@ -182,30 +245,61 @@ impl CombinedJoyConManager {
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_RY, -ry);
 
         // D-Pad
-        changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_HAT0X, report.hat_x());
-        changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_HAT0Y, report.hat_y());
+        changed |= self
+            .gamepad
+            .set_abs(AbsoluteAxisType::ABS_HAT0X, report.hat_x());
+        changed |= self
+            .gamepad
+            .set_abs(AbsoluteAxisType::ABS_HAT0Y, report.hat_y());
 
         // Buttons
-        changed |= self.gamepad.set_key(Key::BTN_SOUTH, report.is_pressed(button_mask::A));
-        changed |= self.gamepad.set_key(Key::BTN_EAST, report.is_pressed(button_mask::B));
-        changed |= self.gamepad.set_key(Key::BTN_WEST, report.is_pressed(button_mask::X));
-        changed |= self.gamepad.set_key(Key::BTN_NORTH, report.is_pressed(button_mask::Y));
+        for (key, down) in face_keys(self.face_layout, report.buttons) {
+            changed |= self.gamepad.set_key(key, down);
+        }
 
-        changed |= self.gamepad.set_key(Key::BTN_TL, report.is_pressed(button_mask::L));
-        changed |= self.gamepad.set_key(Key::BTN_TR, report.is_pressed(button_mask::R));
-        changed |= self.gamepad.set_key(Key::BTN_TL2, report.is_pressed(button_mask::ZL));
-        changed |= self.gamepad.set_key(Key::BTN_TR2, report.is_pressed(button_mask::ZR));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TL, report.is_pressed(button_mask::L));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TR, report.is_pressed(button_mask::R));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TL2, report.is_pressed(button_mask::ZL));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_TR2, report.is_pressed(button_mask::ZR));
 
-        changed |= self.gamepad.set_key(Key::BTN_SELECT, report.is_pressed(button_mask::MINUS));
-        changed |= self.gamepad.set_key(Key::BTN_START, report.is_pressed(button_mask::PLUS));
-        changed |= self.gamepad.set_key(Key::BTN_MODE, report.is_pressed(button_mask::HOME));
-        changed |= self.gamepad.set_key(Key::BTN_Z, report.is_pressed(button_mask::CAPTURE));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_SELECT, report.is_pressed(button_mask::MINUS));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_START, report.is_pressed(button_mask::PLUS));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_MODE, report.is_pressed(button_mask::HOME));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_Z, report.is_pressed(button_mask::CAPTURE));
 
-        changed |= self.gamepad.set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::L_STICK_BTN));
-        changed |= self.gamepad.set_key(Key::BTN_THUMBR, report.is_pressed(button_mask::R_STICK_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_THUMBL, report.is_pressed(button_mask::L_STICK_BTN));
+        changed |= self
+            .gamepad
+            .set_key(Key::BTN_THUMBR, report.is_pressed(button_mask::R_STICK_BTN));
 
-        let zl_val = if report.is_pressed(button_mask::ZL) { 255 } else { 0 };
-        let zr_val = if report.is_pressed(button_mask::ZR) { 255 } else { 0 };
+        let zl_val = if report.is_pressed(button_mask::ZL) {
+            255
+        } else {
+            0
+        };
+        let zr_val = if report.is_pressed(button_mask::ZR) {
+            255
+        } else {
+            0
+        };
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_Z, zl_val);
         changed |= self.gamepad.set_abs(AbsoluteAxisType::ABS_RZ, zr_val);
 
@@ -214,7 +308,6 @@ impl CombinedJoyConManager {
         }
     }
 }
-
 
 /// Which physical half of a combined pair this sink represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +338,7 @@ pub struct PadState {
 pub fn combined_side_state(
     side: Side,
     horizontal: bool,
+    layout: FaceLayout,
     buttons: u32,
     sticks: (f32, f32, f32, f32),
     triggers: (u8, u8),
@@ -255,8 +349,12 @@ pub fn combined_side_state(
 
     match (side, horizontal) {
         (Side::Left, false) => {
-            state.axes.push((AbsoluteAxisType::ABS_X, axis_from_unit(lx)));
-            state.axes.push((AbsoluteAxisType::ABS_Y, -axis_from_unit(ly)));
+            state
+                .axes
+                .push((AbsoluteAxisType::ABS_X, axis_from_unit(lx)));
+            state
+                .axes
+                .push((AbsoluteAxisType::ABS_Y, -axis_from_unit(ly)));
             state
                 .axes
                 .push((AbsoluteAxisType::ABS_HAT0X, hat_x(buttons)));
@@ -266,9 +364,7 @@ pub fn combined_side_state(
             state
                 .keys
                 .push((Key::BTN_SELECT, pressed(button_mask::MINUS)));
-            state
-                .keys
-                .push((Key::BTN_Z, pressed(button_mask::CAPTURE)));
+            state.keys.push((Key::BTN_Z, pressed(button_mask::CAPTURE)));
             state.keys.push((Key::BTN_TL, pressed(button_mask::L)));
             state.keys.push((Key::BTN_TL2, pressed(button_mask::ZL)));
             state
@@ -279,25 +375,22 @@ pub fn combined_side_state(
                 .push((AbsoluteAxisType::ABS_Z, i32::from(triggers.0)));
         }
         (Side::Right, false) => {
-            state.axes.push((AbsoluteAxisType::ABS_RX, axis_from_unit(rx)));
-            state.axes.push((AbsoluteAxisType::ABS_RY, -axis_from_unit(ry)));
             state
-                .keys
-                .push((Key::BTN_SOUTH, pressed(button_mask::A)));
-            state.keys.push((Key::BTN_EAST, pressed(button_mask::B)));
-            state.keys.push((Key::BTN_WEST, pressed(button_mask::X)));
+                .axes
+                .push((AbsoluteAxisType::ABS_RX, axis_from_unit(rx)));
             state
-                .keys
-                .push((Key::BTN_NORTH, pressed(button_mask::Y)));
+                .axes
+                .push((AbsoluteAxisType::ABS_RY, -axis_from_unit(ry)));
+            state.keys.extend(
+                face_keys(layout, buttons)
+                    .into_iter()
+                    .map(|(key, down)| (key, u8::from(down))),
+            );
             state
                 .keys
                 .push((Key::BTN_START, pressed(button_mask::PLUS)));
-            state
-                .keys
-                .push((Key::BTN_MODE, pressed(button_mask::HOME)));
-            state
-                .keys
-                .push((Key::BTN_C, pressed(button_mask::C_BTN)));
+            state.keys.push((Key::BTN_MODE, pressed(button_mask::HOME)));
+            state.keys.push((Key::BTN_C, pressed(button_mask::C_BTN)));
             state.keys.push((Key::BTN_TR, pressed(button_mask::R)));
             state.keys.push((Key::BTN_TR2, pressed(button_mask::ZR)));
             state
@@ -309,18 +402,17 @@ pub fn combined_side_state(
         }
         (Side::Left, true) => {
             // Split mode: 90 deg CCW, rail buttons on the bumpers.
-            state.axes.push((AbsoluteAxisType::ABS_X, -axis_from_unit(ly)));
-            state.axes.push((AbsoluteAxisType::ABS_Y, -axis_from_unit(lx)));
             state
-                .keys
-                .push((Key::BTN_SOUTH, pressed(button_mask::LEFT)));
+                .axes
+                .push((AbsoluteAxisType::ABS_X, -axis_from_unit(ly)));
             state
-                .keys
-                .push((Key::BTN_EAST, pressed(button_mask::DOWN)));
-            state.keys.push((Key::BTN_WEST, pressed(button_mask::UP)));
-            state
-                .keys
-                .push((Key::BTN_NORTH, pressed(button_mask::RIGHT)));
+                .axes
+                .push((AbsoluteAxisType::ABS_Y, -axis_from_unit(lx)));
+            state.keys.extend(
+                horizontal_dpad_keys(buttons)
+                    .into_iter()
+                    .map(|(key, down)| (key, u8::from(down))),
+            );
             state.keys.push((Key::BTN_TL, pressed(button_mask::SL_L)));
             state.keys.push((Key::BTN_TR, pressed(button_mask::SR_L)));
             state.keys.push((
@@ -339,16 +431,17 @@ pub fn combined_side_state(
         }
         (Side::Right, true) => {
             // Split mode: 90 deg CW.
-            state.axes.push((AbsoluteAxisType::ABS_X, axis_from_unit(ry)));
-            state.axes.push((AbsoluteAxisType::ABS_Y, axis_from_unit(rx)));
             state
-                .keys
-                .push((Key::BTN_SOUTH, pressed(button_mask::A)));
-            state.keys.push((Key::BTN_EAST, pressed(button_mask::X)));
-            state.keys.push((Key::BTN_WEST, pressed(button_mask::B)));
+                .axes
+                .push((AbsoluteAxisType::ABS_X, axis_from_unit(ry)));
             state
-                .keys
-                .push((Key::BTN_NORTH, pressed(button_mask::Y)));
+                .axes
+                .push((AbsoluteAxisType::ABS_Y, axis_from_unit(rx)));
+            state.keys.extend(
+                horizontal_face_keys(buttons)
+                    .into_iter()
+                    .map(|(key, down)| (key, u8::from(down))),
+            );
             state.keys.push((Key::BTN_TL, pressed(button_mask::SL_R)));
             state.keys.push((Key::BTN_TR, pressed(button_mask::SR_R)));
             state.keys.push((
@@ -358,9 +451,7 @@ pub fn combined_side_state(
             state
                 .keys
                 .push((Key::BTN_START, pressed(button_mask::PLUS)));
-            state
-                .keys
-                .push((Key::BTN_MODE, pressed(button_mask::HOME)));
+            state.keys.push((Key::BTN_MODE, pressed(button_mask::HOME)));
             state
                 .keys
                 .push((Key::BTN_THUMBL, pressed(button_mask::R_STICK_BTN)));
@@ -377,6 +468,7 @@ pub struct CombinedSide {
     gamepad: Arc<Mutex<VirtualGamepad>>,
     side: Side,
     horizontal: bool,
+    face_layout: FaceLayout,
 }
 
 impl CombinedSide {
@@ -385,7 +477,23 @@ impl CombinedSide {
             gamepad: pad,
             side,
             horizontal,
+            face_layout: FaceLayout::Positions,
         }
+    }
+
+    /// Select the face-button convention (default: physical Nintendo positions).
+    pub fn set_face_layout(&mut self, layout: FaceLayout) {
+        self.face_layout = layout;
+    }
+
+    /// Shared node force-feedback queue (either half may drain it).
+    pub fn poll_ff(&mut self) -> std::io::Result<Vec<super::ff::FfEvent>> {
+        lock_gamepad(&self.gamepad).poll_ff()
+    }
+
+    /// Current gained rumble target of the shared node.
+    pub fn ff_target(&self) -> (u16, u16) {
+        lock_gamepad(&self.gamepad).ff_target()
     }
 }
 
@@ -404,7 +512,14 @@ impl PadSink for CombinedSide {
     ) -> std::io::Result<()> {
         // Single source of truth: the pure mapping below is exactly what the
         // tests exercise. Apply only, then flush once like the daemon did.
-        let state = combined_side_state(self.side, self.horizontal, buttons, sticks, triggers);
+        let state = combined_side_state(
+            self.side,
+            self.horizontal,
+            self.face_layout,
+            buttons,
+            sticks,
+            triggers,
+        );
         let gamepad = lock_gamepad(&self.gamepad);
 
         for (axis, value) in state.axes {
@@ -490,7 +605,8 @@ mod tests {
     fn combined_side_left_matches_legacy_rotation() {
         let sticks = (0.25, -0.5, 0.0, 0.0);
 
-        let normal = combined_side_state(Side::Left, false, 0, sticks, (0, 0));
+        let normal =
+            combined_side_state(Side::Left, false, FaceLayout::Positions, 0, sticks, (0, 0));
         let axes = axis_map(&normal);
         assert_eq!(
             axes.get(&AbsoluteAxisType::ABS_X.0),
@@ -502,7 +618,8 @@ mod tests {
             "normal left keeps the -ly inversion"
         );
 
-        let horizontal = combined_side_state(Side::Left, true, 0, sticks, (0, 0));
+        let horizontal =
+            combined_side_state(Side::Left, true, FaceLayout::Positions, 0, sticks, (0, 0));
         let axes = axis_map(&horizontal);
         assert_eq!(
             axes.get(&AbsoluteAxisType::ABS_X.0),
@@ -520,7 +637,8 @@ mod tests {
     fn combined_side_right_matches_legacy_rotation() {
         let sticks = (0.0, 0.0, 0.75, -0.25);
 
-        let normal = combined_side_state(Side::Right, false, 0, sticks, (0, 0));
+        let normal =
+            combined_side_state(Side::Right, false, FaceLayout::Positions, 0, sticks, (0, 0));
         let axes = axis_map(&normal);
         assert_eq!(
             axes.get(&AbsoluteAxisType::ABS_RX.0),
@@ -532,7 +650,8 @@ mod tests {
             "normal right keeps the -ry inversion"
         );
 
-        let horizontal = combined_side_state(Side::Right, true, 0, sticks, (0, 0));
+        let horizontal =
+            combined_side_state(Side::Right, true, FaceLayout::Positions, 0, sticks, (0, 0));
         let axes = axis_map(&horizontal);
         assert_eq!(
             axes.get(&AbsoluteAxisType::ABS_X.0),
@@ -550,7 +669,14 @@ mod tests {
     fn horizontal_mode_applies_the_90_degree_rotation_for_both_sides() {
         let sticks = (0.4, -0.3, 0.2, 0.6);
 
-        let left = axis_map(&combined_side_state(Side::Left, true, 0, sticks, (0, 0)));
+        let left = axis_map(&combined_side_state(
+            Side::Left,
+            true,
+            FaceLayout::Positions,
+            0,
+            sticks,
+            (0, 0),
+        ));
         assert_eq!(
             left.get(&AbsoluteAxisType::ABS_X.0),
             Some(&axis_from_unit(0.3))
@@ -560,7 +686,14 @@ mod tests {
             Some(&-axis_from_unit(0.4))
         );
 
-        let right = axis_map(&combined_side_state(Side::Right, true, 0, sticks, (0, 0)));
+        let right = axis_map(&combined_side_state(
+            Side::Right,
+            true,
+            FaceLayout::Positions,
+            0,
+            sticks,
+            (0, 0),
+        ));
         assert_eq!(
             right.get(&AbsoluteAxisType::ABS_X.0),
             Some(&axis_from_unit(0.6))
@@ -581,6 +714,7 @@ mod tests {
         let left = combined_side_state(
             Side::Left,
             false,
+            FaceLayout::Positions,
             bm::ZL | bm::RIGHT | bm::UP,
             NEUTRAL,
             (255, 255),
@@ -593,6 +727,7 @@ mod tests {
         let right = combined_side_state(
             Side::Right,
             false,
+            FaceLayout::Positions,
             bm::ZR | bm::LEFT | bm::DOWN,
             NEUTRAL,
             (255, 255),
@@ -603,10 +738,24 @@ mod tests {
 
     #[test]
     fn partial_analog_trigger_reaches_the_axis() {
-        let left = combined_side_state(Side::Left, false, 0, NEUTRAL, (128, 200));
+        let left = combined_side_state(
+            Side::Left,
+            false,
+            FaceLayout::Positions,
+            0,
+            NEUTRAL,
+            (128, 200),
+        );
         assert_eq!(axis_map(&left).get(&AbsoluteAxisType::ABS_Z.0), Some(&128));
 
-        let right = combined_side_state(Side::Right, false, 0, NEUTRAL, (128, 200));
+        let right = combined_side_state(
+            Side::Right,
+            false,
+            FaceLayout::Positions,
+            0,
+            NEUTRAL,
+            (128, 200),
+        );
         assert_eq!(
             axis_map(&right).get(&AbsoluteAxisType::ABS_RZ.0),
             Some(&200)
@@ -615,10 +764,24 @@ mod tests {
 
     #[test]
     fn digital_zl_still_arrives_as_full_scale() {
-        let left = combined_side_state(Side::Left, false, bm::ZL | bm::ZR, NEUTRAL, (255, 255));
+        let left = combined_side_state(
+            Side::Left,
+            false,
+            FaceLayout::Positions,
+            bm::ZL | bm::ZR,
+            NEUTRAL,
+            (255, 255),
+        );
         assert_eq!(axis_map(&left).get(&AbsoluteAxisType::ABS_Z.0), Some(&255));
 
-        let right = combined_side_state(Side::Right, false, bm::ZL | bm::ZR, NEUTRAL, (255, 255));
+        let right = combined_side_state(
+            Side::Right,
+            false,
+            FaceLayout::Positions,
+            bm::ZL | bm::ZR,
+            NEUTRAL,
+            (255, 255),
+        );
         assert_eq!(
             axis_map(&right).get(&AbsoluteAxisType::ABS_RZ.0),
             Some(&255)
@@ -628,7 +791,8 @@ mod tests {
     #[test]
     fn horizontal_mapping_still_has_no_trigger_axis() {
         for side in [Side::Left, Side::Right] {
-            let state = combined_side_state(side, true, 0, NEUTRAL, (128, 200));
+            let state =
+                combined_side_state(side, true, FaceLayout::Positions, 0, NEUTRAL, (128, 200));
             let axes = axis_map(&state);
             assert!(!axes.contains_key(&AbsoluteAxisType::ABS_Z.0));
             assert!(!axes.contains_key(&AbsoluteAxisType::ABS_RZ.0));
@@ -639,7 +803,14 @@ mod tests {
     fn keys_are_the_same_set_as_the_direct_gamepad_mapping() {
         // Direct VirtualGamepad::update sets these keys for a left-side mask.
         let left_mask = bm::MINUS | bm::CAPTURE | bm::L | bm::ZL | bm::L_STICK_BTN;
-        let left = combined_side_state(Side::Left, false, left_mask, NEUTRAL, (0, 0));
+        let left = combined_side_state(
+            Side::Left,
+            false,
+            FaceLayout::Positions,
+            left_mask,
+            NEUTRAL,
+            (0, 0),
+        );
         let expected_left: BTreeSet<u16> = [
             Key::BTN_SELECT,
             Key::BTN_Z,
@@ -665,7 +836,14 @@ mod tests {
             | bm::R
             | bm::ZR
             | bm::R_STICK_BTN;
-        let right = combined_side_state(Side::Right, false, right_mask, NEUTRAL, (0, 0));
+        let right = combined_side_state(
+            Side::Right,
+            false,
+            FaceLayout::Positions,
+            right_mask,
+            NEUTRAL,
+            (0, 0),
+        );
         let expected_right: BTreeSet<u16> = [
             Key::BTN_SOUTH,
             Key::BTN_EAST,
@@ -690,5 +868,30 @@ mod tests {
         // gamepad mapper (which always sets the full side's key set).
         assert_eq!(key_map(&left).len(), expected_left.len());
         assert_eq!(key_map(&right).len(), expected_right.len());
+    }
+
+    #[test]
+    fn combined_side_vertical_right_follows_the_face_layout() {
+        let positions = combined_side_state(
+            Side::Right,
+            false,
+            FaceLayout::Positions,
+            bm::A,
+            NEUTRAL,
+            (0, 0),
+        );
+        let labels = combined_side_state(
+            Side::Right,
+            false,
+            FaceLayout::Labels,
+            bm::A,
+            NEUTRAL,
+            (0, 0),
+        );
+
+        assert!(pressed_keys(&positions).contains(&Key::BTN_EAST.0));
+        assert!(!pressed_keys(&positions).contains(&Key::BTN_SOUTH.0));
+        assert!(pressed_keys(&labels).contains(&Key::BTN_SOUTH.0));
+        assert!(!pressed_keys(&labels).contains(&Key::BTN_EAST.0));
     }
 }

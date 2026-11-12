@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+
+use crate::uinput::FaceLayout;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -80,6 +82,33 @@ pub struct DaemonConfig {
         deserialize_with = "deserialize_stick_deadzone"
     )]
     pub stick_deadzone: u16,
+    /// Face-button convention for the uinput nodes (`positions` default).
+    ///
+    /// Tolerant: an unknown string warns and falls back to the default instead
+    /// of failing the whole config load.
+    #[serde(default, deserialize_with = "deserialize_face_layout")]
+    pub face_button_layout: FaceLayout,
+}
+
+fn deserialize_face_layout<'de, D>(deserializer: D) -> Result<FaceLayout, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Same tolerant shape as `stick_deadzone`: the file is JSON, and a
+    // wrong-typed value must not fail the whole config load.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_str().and_then(FaceLayout::from_name) {
+        Some(layout) => layout,
+        None => {
+            if !value.is_null() {
+                tracing::warn!(
+                    "Unknown face_button_layout {}; using positions (valid: positions, labels)",
+                    value
+                );
+            }
+            FaceLayout::Positions
+        }
+    })
 }
 
 fn default_idle_sleep() -> u64 {
@@ -94,6 +123,7 @@ impl Default for DaemonConfig {
             controllers: Vec::new(),
             idle_sleep_seconds: 300,
             stick_deadzone: DEFAULT_STICK_DEADZONE,
+            face_button_layout: FaceLayout::Positions,
         }
     }
 }
@@ -154,8 +184,16 @@ impl DaemonConfig {
 
         if let Some(ctrls) = v.get("controllers").and_then(|c| c.as_array()) {
             for c in ctrls {
-                let mac = c.get("mac").and_then(|m| m.as_str()).unwrap_or("").to_string();
-                let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("Switch 2 Controller").to_string();
+                let mac = c
+                    .get("mac")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = c
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("Switch 2 Controller")
+                    .to_string();
                 let player = c.get("player").and_then(|p| p.as_u64()).unwrap_or(1) as u8;
 
                 // Guess PID from name
@@ -186,6 +224,7 @@ impl DaemonConfig {
             controllers,
             idle_sleep_seconds: 300,
             stick_deadzone: DEFAULT_STICK_DEADZONE,
+            face_button_layout: FaceLayout::Positions,
         })
     }
 
@@ -201,7 +240,11 @@ impl DaemonConfig {
     }
 
     pub fn add_or_update_controller(&mut self, controller: BondedController) {
-        if let Some(existing) = self.controllers.iter_mut().find(|c| c.mac.eq_ignore_ascii_case(&controller.mac)) {
+        if let Some(existing) = self
+            .controllers
+            .iter_mut()
+            .find(|c| c.mac.eq_ignore_ascii_case(&controller.mac))
+        {
             *existing = controller;
         } else {
             self.controllers.push(controller);

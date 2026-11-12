@@ -108,6 +108,8 @@ pub struct VirtualGamepad {
     last_abs: Mutex<HashMap<u16, i32>>,
     ff: FfState,
     player: u8,
+    /// Face-button convention (A/B/X/Y -> evdev slots).
+    face_layout: super::mapping::FaceLayout,
     pub name: String,
 }
 
@@ -157,6 +159,7 @@ impl VirtualGamepad {
             last_abs: Mutex::new(HashMap::new()),
             ff: FfState::new(),
             player: 0,
+            face_layout: super::mapping::FaceLayout::Positions,
             name: name.to_string(),
         })
     }
@@ -328,6 +331,11 @@ impl VirtualGamepad {
         self.player
     }
 
+    /// Select the face-button convention (default: physical Nintendo positions).
+    pub fn set_face_layout(&mut self, layout: super::mapping::FaceLayout) {
+        self.face_layout = layout;
+    }
+
     /// Flush a frame with a single SYN_REPORT.
     pub fn sync(&self) {
         let _ = self.device.emit(&[RawInputEvent::new(
@@ -387,10 +395,10 @@ impl PadSink for VirtualGamepad {
         self.set_abs(AbsoluteAxisType::ABS_RZ, i32::from(rt));
 
         let pressed = |mask: u32| buttons & mask != 0;
-        self.set_key(Key::BTN_SOUTH, pressed(button_mask::A));
-        self.set_key(Key::BTN_EAST, pressed(button_mask::B));
-        self.set_key(Key::BTN_WEST, pressed(button_mask::X));
-        self.set_key(Key::BTN_NORTH, pressed(button_mask::Y));
+        // One table for the whole crate: A/B/X/Y -> evdev slots.
+        for (key, down) in super::mapping::face_keys(self.face_layout, buttons) {
+            self.set_key(key, down);
+        }
         self.set_key(Key::BTN_TL, pressed(button_mask::L));
         self.set_key(Key::BTN_TR, pressed(button_mask::R));
         self.set_key(Key::BTN_TL2, pressed(button_mask::ZL));
@@ -595,7 +603,10 @@ mod tests {
 
         let device = find_device(&name);
         let keys = device.get_key_state().unwrap();
-        assert!(keys.contains(Key::BTN_SOUTH), "A maps to BTN_SOUTH");
+        assert!(
+            keys.contains(Key::BTN_EAST),
+            "A maps to BTN_EAST in the default physical-positions layout"
+        );
         assert_eq!(keys.iter().count(), 1, "only A is held");
 
         let abs = device.get_abs_state().unwrap();
