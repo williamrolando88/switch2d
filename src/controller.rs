@@ -215,6 +215,9 @@ where
     }
 }
 
+/// Total time budget for the LE create-connection (both address types).
+const L2CAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Request the legacy 247-byte MTU and insist it can carry a full report.
 fn negotiate_mtu(att: &AttClient, requested: u16) -> io::Result<u16> {
     let mtu = att.exchange_mtu(requested)?;
@@ -286,12 +289,25 @@ impl SwitchController {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid adapter MAC"))?;
 
         info!("Connecting to Switch 2 controller {}...", mac);
-        let socket = L2capSocket::create()?;
-        socket.bind(adapter_le)?;
 
-        // Attempt connect (tries LE_PUBLIC then LE_RANDOM)
-        let addr_type = socket.connect_le(dest_le, Duration::from_secs(8))?;
-        info!("L2CAP link established with {} (type: {})", mac, addr_type);
+        // Legacy order: LE_PUBLIC then LE_RANDOM, each with a **fresh socket**
+        // (`bridge.py:436-474`). A socket whose connect(2) failed is poisoned,
+        // so retrying on it would only ever yield EINVAL and hide the real
+        // failure of the first attempt.
+        let (socket, addr_type) =
+            L2capSocket::connect_new(adapter_le, dest_le, L2CAP_CONNECT_TIMEOUT).map_err(
+                |err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!("connect to {mac} via adapter {adapter_mac}: {err}"),
+                    )
+                },
+            )?;
+        info!(
+            "L2CAP link established with {} (type: {})",
+            mac,
+            crate::bluetooth::l2cap::address_type_name(addr_type)
+        );
 
         let att = AttClient::new(socket);
 

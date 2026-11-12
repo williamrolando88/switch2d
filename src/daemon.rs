@@ -1,5 +1,6 @@
 //! Central daemon orchestrating multiple controller connections and virtual gamepad lifecycle.
 
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use crate::bluetooth::scan::{ScanControl, ShellScanControl};
 use crate::config::{DaemonConfig, DaemonMode};
 use crate::controller::{BondPolicy, ConnectOptions, SwitchController};
 use crate::protocol::constants::*;
@@ -82,6 +84,12 @@ impl Daemon {
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
+                        // HANDOVER Bug 3: stop discovery *per attempt*, not once
+                        // at startup — another app (decky, a stray bluetoothctl,
+                        // BlueZ itself) can restart scanning at any time, and a
+                        // live LE scan makes create-connection fail (ENOSYS).
+                        // Task 09B moves this into the hub.
+                        let discovery_note = stop_discovery_for_connect(&mac_str);
                         SwitchController::connect_with(
                             &mac_str,
                             &adapter_str,
@@ -103,6 +111,12 @@ impl Daemon {
                                 }
                             }),
                         )
+                        .map_err(|err| {
+                            io::Error::new(
+                                err.kind(),
+                                format!("{err} [discovery_stop: {discovery_note}]"),
+                            )
+                        })
                     }).await;
 
                     // Release connect lock regardless of success or failure
@@ -116,8 +130,8 @@ impl Daemon {
                             }
                             warn!("Controller {} disconnected.", ctrl_cfg.mac);
                         }
-                        Ok(Err(_e)) => {
-                            trace_or_debug(&ctrl_cfg.mac);
+                        Ok(Err(e)) => {
+                            log_connect_failure(&ctrl_cfg.mac, &e);
                             sleep(Duration::from_millis(1500)).await;
                         }
                         Err(e) => {
@@ -171,6 +185,10 @@ impl Daemon {
                     let res = tokio::task::spawn_blocking(move || {
                         let is_l = is_left;
                         let mgr_for_cb = mgr_cb.clone();
+                        // HANDOVER Bug 3: discovery stops per connect attempt
+                        // (see the combined-mode branch; 09B centralises this in
+                        // the hub, which is the only dialer).
+                        let discovery_note = stop_discovery_for_connect(&mac_str);
                         SwitchController::connect_with(
                             &mac_str,
                             &adapter_str,
@@ -190,6 +208,12 @@ impl Daemon {
                                 }
                             }),
                         )
+                        .map_err(|err| {
+                            io::Error::new(
+                                err.kind(),
+                                format!("{err} [discovery_stop: {discovery_note}]"),
+                            )
+                        })
                     }).await;
 
                     drop(conn_permit);
@@ -202,7 +226,8 @@ impl Daemon {
                             }
                             warn!("Controller {} disconnected.", ctrl_cfg.mac);
                         }
-                        Ok(Err(_)) => {
+                        Ok(Err(e)) => {
+                            log_connect_failure(&ctrl_cfg.mac, &e);
                             sleep(Duration::from_millis(1500)).await;
                         }
                         Err(e) => {
@@ -224,6 +249,42 @@ impl Daemon {
     }
 }
 
-fn trace_or_debug(mac: &str) {
-    tracing::debug!("Waiting for {} to advertise...", mac);
+/// Stop all Bluetooth discovery before an LE create-connection (HANDOVER
+/// Bug 3, TEST_RESULTS.md finding 3/4). Best effort: failures are reported in
+/// the connect error text, never fatal.
+fn stop_discovery_for_connect(mac: &str) -> String {
+    match ShellScanControl::from_env().prepare_global() {
+        Ok(()) => "ok".to_string(),
+        Err(err) => {
+            warn!("Could not stop Bluetooth discovery before connecting {mac}: {err}");
+            format!("failed: {err}")
+        }
+    }
+}
+
+/// Log a failed connect attempt: the first failure for a pad is a warning with
+/// the full diagnostic (MAC, both address types, both OS errors, discovery
+/// outcome); later retries drop to debug so a parked/unreachable pad does not
+/// spam the log.
+fn log_connect_failure(mac: &str, err: &std::io::Error) {
+    use std::sync::atomic::AtomicBool;
+    static WARNED: [AtomicBool; 8] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    // Cheap per-MAC slot: last hex digit of the MAC.
+    let slot = mac.chars().last().and_then(|c| c.to_digit(16)).unwrap_or(0);
+    let slot = (slot as usize) % WARNED.len();
+
+    if !WARNED[slot].swap(true, Ordering::Relaxed) {
+        warn!("Connect to {mac} failed: {err}");
+    } else {
+        tracing::debug!("Connect to {mac} failed (retrying): {err}");
+    }
 }

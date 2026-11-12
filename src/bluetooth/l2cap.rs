@@ -14,6 +14,24 @@ pub const ATT_CID: u16 = 4;
 pub const BDADDR_LE_PUBLIC: u8 = 1;
 pub const BDADDR_LE_RANDOM: u8 = 2;
 
+/// Address types in legacy attempt order: public first, then random
+/// (`bridge.py:436-474`).
+pub const ADDRESS_TYPES: [u8; 2] = [BDADDR_LE_PUBLIC, BDADDR_LE_RANDOM];
+
+/// The ordered address types a connect attempt walks.
+pub fn address_type_order() -> [u8; 2] {
+    ADDRESS_TYPES
+}
+
+/// Human-readable address type for diagnostics.
+pub fn address_type_name(addr_type: u8) -> &'static str {
+    match addr_type {
+        BDADDR_LE_PUBLIC => "LE_PUBLIC",
+        BDADDR_LE_RANDOM => "LE_RANDOM",
+        _ => "unknown",
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SockaddrL2 {
@@ -36,6 +54,19 @@ impl SockaddrL2 {
             _pad: 0,
         }
     }
+}
+
+/// `L2CAP connect failed (LE_PUBLIC: <err>; LE_RANDOM: <err>)`.
+///
+/// Kept as a pure function so the diagnostic contract is unit-testable without
+/// a Bluetooth adapter.
+fn format_connect_failure(failures: &[(u8, String)]) -> String {
+    let detail = failures
+        .iter()
+        .map(|(addr_type, err)| format!("{}: {}", address_type_name(*addr_type), err))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("L2CAP connect failed ({detail})")
 }
 
 pub struct L2capSocket {
@@ -87,7 +118,11 @@ impl L2capSocket {
     }
 
     /// Non-blocking connect with timeout to remote device MAC.
-    pub fn connect_timeout(
+    ///
+    /// Private on purpose: a failed `connect(2)` poisons the socket (later
+    /// attempts fail with `EINVAL`), so the only public entry point is
+    /// [`L2capSocket::connect_new`], which builds a fresh socket per attempt.
+    fn connect_timeout(
         &self,
         dest_mac_le: [u8; 6],
         dst_type: u8,
@@ -165,27 +200,53 @@ impl L2capSocket {
         Ok(())
     }
 
-    /// Try connecting with LE_PUBLIC, then fallback to LE_RANDOM.
-    pub fn connect_le(
-        &self,
+    /// Connect to `dest_mac_le`, trying LE_PUBLIC then LE_RANDOM, with a
+    /// **fresh socket (and bind) for every address type**.
+    ///
+    /// Legacy rebuilt the whole `SwitchController` per attempt
+    /// (`bridge.py:436-474`). A socket whose `connect(2)` failed cannot be
+    /// reused: Linux returns `EINVAL` immediately on any later connect, so a
+    /// retry on the same fd both never reaches the controller and masks the
+    /// real error of the first attempt.
+    ///
+    /// Returns the connected socket plus the address type that worked. On total
+    /// failure the error names every attempt and its OS error.
+    pub fn connect_new(
+        adapter_mac_le: [u8; 6],
         dest_mac_le: [u8; 6],
         timeout: Duration,
-    ) -> std::io::Result<u8> {
-        let per_try = timeout / 2;
-        debug!("Attempting L2CAP connect with BDADDR_LE_PUBLIC...");
-        match self.connect_timeout(dest_mac_le, BDADDR_LE_PUBLIC, per_try) {
-            Ok(()) => Ok(BDADDR_LE_PUBLIC),
-            Err(e_pub) => {
-                debug!("LE_PUBLIC connect failed ({}), trying BDADDR_LE_RANDOM...", e_pub);
-                match self.connect_timeout(dest_mac_le, BDADDR_LE_RANDOM, per_try) {
-                    Ok(()) => Ok(BDADDR_LE_RANDOM),
-                    Err(e_rnd) => Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("L2CAP connect failed (pub: {}, rnd: {})", e_pub, e_rnd),
-                    )),
+    ) -> std::io::Result<(Self, u8)> {
+        let per_try = timeout / ADDRESS_TYPES.len() as u32;
+        let mut failures: Vec<(u8, String)> = Vec::with_capacity(ADDRESS_TYPES.len());
+
+        for addr_type in ADDRESS_TYPES {
+            // Fresh socket per attempt, dropped (closed) on failure: the
+            // poisoned fd is never touched again.
+            let socket = Self::create()?;
+            socket.bind(adapter_mac_le)?;
+
+            debug!(
+                "Attempting L2CAP connect (type {}, {:02X?})...",
+                address_type_name(addr_type),
+                dest_mac_le
+            );
+            match socket.connect_timeout(dest_mac_le, addr_type, per_try) {
+                Ok(()) => return Ok((socket, addr_type)),
+                Err(err) => {
+                    debug!(
+                        "L2CAP connect with {} failed: {}",
+                        address_type_name(addr_type),
+                        err
+                    );
+                    failures.push((addr_type, err.to_string()));
                 }
             }
         }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format_connect_failure(&failures),
+        ))
     }
 
     pub fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
@@ -230,5 +291,60 @@ impl L2capSocket {
 impl AsRawFd for L2capSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_type_order_is_public_then_random() {
+        assert_eq!(address_type_order(), [BDADDR_LE_PUBLIC, BDADDR_LE_RANDOM]);
+        assert_eq!(address_type_name(BDADDR_LE_PUBLIC), "LE_PUBLIC");
+        assert_eq!(address_type_name(BDADDR_LE_RANDOM), "LE_RANDOM");
+        assert_eq!(address_type_name(0xFF), "unknown");
+    }
+
+    #[test]
+    fn connect_failure_error_names_every_attempt() {
+        // The exact shape of the hardware failure that blocked the test round:
+        // ENOSYS from the kernel's bt_to_errno for a refused LE connect, then
+        // EINVAL from the poisoned-fd reuse.
+        let text = format_connect_failure(&[
+            (
+                BDADDR_LE_PUBLIC,
+                "Function not implemented (os error 38)".to_string(),
+            ),
+            (
+                BDADDR_LE_RANDOM,
+                "Invalid argument (os error 22)".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            text,
+            concat!(
+                "L2CAP connect failed (LE_PUBLIC: Function not implemented (os error 38); ",
+                "LE_RANDOM: Invalid argument (os error 22))"
+            )
+        );
+        assert!(text.contains("LE_PUBLIC"));
+        assert!(text.contains("LE_RANDOM"));
+        assert!(text.contains("os error 38"));
+        assert!(text.contains("os error 22"));
+    }
+
+    #[test]
+    fn only_connect_path_returns_a_fresh_connected_socket() {
+        // `connect_new` is the only public connect API: it creates, binds and
+        // connects a new socket per address type and hands back the connected
+        // one. There is no `&self` connect method left, so a socket whose
+        // connect(2) failed can never be retried (Linux would answer EINVAL on
+        // every later attempt). This function-pointer assertion pins the
+        // signature at compile time.
+        let connect: fn([u8; 6], [u8; 6], Duration) -> std::io::Result<(L2capSocket, u8)> =
+            L2capSocket::connect_new;
+        let _ = connect;
     }
 }
