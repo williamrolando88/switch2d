@@ -378,3 +378,52 @@ Two structural notes, so a future reader does not mistake them for regressions:
 * **Non-goals from HANDOVER, tracked but not yet actioned:** the `< 5 MB` RSS target is
   unmeasured (no measurement harness yet), and user-facing console text must use Fish shell
   syntax — relevant when `main.rs` output is revisited, note it in the CLI task.
+
+---
+
+## 10. Task 09 design — daemon wiring (hub thread + per-pad workers)
+
+The hub is synchronous, spawns processes and sleeps, so it runs on its **own OS thread**, not
+a tokio task. Workers are async tasks. They talk over channels; neither owns the other.
+
+```
+main (tokio)
+ ├─ supervisor task      : 1.5 s tick -> led-players override, status.json publish
+ ├─ Hub thread (std)     : poll_once / dial_pending, owns ScanControl + AdvertSource
+ │      └─ Dialer::dial  : controller::connect_with(...) (blocking, up to ~25 s worst case)
+ │            └─ sends SwitchController over per-pad mpsc to the worker
+ └─ worker task per pad  : owns uinput pad, calibration, rumble, idle sleep, DSU slot
+        └─ AttClient reader thread -> try_send(report) on a bounded(64) channel
+```
+
+### Invariants this shape preserves
+* **One dialer.** Only the hub thread calls `connect_with`, so two LE create-connections are
+  impossible (HANDOVER Bug 2) and no `connect_lock` is needed in worker code.
+* **Reader thread never blocks.** Its notification handler does exactly one `try_send`; a full
+  channel drops the frame and increments a counter (logged once per second), which keeps
+  command-response notifications flowing (analysis §5.6, §7.3).
+* **Workers never dial.** They wait on the channel; when the controller is dropped and the link
+  dies, the worker calls `hub`-side nothing — it reports `mark_disconnected` via a channel to
+  the supervisor, and the hub re-arms the pad (`register_known`).
+* **Node survives sessions.** Teardown does `release_all()` + rumble stop and keeps the uinput
+  node; only daemon shutdown closes nodes, and it stops rumble *before* clearing the callback
+  (deviation 6).
+
+### Sequencing rules that are easy to get wrong
+1. `mark_connected` on session activate, `mark_disconnected` on teardown, `register_known` at
+   startup and whenever config changes. Never infer connection state from adverts (task 06C).
+2. Hub errors are `warn` + backoff (250 ms → 2 s, capped), never fatal: `poll_once` returns
+   `Err` when `StartDiscovery` or `busctl` fails, and that must not kill the thread.
+3. Dial success must reach the worker *before* the hub returns to polling, otherwise the pad
+   advertises again during the gap and a second dial is queued for a pad that is already up.
+4. Idle sleep uses button-mask changes only (§7.3) and must call `controller.sleep()` (which
+   waits ≤1 s for the HCI-state reply, task 05) before dropping the session.
+5. `status.json` is published from the supervisor's 1.5 s tick *and* on every activate and
+   teardown; the publisher is the only writer.
+
+### Splitting
+| Task | Contents | Testable without hardware |
+|---|---|---|
+| 09A | `worker.rs`: channel-driven session, uinput mapping, `release_all()`, idle sleep | yes, with a fake input source |
+| 09B | `daemon.rs` rewrite: hub thread, supervisor, status wiring, CLI `run`, adapter auto-detect | partly |
+| 09C | `led-players.json` override feeding LED + DSU slot + gamepad name (ADR-4) | yes, pure resolver |
