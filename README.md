@@ -288,7 +288,11 @@ likely thing to find here, because that path has been rewritten most.
 
 ### Round 2
 
-The current plan is [`docs/TEST_PLAN_ROUND3.md`](docs/TEST_PLAN_ROUND3.md): round 2
+The current plan is [`docs/TEST_PLAN_ROUND5.md`](docs/TEST_PLAN_ROUND5.md): the daemon
+with both pads, end to end. Earlier rounds: [`ROUND4`](docs/TEST_PLAN_ROUND4.md),
+[`ROUND3`](docs/TEST_PLAN_ROUND3.md), [`ROUND2`](docs/TEST_PLAN_ROUND2.md).
+
+Historical note: [`docs/TEST_PLAN_ROUND3.md`](docs/TEST_PLAN_ROUND3.md): round 2
 proved pairing works but reconnect-after-wake does not, so round 3 is read-only
 diagnostics on the pad's advertisement and the kernel connect path. The previous
 round is [`docs/TEST_PLAN_ROUND2.md`](docs/TEST_PLAN_ROUND2.md). Start
