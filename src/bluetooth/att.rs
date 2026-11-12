@@ -1,11 +1,12 @@
 //! ATT (Attribute Protocol) client over raw L2CAP socket for Switch 2 controllers.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::l2cap::L2capSocket;
 
@@ -31,9 +32,17 @@ pub const UUID_PRIMARY_SERVICE: u16 = 0x2800;
 pub const UUID_CHARACTERISTIC: u16 = 0x2803;
 pub const UUID_CCCD: u16 = 0x2902;
 
+/// ATT "Attribute Not Found" error code: the normal end-of-range answer for
+/// `ATT_FIND_INFO_REQ` when nothing remains in the requested range.
+pub const ATT_ERR_ATTRIBUTE_NOT_FOUND: u8 = 0x0A;
+
 /// Upper bound on FIND_INFO pages per characteristic (MTU-sized replies can
 /// need several round-trips for descriptor-heavy characteristics).
 const MAX_FIND_INFO_PAGES: usize = 32;
+
+/// Log the discovered characteristic UUID list once per process (info level),
+/// so the first hardware connect shows exactly what the walk returned.
+static GATT_UUID_LIST_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct Characteristic {
@@ -180,6 +189,32 @@ pub fn uuid_to_str(raw: &[u8]) -> String {
 
 fn hex_str(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Structured ATT error response so callers can distinguish the normal
+/// end-of-range `ATTRIBUTE_NOT_FOUND` from a real failure.
+#[derive(Debug)]
+struct AttRequestError {
+    code: u8,
+}
+
+impl std::fmt::Display for AttRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ATT Error response code: 0x{:02X}", self.code)
+    }
+}
+
+impl std::error::Error for AttRequestError {}
+
+fn att_error(code: u8) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, AttRequestError { code })
+}
+
+/// ATT error code carried by `err`, when the peer answered with `ATT_ERROR_RSP`.
+pub fn att_error_code(err: &io::Error) -> Option<u8> {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<AttRequestError>())
+        .map(|att| att.code)
 }
 
 pub type NotificationHandler = Box<dyn Fn(u16, &[u8]) + Send + Sync + 'static>;
@@ -340,10 +375,7 @@ impl AttClient {
         let resp = resp_guard.take().unwrap_or_default();
         if !resp.is_empty() && resp[0] == ATT_ERROR_RSP {
             let code = if resp.len() >= 5 { resp[4] } else { 0 };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("ATT Error response code: 0x{:02X}", code),
-            ));
+            return Err(att_error(code));
         }
 
         Ok(resp)
@@ -456,6 +488,13 @@ impl AttClient {
             };
         }
 
+        for svc in &services {
+            debug!(
+                "GATT primary service 0x{:04X}..=0x{:04X} uuid={}",
+                svc.start_handle, svc.end_handle, svc.uuid
+            );
+        }
+
         // 2. Discover Characteristics for each service
         for svc in &mut services {
             let mut c_start = svc.start_handle;
@@ -504,6 +543,20 @@ impl AttClient {
                 c_start = last_handle.saturating_add(1);
             }
 
+            for ch in &svc.characteristics {
+                debug!(
+                    "GATT characteristic decl=0x{:04X} value=0x{:04X} props=0x{:02X} uuid={}",
+                    ch.decl_handle, ch.value_handle, ch.properties, ch.uuid
+                );
+            }
+            debug!(
+                "GATT service 0x{:04X}..=0x{:04X} uuid={}: {} characteristic(s)",
+                svc.start_handle,
+                svc.end_handle,
+                svc.uuid,
+                svc.characteristics.len()
+            );
+
             // 3. Discover each characteristic's CCCD via ATT_FIND_INFO over its
             // descriptor range. No derivation: an absent CCCD stays None and is
             // only replaced by the legacy safety-net defaults in resolve_handles.
@@ -517,8 +570,18 @@ impl AttClient {
                 .collect();
 
             for (idx, start, end) in plan {
+                let uuid = svc.characteristics[idx].uuid.clone();
+                debug!(
+                    "CCCD scan characteristic uuid={} value=0x{:04X} descriptors=0x{:04X}..=0x{:04X}",
+                    uuid, svc.characteristics[idx].value_handle, start, end
+                );
                 let entries = self.find_info_scan(start, end);
-                svc.characteristics[idx].cccd_handle = select_cccd(&entries, start, end);
+                let cccd = select_cccd(&entries, start, end);
+                debug!(
+                    "CCCD scan characteristic uuid={} -> {:?}",
+                    uuid, cccd
+                );
+                svc.characteristics[idx].cccd_handle = cccd;
             }
         }
 
@@ -530,28 +593,61 @@ impl AttClient {
     ///
     /// Stops on ATT errors, non-FIND_INFO replies, malformed/truncated bodies,
     /// or after [`MAX_FIND_INFO_PAGES`] round-trips. 128-bit UUID entries only
-    /// advance the page cursor (they can never be a CCCD).
+    /// advance the page cursor (they can never be a CCCD). Every stop is logged
+    /// at debug, including the page-cap case, so a silent truncation can be told
+    /// apart from a genuine end of range.
     fn find_info_scan(&self, start: u16, end: u16) -> Vec<(u16, u16)> {
         let mut found = Vec::new();
         let mut handle = start;
+        let mut pages = 0usize;
 
-        for _ in 0..MAX_FIND_INFO_PAGES {
+        loop {
             if handle > end {
+                debug!(
+                    "FIND_INFO 0x{:04X}..=0x{:04X}: range exhausted after {} page(s)",
+                    start, end, pages
+                );
                 break;
             }
+            if pages >= MAX_FIND_INFO_PAGES {
+                debug!(
+                    "FIND_INFO 0x{:04X}..=0x{:04X}: PAGE CAP {} reached with next handle \
+                     0x{:04X}; stopping (possible missing descriptors)",
+                    start, end, MAX_FIND_INFO_PAGES, handle
+                );
+                break;
+            }
+            pages += 1;
 
             let mut req = [0u8; 5];
             req[0] = ATT_FIND_INFO_REQ;
             req[1..3].copy_from_slice(&handle.to_le_bytes());
             req[3..5].copy_from_slice(&end.to_le_bytes());
 
+            debug!(
+                "FIND_INFO page {}: request 0x{:04X}..=0x{:04X}",
+                pages, handle, end
+            );
+
             let resp = match self.request(&req, Duration::from_secs(2)) {
                 Ok(resp) => resp,
                 Err(err) => {
-                    debug!(
-                        "FIND_INFO 0x{:04X}..=0x{:04X} stopped: {}",
-                        handle, end, err
-                    );
+                    match att_error_code(&err) {
+                        Some(ATT_ERR_ATTRIBUTE_NOT_FOUND) => debug!(
+                            "FIND_INFO page {}: 0x{:04X}..=0x{:04X} returned \
+                             ATTRIBUTE_NOT_FOUND (normal end of range)",
+                            pages, handle, end
+                        ),
+                        Some(code) => debug!(
+                            "FIND_INFO page {}: 0x{:04X}..=0x{:04X} stopped on ATT \
+                             error 0x{:02X}: {}",
+                            pages, handle, end, code, err
+                        ),
+                        None => debug!(
+                            "FIND_INFO page {}: 0x{:04X}..=0x{:04X} request failed: {}",
+                            pages, handle, end, err
+                        ),
+                    }
                     break;
                 }
             };
@@ -559,25 +655,61 @@ impl AttClient {
             let entries = match parse_find_info_rsp(&resp) {
                 Some(entries) => entries,
                 None => {
-                    debug!("Unexpected FIND_INFO payload: {:02X?}", resp);
+                    debug!(
+                        "FIND_INFO page {}: unexpected payload (len={}): {:02X?}",
+                        pages,
+                        resp.len(),
+                        resp
+                    );
                     break;
                 }
             };
 
+            debug!(
+                "FIND_INFO page {}: {} bytes, {} entries",
+                pages,
+                resp.len(),
+                entries.len()
+            );
+
             let mut last = 0u16;
             for (entry_handle, raw_uuid) in entries {
+                let uuid = uuid_to_str(&raw_uuid);
                 if raw_uuid.len() == 2 {
-                    found.push((entry_handle, u16::from_le_bytes([raw_uuid[0], raw_uuid[1]])));
+                    let uuid16 = u16::from_le_bytes([raw_uuid[0], raw_uuid[1]]);
+                    if uuid16 == UUID_CCCD {
+                        debug!(
+                            "FIND_INFO page {}: 0x2902 CCCD candidate handle=0x{:04X} \
+                             (range 0x{:04X}..=0x{:04X})",
+                            pages, entry_handle, start, end
+                        );
+                    }
+                    found.push((entry_handle, uuid16));
                 }
+                debug!(
+                    "FIND_INFO page {}: entry handle=0x{:04X} uuid={}",
+                    pages, entry_handle, uuid
+                );
                 last = last.max(entry_handle);
             }
 
             if last == 0 || last >= end {
+                debug!(
+                    "FIND_INFO 0x{:04X}..=0x{:04X}: last handle 0x{:04X} ends the range",
+                    start, end, last
+                );
                 break;
             }
             handle = last + 1;
         }
 
+        debug!(
+            "FIND_INFO 0x{:04X}..=0x{:04X}: {} 16-bit entries, {} CCCD candidate(s)",
+            start,
+            end,
+            found.len(),
+            found.iter().filter(|(_, uuid)| *uuid == UUID_CCCD).count()
+        );
         found
     }
 
@@ -598,6 +730,20 @@ impl AttClient {
         }
 
         let vib_uuid = vibration_uuid_for(pid);
+        debug!(
+            "GATT resolve pid=0x{:04X}: looking for vibration uuid {} among {} characteristic(s)",
+            pid,
+            vib_uuid,
+            map.len()
+        );
+        if !GATT_UUID_LIST_LOGGED.swap(true, Ordering::Relaxed) {
+            let uuids: Vec<&str> = services
+                .iter()
+                .flat_map(|svc| svc.characteristics.iter())
+                .map(|ch| ch.uuid.as_str())
+                .collect();
+            info!("GATT characteristic UUIDs: [{}]", uuids.join(", "));
+        }
 
         let value_handle = |uuid: &str, fallback: u16| -> (u16, bool) {
             match map.get(uuid) {
@@ -657,6 +803,46 @@ impl AttClient {
             fallbacks.push(format!("vibration=0x{:04X}", handles.vibration));
         }
 
+        let cccd_reason = |uuid: &str| -> &'static str {
+            match map.get(uuid) {
+                Some((_, Some(_))) => "CCCD present",
+                Some((_, None)) => "characteristic present but CCCD not found by FIND_INFO",
+                None => "characteristic UUID absent",
+            }
+        };
+        let mut reasons: Vec<String> = Vec::new();
+        if !provenance.input_report {
+            reasons.push(format!("input_report: {} absent", INPUT_REPORT_UUID));
+        }
+        if !provenance.input_report_cccd {
+            reasons.push(format!(
+                "input_report_cccd: {}",
+                cccd_reason(INPUT_REPORT_UUID)
+            ));
+        }
+        if !provenance.command_write {
+            reasons.push(format!("command_write: {} absent", COMMAND_WRITE_UUID));
+        }
+        if !provenance.command_response {
+            reasons.push(format!(
+                "command_response: {} absent",
+                COMMAND_RESPONSE_UUID
+            ));
+        }
+        if !provenance.command_response_cccd {
+            reasons.push(format!(
+                "command_response_cccd: {}",
+                cccd_reason(COMMAND_RESPONSE_UUID)
+            ));
+        }
+        if !provenance.vibration {
+            reasons.push(format!("vibration: {} absent", vib_uuid));
+        }
+        if !reasons.is_empty() {
+            debug!("GATT fallback reasons: {}", reasons.join("; "));
+        }
+        debug!("GATT handle provenance: {:?}", provenance);
+
         if fallbacks.is_empty() {
             debug!(
                 "GATT handles discovered: input=0x{:04X} input_cccd=0x{:04X} \
@@ -670,7 +856,7 @@ impl AttClient {
             );
         } else {
             warn!(
-                "GATT discovery incomplete; using NSO GameCube fallback handles: {}",
+                "GATT resolution used NSO GameCube fallback handles: {}",
                 fallbacks.join(", ")
             );
         }
@@ -998,5 +1184,19 @@ mod tests {
         assert!(!is_expected_response(Some(ATT_FIND_INFO_RSP), &[]));
         // Unmapped request: any non-error reply is accepted (legacy leniency).
         assert!(is_expected_response(None, &[ATT_READ_RSP, 0x00]));
+    }
+
+    #[test]
+    fn att_error_code_distinguishes_not_found() {
+        let not_found = att_error(ATT_ERR_ATTRIBUTE_NOT_FOUND);
+        assert_eq!(
+            att_error_code(&not_found),
+            Some(ATT_ERR_ATTRIBUTE_NOT_FOUND)
+        );
+        assert_eq!(not_found.kind(), io::ErrorKind::Other);
+        assert!(not_found.to_string().contains("0x0A"));
+        assert_eq!(att_error_code(&att_error(0x0E)), Some(0x0E));
+        // Transport/parse errors carry no ATT code.
+        assert_eq!(att_error_code(&io::Error::other("boom")), None);
     }
 }
