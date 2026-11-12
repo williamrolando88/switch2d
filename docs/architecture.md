@@ -71,19 +71,23 @@ without hardware, and USB becomes a second `Transport` impl later.
 
 ## 3. Task sequence (delegated in order, each independently verifiable)
 
-| # | Task | Depends on | Hardware needed |
-|---|---|---|---|
-| 01 | `protocol/advert.rs` + tests | — | no |
-| 02 | `status.rs` atomic state plane | — | no |
-| 03 | `att.rs` CCCD discovery via FIND_INFO + response correlation (D1) | — | no (tests via mock PDU decode) |
-| 04 | `scanner.rs` + `AcceptPolicy` + TTLs, behind `AdvertSource` | 01 | no (fake source) |
-| 05 | `controller.rs`: calibration read (D3), bond gating (D2), MTU check, 3-try steps | 03 | yes to validate |
-| 06 | `gamepad.rs`: raw uinput with `UI_SET_PHYS` (D4) + `EV_FF` upload/erase | — | yes |
-| 07 | rumble: HD 60 Hz worker + GC presets | 05, 06 | yes |
-| 08 | `hub` + `worker` split of `daemon.rs`, idle sleep, topology hooks | 04, 05 | yes |
-| 09 | `dsu.rs` (4 slots) + slot policy | 08 | Dolphin |
-| 10 | `motion.rs` IMU node | 06 | yes |
-| 11 | combined-mode pair ownership + horizontal mapping validation | 05, 06 | yes |
+| # | Task | Depends on | Hardware | Status |
+|---|---|---|---|---|
+| 01 | `protocol/advert.rs` + tests | — | no | **done** `514b25e` |
+| 02 | `status.rs` atomic state plane (+02C service/XDG/battery) | — | no | **done** `514b25e` |
+| 03 | `att.rs` CCCD discovery + response correlation | — | no | **done** `482b818` |
+| 04A | `scan.rs` `SeenAdverts` + `ScanControl` seam | 01 | no | **done** `482b818` |
+| 05 | `controller.rs` calibration, bond gating, MTU, retries | 03 | yes to validate | **done** `2805098` |
+| 06A | `bluez.rs` `AdvertSource` over `busctl` GetManagedObjects | 01, 04A | no | next |
+| 06B | `hub.rs` scan/connect scheduler with fake source + dialer | 04A, 06A | no | |
+| 07 | `uinput` raw node with `UI_SET_PHYS` (ADR-1) | — | yes | |
+| 08 | rumble: HD 60 Hz worker + GC presets + `EV_FF` | 05, 07 | yes | |
+| 09 | daemon rewrite: hub + worker split, idle sleep, topology, `status` wiring | 06B, 08 | yes | |
+| 10 | `dsu.rs` 4 slots + slot policy (ADR-3/4) | 09 | Dolphin | |
+| 11 | `uinput/motion.rs` IMU node | 07 | yes | |
+| 12 | combined-pair ownership + horizontal mapping validation | 05, 07 | yes | |
+
+Commit policy: one commit per approved task, each verified to build on its own.
 
 ## 4. Decisions required before tasks 06-09
 
