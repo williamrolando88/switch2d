@@ -6,6 +6,7 @@ pub mod dsu;
 pub mod hub;
 pub mod monitor;
 pub mod players;
+pub mod profiles;
 pub mod protocol;
 pub mod status;
 pub mod uinput;

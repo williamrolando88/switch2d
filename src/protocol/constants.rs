@@ -9,12 +9,10 @@ pub const PRO_CONTROLLER2_PID: u16 = 0x2069;
 pub const NSO_GAMECUBE_PID: u16 = 0x2073;
 
 pub fn controller_name(pid: u16) -> &'static str {
-    match pid {
-        JOYCON2_RIGHT_PID => "Joy-Con 2 (Right)",
-        JOYCON2_LEFT_PID => "Joy-Con 2 (Left)",
-        PRO_CONTROLLER2_PID => "Pro Controller 2",
-        NSO_GAMECUBE_PID => "NSO GameCube Controller",
-        _ => "Unknown Switch 2 Controller",
+    // Display data lives in the controller profiles (one table per model).
+    match crate::profiles::profile_for(pid) {
+        Some(profile) => profile.name,
+        None => "Unknown Switch 2 Controller",
     }
 }
 
@@ -28,11 +26,9 @@ pub const VIBRATION_JOYCON_R_UUID: &str = "fa19b0fb-cd1f-46a7-84a1-bbb09e00c149"
 pub const VIBRATION_JOYCON_L_UUID: &str = "289326cb-a471-485d-a8f4-240c14f18241";
 
 pub fn vibration_uuid_for(pid: u16) -> &'static str {
-    match pid {
-        JOYCON2_LEFT_PID => VIBRATION_JOYCON_L_UUID,
-        JOYCON2_RIGHT_PID => VIBRATION_JOYCON_R_UUID,
-        _ => VIBRATION_PRO_CONTROLLER_UUID,
-    }
+    // The vibration characteristic is PID-specific: it comes from the profile,
+    // with the Pro Controller UUID as the generic fallback.
+    crate::profiles::profile_or_default(pid).vibration_uuid
 }
 
 // Commands / Subcommands

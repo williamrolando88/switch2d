@@ -12,27 +12,30 @@ Written in pure Rust, `switch2d` connects official Nintendo Switch 2 controllers
 
 ## ✨ Features
 
-- **🎮 Native Combined Joy-Con Mode:**
-  Fuses Joy-Con 2 (Left) and Joy-Con 2 (Right) into **a single unified virtual gamepad** in userspace. The left stick controls movement and the right stick controls camera/aiming on the exact same `/dev/input/js0` node. No Steam Input or third-party wrappers required.
-- **👥 Split Mode (2-Player Local Multiplayer):**
-  Instantly toggle into Split Mode where each Joy-Con acts as a standalone horizontal controller for local co-op / party games.
+- **🎮 Combined Joy-Con Mode (implemented; hardware validation pending):**
+  Fuses Joy-Con 2 (Left) and Joy-Con 2 (Right) into **a single unified virtual gamepad** in userspace. Round 5 is the first end-to-end hardware test of this path.
 - **⚡ High Performance & Low Latency:**
   Direct asynchronous Linux `AF_BLUETOOTH` L2CAP seqpacket sockets bypassing BlueZ GATT and eliminating Bluetooth connection dropouts (`BT_SECURITY_LOW`). Sub-millisecond latency.
 - **🪶 Ultra Lightweight:**
   Single static release binary with **zero Python or runtime dependencies**, consuming only **~1.7 MB of RAM** (down from 20-50 MB in Python prototypes).
 - **🔒 Zero-Sudo Architecture:**
   Operates completely in userspace through standard `/dev/uinput` ACLs without requiring elevated root privileges.
+- **🧪 Coded but not shipped as working:** split mode, HD/preset rumble, DSU/cemuhook motion output and the separate IMU evdev node. These paths exist in the tree but are not wired/validated end to end; see [docs/SUPPORT.md](docs/SUPPORT.md) before relying on them.
 
 ---
 
 ## 🎮 Supported Hardware
 
-| Controller | Status | Controls | Gyro (IMU) | Vibration |
-|---|---|---|---|---|
-| **Joy-Con 2 (Combined Pair)** | ✅ Full Support | Full dual-stick + ABXY + D-Pad + 4 Triggers | ✅ 6-Axis | ✅ HD Rumble |
-| **Joy-Con 2 (Split / Solo)** | ✅ Full Support | Single stick + horizontal layout | ✅ 6-Axis | ✅ HD Rumble |
-| **Pro Controller 2** | ✅ Full Support | Dual analog sticks + digital triggers | ✅ 6-Axis | ✅ HD Rumble |
-| **NSO GameCube** | ✅ Full Support | True analog L/R triggers + C-Stick | ✅ 6-Axis | ✅ Preset Rumble |
+See [docs/SUPPORT.md](docs/SUPPORT.md) for what is validated versus speculative.
+
+| Controller | Status | What the evidence covers |
+|---|---|---|
+| **Joy-Con 2 (Left)** | ✅ validated on hardware (rounds 1-4) | Pairing, player LED, 11 buttons, left stick, battery and IMU decode. |
+| **Joy-Con 2 (Right)** | ✅ validated on hardware (rounds 1-4), with a known stick-calibration defect | Everything above, but the right stick currently caps at about ±0.74 because calibration falls back to defaults. |
+| **Pro Controller 2** | 🧪 speculative - never tested on hardware | Code follows the same protocol family; buttons, sticks, rumble, IMU and LEDs are unverified. |
+| **NSO GameCube** | 🧪 speculative - never tested on hardware | Analog-trigger and preset-rumble paths exist in code but have never run. |
+
+"Full support" claims are intentionally gone. Rumble, DSU motion output, the IMU evdev node and split mode are coded but not wired/validated; [docs/SUPPORT.md](docs/SUPPORT.md) is the authoritative list.
 
 ---
 
@@ -81,6 +84,9 @@ Configuration file: ~/.config/switch2d/config.json
 ## 🔄 Modes
 
 You can toggle modes on the fly:
+
+> Combined mode is implemented and is the current round-5 validation target. Split mode is
+> coded but has not been validated on hardware; see [docs/SUPPORT.md](docs/SUPPORT.md).
 
 ```bash
 # 1-Player Unified Gamepad (Default)
@@ -186,11 +192,11 @@ like, and what to write down when it is not.
 | Virtual gamepad node (`/dev/input/eventN`, `phys=ngc/<MAC>`) | **implemented** | buttons, both sticks, triggers, hats |
 | BLE handshake, bonding, player LED | **implemented** | verify with `pair` |
 | Input report decode, battery, stick calibration | **implemented** | verify with `monitor` |
-| Split mode / combined mode | **implemented** | combined = one node, split = one node per Joy-Con |
+| Split mode / combined mode | combined implemented (round 5 validation); split coded, not validated | combined = one node, split = one node per Joy-Con |
 | HD rumble packets | coded, **not wired** to force-feedback yet | `EV_FF` in a game does nothing yet |
 | GameCube preset rumble | coded, **not wired** yet | requires a GC pad to test |
 | DSU / cemuhook motion out | coded, **not wired** into the daemon yet | Dolphin will see nothing yet |
-| Separate IMU gyro node | **not implemented** | motion is only decoded and printed by `monitor` |
+| Separate IMU gyro node | coded (`src/uinput/motion.rs`), **not wired** into the daemon yet | motion is decoded and printed by `monitor`; the node module exists |
 
 Do **not** report the last four rows as bugs — they are known, planned work. Everything above
 them is in scope and worth a report if it misbehaves.
