@@ -1,10 +1,11 @@
 //! High-level controller abstraction managing handshake, calibration, and input streaming.
 
 use std::io;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::bluetooth::att::{AttClient, ResolvedHandles};
@@ -454,18 +455,122 @@ pub fn suspected_le_privacy_failure(errors: &[String]) -> bool {
         .any(|err| err.contains("os error 38") || err.contains("ENOSYS"))
 }
 
+/// Installed-state of the root remediation unit, as readable without root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitState {
+    /// `systemctl is-enabled` says enabled and `is-active` says active.
+    EnabledActive,
+    /// Enabled but not currently active.
+    EnabledNotActive,
+    /// Missing or disabled.
+    NotEnabled,
+    /// Either probe failed or timed out; never claim a state we could not read.
+    Unknown,
+}
+
+const PRIVACY_UNIT: &str = "switch2d-disable-le-privacy.service";
+/// Per-systemctl budget; two sequential probes stay under one second.
+const PRIVACY_UNIT_COMMAND_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Run a command with a hard wall-clock budget. Returns `None` on spawn error,
+/// non-exit, or timeout; never panics and never leaves a running child.
+fn command_output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn unit_enabled_output(output: &str) -> bool {
+    matches!(output.trim(), "enabled" | "enabled-runtime")
+}
+
+/// Probe the remediation unit without root. `systemctl is-enabled` and
+/// `is-active` are readable by normal users; every failure maps to
+/// [`UnitState::Unknown`].
+fn privacy_unit_state() -> UnitState {
+    let enabled = command_output_with_timeout(
+        "systemctl",
+        &["is-enabled", PRIVACY_UNIT],
+        PRIVACY_UNIT_COMMAND_TIMEOUT,
+    );
+    let active = command_output_with_timeout(
+        "systemctl",
+        &["is-active", PRIVACY_UNIT],
+        PRIVACY_UNIT_COMMAND_TIMEOUT,
+    );
+
+    let (Some(enabled), Some(active)) = (enabled, active) else {
+        return UnitState::Unknown;
+    };
+    let enabled = String::from_utf8_lossy(&enabled.stdout);
+    let active = String::from_utf8_lossy(&active.stdout);
+
+    if !unit_enabled_output(&enabled) {
+        UnitState::NotEnabled
+    } else if active.trim() == "active" {
+        UnitState::EnabledActive
+    } else {
+        UnitState::EnabledNotActive
+    }
+}
+
 /// One-line remediation for the suspected LE-privacy signature.
 ///
-/// The MAC is included so a field log identifies the affected pad.
-pub fn le_privacy_warning(mac: &str) -> String {
-    format!(
+/// The MAC is included so a field log identifies the affected pad. `state` is
+/// passed in (pure builder); [`UnitState::Unknown`] adds no claim about the
+/// remediation unit.
+pub fn le_privacy_warning(mac: &str, state: UnitState) -> String {
+    let base = format!(
         "Wake reconnect to {mac} failed with os error 38 (HCI 0x3E). \
          This usually means Bluetooth LE privacy is enabled: the kernel then \
          connects from a random address and a pad that stored this adapter \
          address ignores it. Run `sudo btmgmt -i 0 power off; \
          sudo btmgmt -i 0 privacy off; sudo btmgmt -i 0 power on` or install \
          the switch2d-disable-le-privacy unit."
-    )
+    );
+
+    let ending = match state {
+        UnitState::EnabledActive => {
+            "The switch2d-disable-le-privacy unit is installed and active."
+        }
+        UnitState::EnabledNotActive => {
+            "The unit is enabled but not active - run `sudo systemctl restart \
+             switch2d-disable-le-privacy`."
+        }
+        UnitState::NotEnabled => {
+            "The switch2d-disable-le-privacy unit is NOT installed/enabled; \
+             install it as described in README section \"LE Privacy\"."
+        }
+        UnitState::Unknown => "",
+    };
+
+    if ending.is_empty() {
+        base
+    } else {
+        format!("{base} {ending}")
+    }
 }
 
 pub struct SwitchController {
@@ -532,7 +637,7 @@ impl SwitchController {
                 // One additive WARN after the final failure, never per round.
                 let dial_error = report.last_error.clone().unwrap_or_else(|| err.to_string());
                 if suspected_le_privacy_failure(std::slice::from_ref(&dial_error)) {
-                    warn!("{}", le_privacy_warning(mac));
+                    warn!("{}", le_privacy_warning(mac, privacy_unit_state()));
                 }
                 // FIX 3 diagnostics: rounds, both address types and their last OS
                 // errors (inside `err`), plus what the control plane managed.
@@ -1803,21 +1908,82 @@ mod tests {
     }
 
     #[test]
-    fn le_privacy_warning_names_remediation_and_mac() {
-        let message = le_privacy_warning("BC:89:A6:49:8D:74");
-        assert_eq!(
-            message,
-            "Wake reconnect to BC:89:A6:49:8D:74 failed with os error 38 (HCI 0x3E). \
-             This usually means Bluetooth LE privacy is enabled: the kernel then \
-             connects from a random address and a pad that stored this adapter \
-             address ignores it. Run `sudo btmgmt -i 0 power off; \
-             sudo btmgmt -i 0 privacy off; sudo btmgmt -i 0 power on` or install \
-             the switch2d-disable-le-privacy unit."
+    fn le_privacy_warning_enabled_active_state() {
+        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::EnabledActive);
+        assert!(
+            message.ends_with(
+                "The switch2d-disable-le-privacy unit is installed and active."
+            ),
+            "message: {message}"
         );
-        assert!(message.contains("BC:89:A6:49:8D:74"));
-        assert!(message.contains("sudo btmgmt -i 0 power off"));
-        assert!(message.contains("sudo btmgmt -i 0 privacy off"));
-        assert!(message.contains("sudo btmgmt -i 0 power on"));
-        assert!(message.contains("switch2d-disable-le-privacy"));
+        assert!(!message.contains("NOT installed/enabled"));
+        assert!(!message.contains("enabled but not active"));
+    }
+
+    #[test]
+    fn le_privacy_warning_enabled_not_active_state() {
+        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::EnabledNotActive);
+        assert!(
+            message.ends_with(
+                "The unit is enabled but not active - run `sudo systemctl restart \
+                 switch2d-disable-le-privacy`."
+            ),
+            "message: {message}"
+        );
+        assert!(!message.contains("installed and active"));
+        assert!(!message.contains("NOT installed/enabled"));
+    }
+
+    #[test]
+    fn le_privacy_warning_not_enabled_state() {
+        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::NotEnabled);
+        assert!(
+            message.ends_with(
+                "The switch2d-disable-le-privacy unit is NOT installed/enabled; \
+                 install it as described in README section \"LE Privacy\"."
+            ),
+            "message: {message}"
+        );
+        assert!(!message.contains("installed and active"));
+        assert!(!message.contains("enabled but not active"));
+    }
+
+    #[test]
+    fn le_privacy_warning_unknown_state_adds_nothing() {
+        let base = "Wake reconnect to BC:89:A6:49:8D:74 failed with os error 38 \
+                    (HCI 0x3E). This usually means Bluetooth LE privacy is enabled: \
+                    the kernel then connects from a random address and a pad that \
+                    stored this adapter address ignores it. Run `sudo btmgmt -i 0 \
+                    power off; sudo btmgmt -i 0 privacy off; sudo btmgmt -i 0 power \
+                    on` or install the switch2d-disable-le-privacy unit.";
+        let message = le_privacy_warning("BC:89:A6:49:8D:74", UnitState::Unknown);
+        assert_eq!(message, base);
+        assert!(!message.contains("installed and active"));
+        assert!(!message.contains("enabled but not active"));
+        assert!(!message.contains("NOT installed/enabled"));
+        assert!(!message.contains("README section"));
+    }
+
+    #[test]
+    fn le_privacy_warning_keeps_remediation_in_all_states() {
+        for state in [
+            UnitState::EnabledActive,
+            UnitState::EnabledNotActive,
+            UnitState::NotEnabled,
+            UnitState::Unknown,
+        ] {
+            let message = le_privacy_warning("BC:89:A6:49:8D:74", state);
+            assert!(message.contains("BC:89:A6:49:8D:74"), "state: {state:?}");
+            assert!(message.contains("sudo btmgmt -i 0 power off"), "state: {state:?}");
+            assert!(
+                message.contains("sudo btmgmt -i 0 privacy off"),
+                "state: {state:?}"
+            );
+            assert!(message.contains("sudo btmgmt -i 0 power on"), "state: {state:?}");
+            assert!(
+                message.contains("(HCI 0x3E)"),
+                "state: {state:?}"
+            );
+        }
     }
 }
