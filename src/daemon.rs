@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -11,8 +12,45 @@ use tracing::{error, info, warn};
 
 use crate::config::{DaemonConfig, DaemonMode};
 use crate::controller::{BondPolicy, ConnectOptions, DialBudget, SwitchController};
+use crate::protocol::calibration::StickCalibration;
 use crate::protocol::constants::*;
 use crate::uinput::{CombinedJoyConManager, VirtualGamepad};
+
+/// The calibration a live session actually read, captured once when the
+/// session is established.
+///
+/// `SwitchController::left_calib` / `right_calib` are calibration *blocks*, not
+/// "the left half of the pad": a right Joy-Con keeps its stick calibration in
+/// `right_calib` (falling back to the left block inside the controller), so the
+/// callback has to pick the block belonging to the side it is updating. Feeding
+/// `StickCalibration::default()` here was the round-6 bug: it capped every
+/// stick at the default 0.74 of full scale even though the session had the real
+/// calibration.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SessionCalibration {
+    left: StickCalibration,
+    right: StickCalibration,
+}
+
+impl SessionCalibration {
+    /// Capture the calibration the controller read during this connect.
+    pub(crate) fn capture(controller: &SwitchController) -> Self {
+        Self {
+            left: controller.left_calib,
+            right: controller.right_calib,
+        }
+    }
+
+    /// Calibration for the side being updated (`is_left` = this pad is a left
+    /// Joy-Con). Shared by combined and split mode.
+    pub(crate) fn for_side(&self, is_left: bool) -> &StickCalibration {
+        if is_left {
+            &self.left
+        } else {
+            &self.right
+        }
+    }
+}
 
 pub struct Daemon {
     config: DaemonConfig,
@@ -86,6 +124,12 @@ impl Daemon {
                     let mgr_cb = mgr.clone();
                     let mac_str = ctrl_cfg.mac.clone();
                     let adapter_str = adapter_mac.clone();
+                    // Filled as soon as the session is established; the callback
+                    // only reads it (no I/O, no locks), so the ATT reader is
+                    // never blocked (analysis 5.6).
+                    let session_calib: Arc<OnceLock<SessionCalibration>> =
+                        Arc::new(OnceLock::new());
+                    let calib_for_cb = Arc::clone(&session_calib);
 
                     // Serialize connection attempts so hardware adapter does not hit EBUSY
                     let conn_permit = conn_lock.lock().await;
@@ -121,10 +165,17 @@ impl Daemon {
                                 },
                             },
                             Box::new(move |report| {
+                                // A report can beat the capture by a few frames
+                                // (is_ready is set just before connect returns);
+                                // skipping those is better than emitting
+                                // default-calibrated values.
+                                let Some(calib) = calib_for_cb.get() else {
+                                    return;
+                                };
                                 if is_l {
-                                    mgr_for_cb.update_left(report, &crate::protocol::calibration::StickCalibration::default());
+                                    mgr_for_cb.update_left(report, calib.for_side(true));
                                 } else {
-                                    mgr_for_cb.update_right(report, &crate::protocol::calibration::StickCalibration::default());
+                                    mgr_for_cb.update_right(report, calib.for_side(false));
                                 }
                             }),
                             budget,
@@ -136,6 +187,9 @@ impl Daemon {
 
                     match res {
                         Ok(Ok(controller)) => {
+                            // Capture before the 500 ms health poll so the
+                            // callback switches from "skip" to real values now.
+                            let _ = session_calib.set(SessionCalibration::capture(&controller));
                             info!("Controller {} connected and streaming inputs!", ctrl_cfg.mac);
                             if let Ok(mut live) = live_sessions.lock() {
                                 live.insert(ctrl_cfg.mac.clone());
@@ -201,6 +255,10 @@ impl Daemon {
                     let mac_str = ctrl_cfg.mac.clone();
                     let adapter_str = adapter_mac.clone();
                     let is_left = ctrl_cfg.name.to_lowercase().contains("left");
+                    // Same session calibration capture as combined mode.
+                    let session_calib: Arc<OnceLock<SessionCalibration>> =
+                        Arc::new(OnceLock::new());
+                    let calib_for_cb = Arc::clone(&session_calib);
 
                     let conn_permit = conn_lock.lock().await;
 
@@ -230,10 +288,14 @@ impl Daemon {
                                 },
                             },
                             Box::new(move |report| {
+                                let Some(calib) = calib_for_cb.get() else {
+                                    return;
+                                };
                                 if is_l {
-                                    mgr_for_cb.update_horizontal_left(report, &crate::protocol::calibration::StickCalibration::default());
+                                    mgr_for_cb.update_horizontal_left(report, calib.for_side(true));
                                 } else {
-                                    mgr_for_cb.update_horizontal_right(report, &crate::protocol::calibration::StickCalibration::default());
+                                    mgr_for_cb
+                                        .update_horizontal_right(report, calib.for_side(false));
                                 }
                             }),
                             budget,
@@ -244,6 +306,7 @@ impl Daemon {
 
                     match res {
                         Ok(Ok(controller)) => {
+                            let _ = session_calib.set(SessionCalibration::capture(&controller));
                             info!("Controller {} connected in split mode!", ctrl_cfg.mac);
                             if let Ok(mut live) = live_sessions.lock() {
                                 live.insert(ctrl_cfg.mac.clone());
@@ -303,5 +366,68 @@ fn log_connect_failure(mac: &str, err: &std::io::Error) {
         warn!("Connect to {mac} failed: {err}");
     } else {
         tracing::debug!("Connect to {mac} failed (retrying): {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Realistic single-stick calibration block: centre 2048, max/min delta
+    /// 1254. The same shape the controller tests use; raw 3302 is a hard right
+    /// deflection that this block maps to full scale.
+    const REAL_STICK_CALIBRATION: [u8; 11] = [
+        0x00, 0x08, 0x80, 0xE6, 0x64, 0x4E, 0xE6, 0x64, 0x4E, 0x00, 0x00,
+    ];
+
+    /// Deadzone the virtual-pad mapper applies (CombinedJoyConManager calls
+    /// `apply_scaled_i16(raw, 120)` for every stick update).
+    const MAPPER_DEADZONE: i32 = 120;
+
+    #[test]
+    fn daemon_feeds_session_calibration_not_defaults() {
+        let real = StickCalibration::from_bytes(&REAL_STICK_CALIBRATION).expect("block parses");
+        let default = StickCalibration::default();
+        // Hard right deflection: (3302 - 2048) is exactly this block's max delta.
+        let raw = (3302, 2048);
+
+        // A right Joy-Con keeps its calibration in the right block (left stays
+        // default), so the daemon must feed the right block for that side.
+        let right_pad = SessionCalibration {
+            left: default,
+            right: real,
+        };
+        assert_eq!(*right_pad.for_side(false), real);
+        assert_eq!(
+            right_pad
+                .for_side(false)
+                .apply_scaled_i16(raw, MAPPER_DEADZONE),
+            (32767, 0)
+        );
+
+        // A left Joy-Con is the mirror image.
+        let left_pad = SessionCalibration {
+            left: real,
+            right: default,
+        };
+        assert_eq!(*left_pad.for_side(true), real);
+        assert_eq!(
+            left_pad
+                .for_side(true)
+                .apply_scaled_i16(raw, MAPPER_DEADZONE),
+            (32767, 0)
+        );
+
+        // The round-6 bug: defaults cap the same sample at
+        // (3302 - 2048) / 1700 = 0.7376 of the i16 range.
+        assert_eq!(
+            default.apply_scaled_i16(raw, MAPPER_DEADZONE),
+            (24170, 0),
+            "default calibration caps at ~0.74 (the observed evtest peak)"
+        );
+
+        // And the daemon must never pick the other side's block.
+        assert_ne!(*right_pad.for_side(false), default);
+        assert_eq!(*right_pad.for_side(true), default);
     }
 }
