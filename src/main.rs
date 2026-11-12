@@ -12,7 +12,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use switch2d::bluetooth::scan::{ScanControl, ShellScanControl};
 use switch2d::config::{BondedController, DaemonConfig, DaemonMode};
-use switch2d::controller::{BondPolicy, ConnectOptions, SwitchController};
+use switch2d::controller::{BondPolicy, ConnectOptions, DialBudget, SwitchController};
 use switch2d::daemon::Daemon;
 use switch2d::monitor::{run_monitor, MonitorConfig};
 use switch2d::protocol::constants::*;
@@ -304,7 +304,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mac_for_task = target_mac.clone();
 
             let res = tokio::task::spawn_blocking(move || {
-                SwitchController::connect_with(
+                // Same dial envelope as the daemon: BlueZ object removal plus
+                // short rounds. Pairing a fresh pad rarely needs the retries,
+                // but re-pairing a bonded one hits exactly the case they fix.
+                SwitchController::connect_session(
                     &mac_for_task,
                     &adapter_mac,
                     ConnectOptions {
@@ -313,6 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bond: BondPolicy::Force,
                     },
                     Box::new(|_| {}),
+                    DialBudget::default(),
                 )
             }).await?;
 
