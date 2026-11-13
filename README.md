@@ -281,6 +281,7 @@ Start with `switch2d doctor` — it checks every environment piece and prints th
 | `doctor` warns about `nso-gc` units | Leftover from the older Python bridge; run the disable command it prints |
 | `doctor` warns about the DSU port | Another program holds `127.0.0.1:26760`; motion is unavailable, controllers still work |
 | Input feels delayed or drops | `journalctl --user -u switch2d -f` while playing; report the `dropped=` and `max_gap=` numbers |
+| Other BLE devices (e.g. Xbox Wireless Controller) fail to pair or reconnect | The LE privacy unit disables adapter privacy globally so Switch 2 pads can reconnect. Certain modern BLE devices (especially Xbox Wireless Controllers) require LE privacy (`Privacy=device`). Re-enable privacy with `sudo btmgmt -i 0 power off && sudo btmgmt -i 0 privacy on && sudo btmgmt -i 0 power on && sudo systemctl restart bluetooth` (Switch 2 pads will stop reconnecting while on) |
 
 Logs are the most useful thing in a bug report:
 
@@ -293,6 +294,14 @@ switch2d -v run          # verbose, in the foreground
 
 ## Known limitations
 
+- **LE privacy trade-off (Xbox and modern BLE devices)**: To allow Switch 2 controllers to
+  reconnect, `switch2d-disable-le-privacy.service` disables adapter-level LE privacy
+  (`btmgmt privacy off`). While off, the adapter uses its public address for all LE connections.
+  Certain modern BLE devices—notably **Xbox Wireless Controllers** (running updated Bluetooth
+  firmware) and devices relying on Resolvable Private Addresses (RPAs) or BlueZ's
+  `Privacy=device`—may fail to pair or reconnect. Re-enable privacy with
+  `sudo btmgmt -i 0 power off && sudo btmgmt -i 0 privacy on && sudo btmgmt -i 0 power on && sudo systemctl restart bluetooth`
+  when you need to use those controllers (Switch 2 controllers will stop reconnecting until it is turned off again).
 - **Pro Controller 2** and the **NSO GameCube Controller** are supported in code but have never
   been tested on hardware. Treat them as unverified.
 - **Split mode** is implemented but less validated than combined mode.
